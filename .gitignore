@@ -1,0 +1,95 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+build/
+build-*/
+
+# Model files (large binaries)
+models/*.bin
+models/*.gguf
+models/*.zllm
+models/*.safetensors
+models/*.pt
+models/*.pth
+models/*.ckpt
+
+# Training data (can be large)
+data/*.txt
+data/*.json
+data/*.jsonl
+data/*.csv
+data/*.tsv
+data/*.parquet
+
+# Checkpoints and outputs
+checkpoints/
+outputs/
+runs/
+logs/
+
+# Benchmark results
+bench_results.txt
+bench_*.txt
+*.bench
+
+# Documentation build
+docs/book/
+docs/.doctrees/
+*.html
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python (for scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+
+# Profiling
+*.prof
+callgrind.out.*
+perf.data
+perf.data.old
+flamegraph.svg
+*.trace
+
+# Coverage
+*.gcov
+*.gcda
+*.gcno
+coverage/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.log
+*.pid
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Project specific
+.mise.local.toml
+.secrets
+*.key
+*.pem
