@@ -1,0 +1,109 @@
+# mise configuration for zLLM
+# Install with: curl https://mise.jdx.dev/install.sh | sh
+
+[tools]
+zig = "0.15.1"
+rust = "stable"   # For mdbook
+act = "latest"    # For local CI testing
+
+[env]
+ZLLM_CACHE_DIR = "~/.cache/zllm"
+ZLLM_MODEL_DIR = "~/.cache/zllm/models"
+
+[tasks.setup]
+description = "Initial setup"
+run = """
+  cargo install mdbook
+  mkdir -p models data
+  echo "✅ Setup complete"
+"""
+
+[tasks.test]
+description = "Run all tests"
+run = "zig build test"
+
+[tasks."test:core"]
+description = "Run core module tests"  
+run = "zig test src/core/lib.zig"
+
+[tasks."test:models"]
+description = "Run model tests"
+run = "zig test src/models/lib.zig"
+
+[tasks."test:training"]
+description = "Run training tests"
+run = "zig test src/training/lib.zig"
+
+[tasks.bench]
+description = "Run benchmarks"
+run = "zig build bench -Doptimize=ReleaseFast"
+
+[tasks.example]
+description = "Run generation example"
+run = "zig build run"
+
+[tasks.train]
+description = "Train a small model from scratch"
+run = """
+  zig build -Doptimize=ReleaseFast
+  ./zig-out/bin/train
+"""
+
+[tasks.build]
+description = "Build all targets"
+run = "zig build"
+
+[tasks."build:release"]
+description = "Build optimized release"
+run = "zig build -Doptimize=ReleaseFast"
+
+[tasks."build:small"]
+description = "Build size-optimized release"
+run = "zig build -Doptimize=ReleaseSmall"
+
+[tasks.fmt]
+description = "Check code formatting"
+run = "zig fmt --check src/ tests/ examples/ bench/ build.zig"
+
+[tasks."fmt:fix"]
+description = "Fix code formatting"
+run = "zig fmt src/ tests/ examples/ bench/ build.zig"
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = """
+  rm -rf zig-out zig-cache .zig-cache
+  echo "✨ Cleaned build artifacts"
+"""
+
+[tasks.docs]
+description = "Build documentation with mdbook"
+run = "mdbook build docs/"
+
+[tasks."docs:serve"]
+description = "Serve documentation locally"
+run = "mdbook serve docs/ --open"
+
+[tasks."docs:watch"]
+description = "Watch and rebuild documentation"
+run = "mdbook watch docs/"
+
+[tasks.ci]
+description = "Run CI checks locally"
+depends = ["fmt", "test", "bench"]
+
+[tasks."ci:local"]
+description = "Run CI with act (GitHub Actions locally)"
+run = "act -P ubuntu-latest=ghcr.io/catthehacker/ubuntu:act-latest"
+
+[tasks.hooks]
+description = "Install git hooks"
+run = """
+  cat > .git/hooks/pre-commit << 'EOF'
+  #!/bin/sh
+  mise run fmt
+  mise run test:core
+  EOF
+  chmod +x .git/hooks/pre-commit
+  echo "✅ Git hooks installed"
+"""

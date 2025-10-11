@@ -1,0 +1,51 @@
+[book]
+authors = ["zLLM Contributors"]
+language = "en"
+multilingual = false
+src = "src"
+title = "zLLM Documentation"
+description = "Zero-GPU Language Model Runtime - CPU-native LLM training and inference in pure Zig"
+
+[build]
+build-dir = "book"
+create-missing = true
+
+[preprocessor.index]
+
+[preprocessor.links]
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "coal"
+git-repository-url = "https://github.com/yourusername/zllm"
+git-repository-icon = "fa-github"
+edit-url-template = "https://github.com/yourusername/zllm/edit/main/docs/{path}"
+smart-punctuation = true
+mathjax-support = true
+additional-css = ["theme/zllm.css"]
+additional-js = []
+
+[output.html.playground]
+editable = false
+copyable = true
+copy-js = true
+line-numbers = false
+
+[output.html.fold]
+enable = true
+level = 0
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
+copy-js = true
+
+[output.html.print]
+enable = true

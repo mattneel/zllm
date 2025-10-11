@@ -1,0 +1,42 @@
+/* zLLM Custom Theme */
+
+/* Tiger Style colors */
+:root {
+  --zllm-orange: #ff6600;
+  --zllm-dark: #1a1a1a;
+  --zllm-light: #f5f5f5;
+  --tiger-accent: #cc5200;
+}
+
+/* Code blocks */
+.hljs {
+  font-size: 0.95em;
+}
+
+/* Inline code */
+code {
+  color: var(--zllm-orange);
+}
+
+/* Performance callouts */
+.performance-note {
+  background: rgba(255, 102, 0, 0.1);
+  border-left: 4px solid var(--zllm-orange);
+  padding: 0.5em 1em;
+  margin: 1em 0;
+}
+
+/* Tiger Style emphasis */
+.tiger-style {
+  font-weight: 600;
+  color: var(--tiger-accent);
+}
+
+/* Napkin math boxes */
+.napkin-math {
+  background: rgba(0, 0, 0, 0.05);
+  border: 1px dashed #666;
+  padding: 1em;
+  margin: 1em 0;
+  font-family: monospace;
+}
