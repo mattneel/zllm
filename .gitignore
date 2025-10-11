@@ -29,7 +29,7 @@ runs/
 logs/
 
 # Benchmark results
-bench_results.txt
+#bench_results.txt
 bench_*.txt
 *.bench
 
