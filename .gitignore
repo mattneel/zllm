@@ -30,7 +30,7 @@ logs/
 
 # Benchmark results
 #bench_results.txt
-bench_*.txt
+#bench_*.txt
 *.bench
 
 # Documentation build
