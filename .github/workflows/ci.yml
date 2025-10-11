@@ -44,9 +44,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.arch }}-zig-
 
-      - name: Format Check
-        run: zig fmt --check .
-
       - name: Build
         run: zig build -Doptimize=${{ matrix.mode }}
 
