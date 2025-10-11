@@ -1,8 +1,6 @@
 # ⚡ zLLM
 
 [![CI](https://github.com/mattneel/zllm/actions/workflows/ci.yml/badge.svg)](https://github.com/mattneel/zllm/actions/workflows/ci.yml)
-[![Benchmark](https://github.com/mattneel/zllm/actions/workflows/benchmark.yml/badge.svg)](https://github.com/mattneel/zllm/actions/workflows/benchmark.yml)
-[![Documentation](https://github.com/mattneel/zllm/actions/workflows/docs.yml/badge.svg)](https://mattneel.github.io/zllm/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 **Zero-GPU Language Model Runtime** - Democratizing AI with CPU-native LLM training and inference in pure Zig.
