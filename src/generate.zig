@@ -138,6 +138,20 @@ pub const Runtime = struct {
     stop_tokens: std.ArrayList(u32) = .empty,
     /// "<device> (<backend>)".
     adapter: []const u8 = "",
+    /// Where loading went, in nanoseconds.
+    load: Load = .{},
+
+    pub const Load = struct {
+        /// Shaders and pipelines compiled.
+        pipelines: u64 = 0,
+        /// Weights read from the file onto the GPU (and laid out).
+        weights: u64 = 0,
+        /// The step program: buffers and bind groups.
+        program: u64 = 0,
+        /// The engine's two calibration steps (the first compiles nothing
+        /// but warms every pipeline up).
+        calibration: u64 = 0,
+    };
 
     pub fn create(gpa: Allocator, io: Io, host: *zllm.gpu.Host, file: zllm.gguf.File, bytes: []const u8, o: Options) !*Runtime {
         const rt = try gpa.create(Runtime);
@@ -165,22 +179,25 @@ pub const Runtime = struct {
         };
         var rec: zllm.gpu.cmd.Recorder = .{};
         defer rec.deinit(gpa);
+        var t = Io.Timestamp.now(io, .awake);
         rt.set = try .create(gpa, &rec);
+        try rt.executeTimed(&rec, &t, &rt.load.pipelines);
         host.file = bytes;
         rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
+        try rt.executeTimed(&rec, &t, &rt.load.weights);
         rt.program = try plan.Program.build(arena, gpa, &rec, &rt.set, &rt.model, .{
             .context = o.context,
             .max_tokens = @min(512, o.context),
             .kv = o.kv,
         }, limits);
-        try rec.submit(gpa, 0);
-        try rt.execute(rec.batch());
+        try rt.executeTimed(&rec, &t, &rt.load.program);
         rt.engine = try .init(gpa, &rt.program, &rt.tok);
         for ([_]bool{ false, true }) |warm| {
             const t0 = Io.Timestamp.now(io, .awake);
             try rt.execute(try rt.engine.calibration());
             rt.engine.calibrated(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()), warm);
         }
+        rt.load.calibration = @intCast(t.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds());
 
         if (rt.tok.ids.get("<|im_end|>")) |id| try rt.stop_tokens.append(gpa, id);
         if (rt.tok.eos) |id| if (std.mem.indexOfScalar(u32, rt.stop_tokens.items, id) == null) try rt.stop_tokens.append(gpa, id);
@@ -195,6 +212,17 @@ pub const Runtime = struct {
         rt.tok.deinit(gpa);
         rt.arena_state.deinit();
         gpa.destroy(rt);
+    }
+
+    /// Submits and runs what `rec` holds, adding the time since `t` to
+    /// `phase` and moving `t` on.
+    fn executeTimed(rt: *Runtime, rec: *zllm.gpu.cmd.Recorder, t: *Io.Timestamp, phase: *u64) !void {
+        try rec.submit(rt.gpa, 0);
+        try rt.execute(rec.batch());
+        rec.clear();
+        const now = Io.Timestamp.now(rt.io, .awake);
+        phase.* = @intCast(t.durationTo(now).toNanoseconds());
+        t.* = now;
     }
 
     pub fn execute(rt: *Runtime, words: []const u32) !void {

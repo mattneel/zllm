@@ -116,7 +116,10 @@ pub fn main(init: std.process.Init) !void {
         const t0 = Io.Timestamp.now(io, .awake);
         const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
         defer rt.destroy();
-        std.debug.print("[{s}; loaded in {d} ms; context {d}, {t} KV]\n", .{ rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
+        const ld = rt.load;
+        std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, program {d}, calibration {d}); context {d}, {t} KV]\n", .{
+            rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, opts.context, opts.kv,
+        });
         if (is_soak) {
             const minutes = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 10;
             if (!try soak.run(rt, minutes, out)) return error.SoakFailed;
