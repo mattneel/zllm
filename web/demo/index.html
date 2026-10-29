@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>zllm</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        max-width: 52rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      fieldset {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        align-items: center;
+        border: 1px solid #8884;
+        border-radius: 0.5rem;
+      }
+      #model-url {
+        flex: 1 1 20rem;
+      }
+      progress {
+        width: 100%;
+      }
+      #log {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        margin: 1rem 0;
+      }
+      .msg {
+        white-space: pre-wrap;
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.5rem;
+        background: #8881;
+      }
+      .user {
+        align-self: flex-end;
+        background: #4a7cff22;
+      }
+      .reasoning {
+        opacity: 0.6;
+        font-size: 0.9em;
+      }
+      #prompt {
+        width: 100%;
+        min-height: 4rem;
+        box-sizing: border-box;
+      }
+      #stats {
+        font-family: ui-monospace, monospace;
+        font-size: 0.85em;
+        opacity: 0.8;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>zllm</h1>
+    <fieldset id="load-form">
+      <input id="model-url" value="/models/Qwen3.5-0.8B-BF16.gguf" aria-label="Model URL" />
+      <button id="load-url">Load URL</button>
+      <input id="model-file" type="file" accept=".gguf" aria-label="Model file" />
+    </fieldset>
+    <p id="status">WebGPU, GGUF in, tokens out. Load a Qwen 3.5 GGUF (BF16).</p>
+    <progress id="progress" value="0" max="1" hidden></progress>
+    <div id="log"></div>
+    <form id="chat" hidden>
+      <textarea id="prompt" placeholder="Message"></textarea>
+      <label><input id="think" type="checkbox" checked /> Thinking</label>
+      <button id="send" type="submit">Send</button>
+      <button id="stop" type="button" disabled>Stop</button>
+      <button id="reset" type="button">New chat</button>
+    </form>
+    <p id="stats"></p>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

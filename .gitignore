@@ -13,5 +13,6 @@ __pycache__/
 docs/book/
 docs/theme/mermaid-init.js
 
-# TypeScript
+# TypeScript, and the shim bundle (`bun run build` in web/)
 node_modules/
+web/dist/

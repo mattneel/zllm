@@ -3,14 +3,17 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Browser-side TypeScript for zllm: the book's scripts now, the JS shim and facade from M3",
+  "description": "Browser-side TypeScript for zllm: the JS shim (src/zllm), its demo, and the book's scripts",
   "scripts": {
-    "check": "biome check . && tsc --noEmit",
+    "check": "biome check . && tsc --noEmit && tsc --noEmit -p tsconfig.dev.json",
     "fix": "biome check --write .",
-    "build:book": "bun build src/book/mermaid.ts --target browser --format iife --minify --outfile ../docs/theme/mermaid-init.js"
+    "build:book": "bun build src/book/mermaid.ts --target browser --format iife --minify --outfile ../docs/theme/mermaid-init.js",
+    "dev": "bun src/dev/serve.ts",
+    "build": "bun build src/zllm/index.ts --target browser --format esm --minify --sourcemap=linked --outdir dist --entry-naming zllm.[ext] && cp ../zig-out/web/zllm.wasm dist/"
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.4",
+    "@types/bun": "^1.4.4",
     "typescript": "7.0.2"
   },
   "dependencies": {
