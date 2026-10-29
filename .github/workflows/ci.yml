@@ -27,7 +27,7 @@ jobs:
       - run: zig build test --summary all
 
   tokenizer:
-    name: Tokenizer parity (Hugging Face)
+    name: Tokenizer and chat template parity
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -43,6 +43,7 @@ jobs:
           key: fixtures-vocab-${{ hashFiles('scripts/fixtures.sh') }}
       - run: scripts/fixtures.sh vocab
       - run: zig build check-tokenizer
+      - run: zig build check-chat
 
   gpu-kernels:
     name: GPU kernels (Dawn on llvmpipe)
