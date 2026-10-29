@@ -15,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
 const ops = @import("../ref/ops.zig");
+const gguf = @import("../gguf/gguf.zig");
 
 pub const Kernel = enum {
     rmsnorm,
@@ -31,13 +32,53 @@ pub const Kernel = enum {
     gated_norm,
     mark_tokens,
     sample,
+    // Quantized weights: matvec_quant.wgsl, matmul_quant.wgsl and
+    // embed_quant.wgsl, each composed with its type's decoder.
+    matvec_q8_0,
+    matvec_q3_k,
+    matvec_q4_k,
+    matvec_q5_k,
+    matvec_q6_k,
+    matmul_q8_0,
+    matmul_q3_k,
+    matmul_q4_k,
+    matmul_q5_k,
+    matmul_q6_k,
+    embed_q8_0,
+    embed_q3_k,
+    embed_q4_k,
+    embed_q5_k,
+    embed_q6_k,
 
     pub fn source(k: Kernel) []const u8 {
         return switch (k) {
-            inline else => |tag| @embedFile(@tagName(tag) ++ ".wgsl"),
+            inline else => |tag| comptime composed(@tagName(tag)),
+        };
+    }
+
+    /// The kernel for an operation on weights of type `t`, if supported.
+    pub fn quant(comptime op: QuantOp, t: gguf.TensorType) ?Kernel {
+        return switch (t) {
+            inline .q8_0, .q3_k, .q4_k, .q5_k, .q6_k => |q| @field(Kernel, @tagName(op) ++ "_" ++ @tagName(q)),
+            else => null,
         };
     }
 };
+
+pub const QuantOp = enum { matvec, matmul, embed };
+
+/// A kernel's WGSL: its own file, or for `<op>_<type>` the shared quant
+/// helpers, the type's decoder and the operation's body.
+fn composed(comptime name: []const u8) []const u8 {
+    for (std.enums.values(QuantOp)) |op| {
+        const prefix = @tagName(op) ++ "_q";
+        if (std.mem.startsWith(u8, name, prefix)) {
+            const t = name[@tagName(op).len + 1 ..];
+            return @embedFile("quant/common.wgsl") ++ @embedFile("quant/" ++ t ++ ".wgsl") ++ @embedFile(@tagName(op) ++ "_quant.wgsl");
+        }
+    }
+    return @embedFile(name ++ ".wgsl");
+}
 
 /// Matrix multiply tile sizes (matmul_bf16.wgsl: TN outputs × TT tokens).
 pub const matmul_tile_n = 64;

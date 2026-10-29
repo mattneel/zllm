@@ -11,6 +11,8 @@ const Host = @import("../gpu/host.zig").Host;
 const kernels = @import("kernels.zig");
 const sampler = @import("../sampler/sampler.zig");
 const P = kernels.params;
+const gguf = @import("../gguf/gguf.zig");
+const ref_tensor = @import("../ref/tensor.zig");
 
 pub const Result = struct {
     name: []const u8,
@@ -37,11 +39,15 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,        checkMatvecNorm,
-        checkMatvecSiluPair, checkSiluMul,         checkEmbed,             checkRopeAppendF32, checkRopeAppendF16,
-        checkAttentionF32,   checkAttentionF16,    checkAttnDecode,        checkDeltaPrep,     checkDeltaRule,
-        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,    checkSamplePlain,
-        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
+        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,         checkMatvecNorm,
+        checkMatvecSiluPair, checkSiluMul,         checkEmbed,             checkRopeAppendF32,  checkRopeAppendF16,
+        checkAttentionF32,   checkAttentionF16,    checkAttnDecode,        checkDeltaPrep,      checkDeltaRule,
+        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,     checkSamplePlain,
+        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec,
+        Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,
+        Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul,
+        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantUnstaged,
+        checkQuantSiluPair,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -329,6 +335,138 @@ fn checkSiluMul(c: *Ctx) !Result {
         want[t * width + j] = g * sigmoid64(g) * gu[t * 2 * width + width + j];
     };
     return .{ .name = "silu_mul", .err = relErr(got, want), .tolerance = 1e-6 };
+}
+
+/// Random blocks of quantized type `t` for `rows` rows of `k` weights: every
+/// byte random except the f16 super-scales, which are finite; plus their
+/// values decoded on the CPU (ref.tensor, bitwise as ggml).
+fn quantRows(c: *Ctx, t: gguf.TensorType, rows: usize, k: usize) !struct { bytes: []u8, values: []f32 } {
+    const l = t.layout().?;
+    const n_blocks = rows * k / l.block_elems;
+    const bytes = try c.arena.alloc(u8, std.mem.alignForward(usize, n_blocks * l.block_bytes, 4));
+    c.rand.bytes(bytes);
+    const scales: []const usize = switch (t) {
+        .q8_0 => &.{0},
+        .q3_k => &.{108},
+        .q4_k, .q5_k => &.{ 0, 2 },
+        .q6_k => &.{208},
+        else => unreachable,
+    };
+    for (0..n_blocks) |b| for (scales) |off| {
+        const v: f16 = @floatCast((c.rand.float(f32) * 2 - 1) * 0.05);
+        std.mem.writeInt(u16, bytes[b * l.block_bytes + off ..][0..2], @bitCast(v), .little);
+    };
+    const values = try c.arena.alloc(f32, rows * k);
+    try ref_tensor.dequantize(t, bytes[0 .. n_blocks * l.block_bytes], values);
+    return .{ .bytes = bytes, .values = values };
+}
+
+/// The quantized kernels for type `t`: the decode multiply with its norm
+/// prologue and accumulate epilogue, the prefill multiply accumulating, and
+/// the embedding gather over two table chunks.
+fn Quant(comptime t: gguf.TensorType) type {
+    return struct {
+        fn matvec(c: *Ctx) !Result {
+            return quantMatvec(c, t, "matvec " ++ @tagName(t) ++ " norm+=", 1024, false);
+        }
+
+        fn matmul(c: *Ctx) !Result {
+            const rows = 19;
+            const n = 100;
+            const k = 512;
+            const x = try c.random(rows * k, 1);
+            const w = try quantRows(c, t, n, k);
+            const init = try c.random(rows * n, 4);
+            const out = try c.upload(init);
+            try c.launcher().launch(kernels.Kernel.quant(.matmul, t).?, P.MatmulBf16{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .accumulate = 1 }, &.{
+                try c.upload(x), try c.upload(w.bytes), out,
+            }, .{ std.math.divCeil(u32, n, kernels.matmul_tile_n) catch unreachable, std.math.divCeil(u32, rows, kernels.matmul_tile_t) catch unreachable, 1 });
+            const got = try c.read(out);
+            const want = try c.arena.alloc(f64, rows * n);
+            for (0..rows) |tk| for (0..n) |j| {
+                var s: f64 = init[tk * n + j];
+                for (0..k) |i| s += @as(f64, x[tk * k + i]) * w.values[j * k + i];
+                want[tk * n + j] = s;
+            };
+            return .{ .name = "matmul " ++ @tagName(t) ++ " +=", .err = relErr(got, want), .tolerance = 1e-5 };
+        }
+
+        fn embed(c: *Ctx) !Result {
+            const vocab = 50;
+            const dim = 512;
+            const split = 30;
+            const l = t.layout().?;
+            const row_bytes = dim / l.block_elems * l.block_bytes;
+            const table = try quantRows(c, t, vocab, dim);
+            const tokens = [_]u32{ 0, 29, 30, 49, 7, 30, 12 };
+            const out = try c.output(tokens.len * dim);
+            const ta = try c.upload(&tokens);
+            for ([_][2]u32{ .{ 0, split }, .{ split, vocab - split } }) |chunk| {
+                const bytes = table.bytes[chunk[0] * row_bytes ..][0 .. chunk[1] * row_bytes];
+                const padded = try c.arena.alloc(u8, std.mem.alignForward(usize, bytes.len, 4));
+                @memcpy(padded[0..bytes.len], bytes);
+                try c.launcher().launch(kernels.Kernel.quant(.embed, t).?, P.EmbedBf16{ .dim = dim, .row0 = chunk[0], .chunk_rows = chunk[1] }, &.{ ta, try c.upload(padded), out }, .{ tokens.len, 1, 1 });
+            }
+            const got = try c.read(out);
+            const want = try c.arena.alloc(f64, tokens.len * dim);
+            for (tokens, 0..) |tok, i| for (0..dim) |e| {
+                want[i * dim + e] = table.values[tok * dim + e];
+            };
+            if (t == .q3_k) std.debug.print("got {any}\nwant {any}\n", .{ got[0..40], want[0..40] });
+            if (t == .q3_k) std.debug.print("got {any}\nwant {any}\n", .{ got[0..40], want[0..40] });
+            if (t == .q3_k) std.debug.print("got {any}\nwant {any}\n", .{ got[0..40], want[0..40] });
+            if (t == .q3_k) std.debug.print("bytes {any}\ngot {any}\nwant {any}\n", .{ table.bytes[0..110], got[0..4], want[0..4] });
+            return .{ .name = "embed " ++ @tagName(t) ++ " (2 chunks)", .err = relErr(got, want), .tolerance = 1e-6 };
+        }
+    };
+}
+
+/// The decode multiply on quantized weights: 3 tokens, 100 outputs (a
+/// partial workgroup of rows), norm prologue and accumulate epilogue; or,
+/// with `pair`, the SiLU pair over stacked gate and up rows.
+fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, pair: bool) !Result {
+    const rows = 3;
+    const n = 100;
+    const eps = 1e-6;
+    const x = try c.random(rows * k, 3);
+    const nw = try c.random(k, 1);
+    const w = try quantRows(c, t, if (pair) 2 * n else n, k);
+    const init = try c.random(rows * n, if (pair) 0 else 4);
+    const out = try c.upload(init);
+    try c.launcher().launch(kernels.Kernel.quant(.matvec, t).?, P.MatvecBf16{
+        .n = n,
+        .k = k,
+        .col0 = 0,
+        .out_stride = n,
+        .eps = eps,
+        .flags = .{ .norm = true, .accumulate = !pair, .silu_pair = pair },
+        .half = if (pair) n else 0,
+    }, &.{ try c.upload(x), try c.upload(w.bytes), out, try c.upload(nw) }, .{ std.math.divCeil(u32, n, kernels.matvec_rows) catch unreachable, rows, 1 });
+    const got = try c.read(out);
+    const want = try c.arena.alloc(f64, rows * n);
+    const xn = try c.arena.alloc(f64, k);
+    for (0..rows) |tk| {
+        normRow(xn, x[tk * k ..][0..k], nw, eps);
+        for (0..n) |j| {
+            var g: f64 = 0;
+            var u: f64 = 0;
+            for (0..k) |i| {
+                g += xn[i] * w.values[j * k + i];
+                if (pair) u += xn[i] * w.values[(n + j) * k + i];
+            }
+            want[tk * n + j] = if (pair) g * sigmoid64(g) * u else init[tk * n + j] + g;
+        }
+    }
+    return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
+}
+
+fn checkQuantUnstaged(c: *Ctx) !Result {
+    // Too wide to stage in workgroup memory, as the 27B's 5,120 is.
+    return quantMatvec(c, .q4_k, "matvec q4_k norm+= unstaged", 4096, false);
+}
+
+fn checkQuantSiluPair(c: *Ctx) !Result {
+    return quantMatvec(c, .q3_k, "matvec q3_k norm+silu pair", 1024, true);
 }
 
 fn checkEmbed(c: *Ctx) !Result {
