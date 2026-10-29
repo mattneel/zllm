@@ -44,6 +44,21 @@ jobs:
       - run: scripts/fixtures.sh vocab
       - run: zig build check-tokenizer
 
+  gpu-kernels:
+    name: GPU kernels (Dawn on llvmpipe)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+      - name: Install the Vulkan loader and Mesa's software driver
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers
+      - uses: actions/cache@v6
+        with:
+          path: .fixtures/dawn
+          key: fixtures-dawn-${{ hashFiles('scripts/fixtures.sh') }}
+      - run: scripts/fixtures.sh dawn
+      - run: zig build gpu-check
+
   web:
     name: TypeScript (Biome + tsc)
     runs-on: ubuntu-24.04
@@ -81,7 +96,7 @@ jobs:
   deploy:
     name: Deploy book to GitHub Pages
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: [zig, tokenizer, web, book]
+    needs: [zig, tokenizer, gpu-kernels, web, book]
     runs-on: ubuntu-24.04
     permissions:
       pages: write
