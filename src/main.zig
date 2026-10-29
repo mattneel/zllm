@@ -92,7 +92,10 @@ pub fn main(init: std.process.Init) !void {
         const t0 = Io.Timestamp.now(io, .awake);
         const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
         defer rt.destroy();
-        std.debug.print("[loaded in {d} ms; context {d}, {t} KV]\n", .{ t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
+        var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
+        const info = d.info(&raw);
+        std.debug.print("[{s} ({s}); loaded in {d} ms; context {d}, {t} KV]\n", .{ info.device, info.backend, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
+        d.freeInfo(raw);
         if (is_check) {
             if (!try engine_check.run(rt, out)) return error.EngineCheckFailed;
         } else if (is_chat) {
