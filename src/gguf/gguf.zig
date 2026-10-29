@@ -381,8 +381,10 @@ const Reader = struct {
             const n = std.math.mul(u64, len, size) catch return error.Truncated;
             _ = try r.take(n);
         } else switch (elem_type) {
-            .string => for (0..len) |_| {
-                _ = try r.string();
+            .string => {
+                // Each string takes at least its 8-byte length.
+                const n = std.math.cast(usize, len) orelse return error.Truncated;
+                for (0..n) |_| _ = try r.string();
             },
             // Nested arrays are legal GGUF but no known producer emits them;
             // walking them would need recursion over untrusted depth.

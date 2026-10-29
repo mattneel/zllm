@@ -17,6 +17,28 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
 
+    // zllm.wasm for the browser shim (web/src/zllm), installed as
+    // zig-out/web/zllm.wasm. Safety checks stay on by default.
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_optimize = b.option(std.builtin.OptimizeMode, "wasm-optimize", "Optimize mode for zllm.wasm (default: safe)") orelse .safe;
+    const wasm = b.addExecutable(.{
+        .name = "zllm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/api/wasm.zig"),
+            .target = wasm_target,
+            .optimize = wasm_optimize,
+            .imports = &.{.{ .name = "zllm", .module = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = wasm_target,
+                .optimize = wasm_optimize,
+            }) }},
+        }),
+    });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    const wasm_install = b.addInstallArtifact(wasm, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
+    b.step("wasm", "Build zllm.wasm for the browser").dependOn(&wasm_install.step);
+
     // Parity checks against pinned references. They need `scripts/fixtures.sh`
     // and run through the uv-managed harness in tools/. The CLI they drive is
     // always ReleaseSafe: fast enough for the reference forward pass, with

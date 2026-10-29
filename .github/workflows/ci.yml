@@ -18,13 +18,14 @@ env:
 
 jobs:
   zig:
-    name: Zig fmt + unit tests
+    name: Zig fmt, unit tests, wasm build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
       - run: zig fmt --check .
       - run: zig build test --summary all
+      - run: zig build wasm
 
   tokenizer:
     name: Tokenizer and chat template parity

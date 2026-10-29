@@ -1,7 +1,7 @@
 # api
 
-Not started; planned for M3.
+The browser entry point: `wasm.zig` builds to `zllm.wasm` (`zig build wasm`,
+installed as `zig-out/web/zllm.wasm`). Its exports drive the engine through
+the TypeScript shim in `web/src/zllm`, which owns the GPU and the model file.
 
-C ABI (`zllm_load`, `zllm_generate`, `zllm_cancel`, `zllm_unload`, `zllm_stats`), wasm exports, and the TypeScript facade.
-
-See the [spec](../../docs/src/spec.md) and [architecture](../../docs/src/architecture.md).
+See the [spec](../../docs/src/spec.md).

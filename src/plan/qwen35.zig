@@ -613,7 +613,7 @@ pub const Program = struct {
         const m: u32 = if (s.tokens) |t| @intCast(t.len) else 1;
         const path = s.path orelse Path.of(m);
         std.debug.assert(path == .prefill or m <= kernels.decode_max_rows);
-        const e: u64 = p.hp.n_embd;
+        const e: usize = p.hp.n_embd;
         std.debug.assert(m > 0 and m <= p.cfg.max_tokens and s.pos0 + m <= p.cfg.context);
         std.debug.assert(s.logit_rows <= m and (s.draw == null or s.logit_rows == 1));
 
@@ -641,7 +641,7 @@ pub const Program = struct {
         if (s.readback) |r| if (r.result_norm) |dst| try rec.readBuffer(gpa, read_token, p.h.buffer, 0, std.mem.sliceAsBytes(dst[0 .. m * e]));
 
         // Logit rows in passes of at most cfg.logit_rows.
-        const vocab: u64 = p.hp.vocab;
+        const vocab: usize = p.hp.vocab;
         var r0 = m - s.logit_rows;
         while (r0 < m) {
             const n = @min(p.cfg.logit_rows, m - r0);
