@@ -11,7 +11,7 @@ LLM inference on WebGPU from one Zig codebase, built to the standard of a server
 - **Hybrid models first.** The first targets are Qwen 3.5, 3.6 and 3.8 (Gated DeltaNet plus full attention), from 0.8B to 27B.
 - **OpenAI-style streaming API.** It's meant as a drop-in `engineFactory` for WebLLM.
 
-> **Status: pre-M0.** None of this runs yet. Milestone M0 covers the GGUF reader, the tokenizer and a CPU f32 reference forward pass for Qwen 3.5 0.8B, checked for parity against a pinned llama.cpp build. See the [roadmap](https://mattneel.github.io/zllm/spec.html#13-milestones).
+> **Status: M0 done; nothing runs on a GPU yet.** The GGUF reader, the Qwen tokenizer and a CPU f32 reference forward pass for Qwen 3.5 0.8B are in place, each checked against a pinned reference: llama.cpp gguf-dump, Hugging Face `tokenizers`, and llama.cpp's forward pass (99.76% top-1, final-state cosine ≥ 0.9998). See [Validation](https://mattneel.github.io/zllm/validation.html) and the [roadmap](https://mattneel.github.io/zllm/introduction.html#status).
 
 ## Building
 
@@ -22,10 +22,13 @@ zig build test        # unit tests
 zig fmt --check .     # formatting
 ```
 
-Parity tests need the pinned fixtures: the GGUF, the Hugging Face tokenizer and llama.cpp. All of them are checked by SHA-256 or commit hash.
+The parity checks need the pinned fixtures (GGUF, Hugging Face tokenizer, llama.cpp), each verified by SHA-256 or commit hash, plus [uv](https://docs.astral.sh/uv/):
 
 ```sh
-scripts/fixtures.sh   # downloads into .fixtures/ (gitignored)
+scripts/fixtures.sh          # downloads into .fixtures/ (gitignored)
+zig build check-gguf         # GGUF reader vs llama.cpp gguf-dump
+zig build check-tokenizer    # tokenizer vs Hugging Face
+zig build check-forward      # CPU reference vs llama.cpp
 ```
 
 ## Documentation
@@ -33,8 +36,11 @@ scripts/fixtures.sh   # downloads into .fixtures/ (gitignored)
 The book is at **[mattneel.github.io/zllm](https://mattneel.github.io/zllm/)** and contains the spec, the architecture, the GGUF tensor semantics for each model, and the validation contract. To build it locally:
 
 ```sh
+(cd web && bun install && bun run build:book)   # bundles the book's TypeScript
 mdbook serve docs
 ```
+
+See [Contributing](https://mattneel.github.io/zllm/contributing.html) for the toolchain, the checks and the commit conventions.
 
 ## Funding
 
