@@ -188,10 +188,10 @@ Measured with `zllm generate` on an RTX 5090 Laptop (D3D12), f16 KV:
 
 | Phase | M2 | Now |
 |---|---|---|
-| Prefill, a 2,457-token prompt | 1,562–1,567 tok/s | 2,781–2,807 tok/s, in 12 steps |
-| Decode, greedy, short context | 34 tok/s | 218 tok/s |
-| Decode, greedy, after the 2,457-token prompt | 27 tok/s | 219 tok/s |
-| Decode, top-k 20 + top-p 0.95 | 25 tok/s | 211–212 tok/s |
+| Prefill, a 2,457-token prompt | 1,562–1,567 tok/s | 2,848–2,854 tok/s, in 12 steps |
+| Decode, greedy, short context | 34 tok/s | 220 tok/s |
+| Decode, greedy, after the 2,457-token prompt | 27 tok/s | 221 tok/s |
+| Decode, top-k 20 + top-p 0.95 | 25 tok/s | 212–215 tok/s |
 
 `zllm bench` attributes a decode step to kernel classes by ablation: the
 step replayed without each class. It drove the decode kernels, step by step,
@@ -204,13 +204,19 @@ at position 1,056:
 | Sampler in phases across the GPU (10.6 → 0.2 ms) | 8.1 |
 | Decode attention split over cache blocks (3.0 → 0.45 ms) | 5.7 |
 | DeltaNet state in registers (1.2 → 0.35 ms) | 5.0 |
+| Matrix-vector activations in workgroup memory | 4.8–4.9 |
+| Decode attention reads V once per GQA group (0.66 → 0.34–0.40 ms) | 4.7 |
 
-What remains:
+What remains, of about 4.5 ms per step:
 
+- **Dispatches:** each step issues about 440 dispatches. A dependent dispatch
+  costs at least 2.4 µs on this GPU through D3D12, so about 1 ms goes to the
+  floor alone. Many of them are tiny: β and α are 16-row projections, and
+  every residual add and RMSNorm is its own dispatch. Fusion (M5), with
+  projections that share an input merged and adds folded into norms, is the
+  next lever.
 - **Weights:** a decode step streams 1.5 GB of BF16 weights, about 1.7 ms
-  at this GPU's bandwidth. The matrix-vector kernel reaches 0.5–0.8 TB/s of
-  it.
-- **Dispatches:** each step issues about 440 small dispatches, each with a
-  barrier, which fusion (M5) cuts down.
+  at this GPU's bandwidth. The vocabulary projection runs at that floor; the
+  body's projections average about 70% of it.
 
-Synchronizing a submission costs about 0.1 ms.
+Synchronizing a submission costs 0.1–0.2 ms.
