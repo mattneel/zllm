@@ -23,16 +23,42 @@ pub const Host = struct {
     encoder: c.WGPUCommandEncoder = null,
     pass: c.WGPUComputePassEncoder = null,
     reads: std.ArrayList(Read) = .empty,
+    /// Per-dispatch GPU time, while profiling (startProfile).
+    profile: ?Profile = null,
 
     const Read = struct { token: u32, staging: c.WGPUBuffer, dst: []u8 };
 
-    pub const Error = dawn.Error || cmd.DecodeError || Allocator.Error || error{ BadCommand, BadId };
+    /// While profiling, each dispatch runs in its own compute pass with
+    /// timestamps at its start and end, which serializes dispatches a
+    /// shared pass might overlap: totals are an upper bound on a normal
+    /// step. Times add up per pipeline.
+    pub const Profile = struct {
+        query_set: c.WGPUQuerySet,
+        resolve: c.WGPUBuffer,
+        readback: c.WGPUBuffer,
+        /// Each timed dispatch in the open submit.
+        pending: std.ArrayList(Key) = .empty,
+        /// Nanoseconds and dispatches per pipeline and grid.
+        totals: std.AutoArrayHashMapUnmanaged(Key, Total) = .empty,
+        /// Dispatches past `capacity` in one submit, not timed.
+        untimed: u64 = 0,
+
+        /// Timed dispatches per submit: two of WebGPU's at most 4096
+        /// queries per set each.
+        pub const capacity = 2048;
+
+        pub const Key = struct { pipeline: u32, grid: [3]u32 };
+        pub const Total = struct { ns: u64 = 0, count: u64 = 0 };
+    };
+
+    pub const Error = dawn.Error || cmd.DecodeError || Allocator.Error || error{ BadCommand, BadId, NoTimestamps };
 
     pub fn init(gpa: Allocator, d: *dawn.Device) Host {
         return .{ .gpa = gpa, .d = d };
     }
 
     pub fn deinit(h: *Host) void {
+        h.stopProfile();
         const p = &h.d.p;
         if (h.pass) |pass| p.ComputePassEncoderRelease(pass);
         if (h.encoder) |enc| p.CommandEncoderRelease(enc);
@@ -50,6 +76,40 @@ pub const Host = struct {
         h.shaders.deinit(h.gpa);
         h.buffers.deinit(h.gpa);
         h.* = undefined;
+    }
+
+    /// Starts timing every dispatch (Profile). Needs the device's
+    /// timestamp queries.
+    pub fn startProfile(h: *Host) Error!void {
+        if (!h.d.has_timestamps) return error.NoTimestamps;
+        if (h.profile != null) return;
+        const p = &h.d.p;
+        var qdesc = std.mem.zeroes(c.WGPUQuerySetDescriptor);
+        qdesc.type = c.WGPUQueryType_Timestamp;
+        qdesc.count = 2 * Profile.capacity;
+        const qs = p.DeviceCreateQuerySet(h.d.device, &qdesc) orelse return error.GpuError;
+        var bdesc = std.mem.zeroes(c.WGPUBufferDescriptor);
+        bdesc.size = 16 * Profile.capacity;
+        bdesc.usage = c.WGPUBufferUsage_QueryResolve | c.WGPUBufferUsage_CopySrc;
+        const resolve = p.DeviceCreateBuffer(h.d.device, &bdesc) orelse return error.GpuError;
+        bdesc.usage = c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst;
+        const readback = p.DeviceCreateBuffer(h.d.device, &bdesc) orelse return error.GpuError;
+        h.profile = .{ .query_set = qs, .resolve = resolve, .readback = readback };
+    }
+
+    /// Stops timing and frees the profile.
+    pub fn stopProfile(h: *Host) void {
+        var pr = h.profile orelse return;
+        const p = &h.d.p;
+        p.QuerySetDestroy(pr.query_set);
+        p.QuerySetRelease(pr.query_set);
+        for ([_]c.WGPUBuffer{ pr.resolve, pr.readback }) |b| {
+            p.BufferDestroy(b);
+            p.BufferRelease(b);
+        }
+        pr.pending.deinit(h.gpa);
+        pr.totals.deinit(h.gpa);
+        h.profile = null;
     }
 
     /// Runs one batch, appending completions. On `error.GpuError`,
@@ -130,12 +190,20 @@ pub const Host = struct {
             .dispatch => {
                 try need(a, 5);
                 if (a.len != 5 + a[4]) return error.BadCommand;
-                const pass = try h.computePass();
+                const timed = if (h.profile) |*pr| pr.pending.items.len < Profile.capacity else false;
+                if (h.profile) |*pr| if (!timed) {
+                    pr.untimed += 1;
+                };
+                const pass = if (timed) try h.timedPass() else try h.computePass();
                 p.ComputePassEncoderSetPipeline(pass, try get(c.WGPUComputePipeline, h.pipelines, a[0]));
                 for (a[5..], 0..) |g, i| {
                     p.ComputePassEncoderSetBindGroup(pass, @intCast(i), try get(c.WGPUBindGroup, h.bind_groups, g), 0, null);
                 }
                 p.ComputePassEncoderDispatchWorkgroups(pass, a[1], a[2], a[3]);
+                if (timed) {
+                    h.endPass();
+                    try h.profile.?.pending.append(h.gpa, .{ .pipeline = a[0], .grid = a[1..4].* });
+                }
             },
             .copy_buffer => {
                 try need(a, 8);
@@ -200,6 +268,22 @@ pub const Host = struct {
         return h.pass;
     }
 
+    /// A new compute pass that timestamps its start and end into the
+    /// profile's next two queries.
+    fn timedPass(h: *Host) Error!c.WGPUComputePassEncoder {
+        h.endPass();
+        const pr = &h.profile.?;
+        const i: u32 = @intCast(pr.pending.items.len);
+        var writes = std.mem.zeroes(c.WGPUPassTimestampWrites);
+        writes.querySet = pr.query_set;
+        writes.beginningOfPassWriteIndex = 2 * i;
+        writes.endOfPassWriteIndex = 2 * i + 1;
+        var desc = std.mem.zeroes(c.WGPUComputePassDescriptor);
+        desc.timestampWrites = &writes;
+        h.pass = h.d.p.CommandEncoderBeginComputePass(try h.encoderOrNew(), &desc) orelse return error.GpuError;
+        return h.pass;
+    }
+
     /// The encoder, with any open compute pass ended so copies can follow.
     fn copyEncoder(h: *Host) Error!c.WGPUCommandEncoder {
         h.endPass();
@@ -218,6 +302,13 @@ pub const Host = struct {
     fn submit(h: *Host) Error!void {
         const p = &h.d.p;
         h.endPass();
+        const timed: usize = if (h.profile) |pr| pr.pending.items.len else 0;
+        if (timed > 0) {
+            const pr = &h.profile.?;
+            const enc = try h.encoderOrNew();
+            p.CommandEncoderResolveQuerySet(enc, pr.query_set, 0, @intCast(2 * timed), pr.resolve, 0);
+            p.CommandEncoderCopyBufferToBuffer(enc, pr.resolve, 0, pr.readback, 0, 16 * timed);
+        }
         if (h.encoder) |enc| {
             const buf = p.CommandEncoderFinish(enc, null);
             p.CommandEncoderRelease(enc);
@@ -244,6 +335,28 @@ pub const Host = struct {
             p.BufferUnmap(r.staging);
             p.BufferRelease(r.staging);
         }
+        if (timed > 0) try h.collectProfile(timed);
+    }
+
+    /// Adds the open submit's `timed` dispatches to the profile's totals.
+    fn collectProfile(h: *Host, timed: usize) Error!void {
+        const p = &h.d.p;
+        const pr = &h.profile.?;
+        var status: c.WGPUMapAsyncStatus = c.WGPUMapAsyncStatus_Error;
+        var info = std.mem.zeroes(c.WGPUBufferMapCallbackInfo);
+        info.mode = c.WGPUCallbackMode_WaitAnyOnly;
+        info.callback = onMapped;
+        info.userdata1 = &status;
+        h.d.wait(p.BufferMapAsync(pr.readback, c.WGPUMapMode_Read, 0, 16 * timed, info));
+        if (status != c.WGPUMapAsyncStatus_Success) return error.GpuError;
+        const raw: [*]const u64 = @ptrCast(@alignCast(p.BufferGetConstMappedRange(pr.readback, 0, 16 * timed) orelse return error.GpuError));
+        for (pr.pending.items, 0..) |key, i| {
+            const t = try pr.totals.getOrPutValue(h.gpa, key, .{});
+            t.value_ptr.ns += raw[2 * i + 1] -| raw[2 * i];
+            t.value_ptr.count += 1;
+        }
+        p.BufferUnmap(pr.readback);
+        pr.pending.clearRetainingCapacity();
     }
 
     fn onWorkDone(_: c.WGPUQueueWorkDoneStatus, _: c.WGPUStringView, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {}

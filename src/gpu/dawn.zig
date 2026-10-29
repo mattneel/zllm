@@ -47,6 +47,10 @@ pub const Procs = struct {
     CommandEncoderBeginComputePass: Proc(c.WGPUProcCommandEncoderBeginComputePass),
     CommandEncoderClearBuffer: Proc(c.WGPUProcCommandEncoderClearBuffer),
     CommandEncoderCopyBufferToBuffer: Proc(c.WGPUProcCommandEncoderCopyBufferToBuffer),
+    CommandEncoderResolveQuerySet: Proc(c.WGPUProcCommandEncoderResolveQuerySet),
+    DeviceCreateQuerySet: Proc(c.WGPUProcDeviceCreateQuerySet),
+    QuerySetDestroy: Proc(c.WGPUProcQuerySetDestroy),
+    QuerySetRelease: Proc(c.WGPUProcQuerySetRelease),
     CommandEncoderFinish: Proc(c.WGPUProcCommandEncoderFinish),
     CommandEncoderRelease: Proc(c.WGPUProcCommandEncoderRelease),
     CommandBufferRelease: Proc(c.WGPUProcCommandBufferRelease),
@@ -107,6 +111,8 @@ pub const Device = struct {
     queue: c.WGPUQueue,
     limits: c.WGPULimits,
     has_f16: bool,
+    /// Timestamp queries, for profiling (Host.profile).
+    has_timestamps: bool = false,
 
     /// First uncaptured error since the last `takeError`.
     error_message: [1024]u8 = undefined,
@@ -155,10 +161,20 @@ pub const Device = struct {
         var limits = std.mem.zeroes(c.WGPULimits);
         _ = p.AdapterGetLimits(d.adapter, &limits);
         d.has_f16 = p.AdapterHasFeature(d.adapter, c.WGPUFeatureName_ShaderF16) != 0;
-        const features = [_]c.WGPUFeatureName{c.WGPUFeatureName_ShaderF16};
+        d.has_timestamps = p.AdapterHasFeature(d.adapter, c.WGPUFeatureName_TimestampQuery) != 0;
+        var features: [2]c.WGPUFeatureName = undefined;
+        var n_features: usize = 0;
+        if (d.has_f16) {
+            features[n_features] = c.WGPUFeatureName_ShaderF16;
+            n_features += 1;
+        }
+        if (d.has_timestamps) {
+            features[n_features] = c.WGPUFeatureName_TimestampQuery;
+            n_features += 1;
+        }
 
         var ddesc = std.mem.zeroes(c.WGPUDeviceDescriptor);
-        ddesc.requiredFeatureCount = if (d.has_f16) 1 else 0;
+        ddesc.requiredFeatureCount = n_features;
         ddesc.requiredFeatures = &features;
         ddesc.requiredLimits = &limits;
         ddesc.uncapturedErrorCallbackInfo.callback = onUncapturedError;

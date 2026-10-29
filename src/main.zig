@@ -8,6 +8,7 @@ const zllm = @import("zllm");
 const gen = @import("generate.zig");
 const engine_check = @import("engine_check.zig");
 const bench = @import("bench.zig");
+const profile = @import("profile.zig");
 
 const usage =
     \\usage: zllm <command> [args]
@@ -31,6 +32,8 @@ const usage =
     \\  gpu-check                           check every GPU kernel against a CPU computation
     \\  bench <model.gguf> [tokens]          time decode steps after a context of `tokens` (default
     \\                                       1024), and each kernel's share of a step
+    \\  profile <model.gguf> [tokens]        GPU time per kernel (timestamp queries) over prefill
+    \\                                       steps of `tokens` (default 32), then decode steps
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
@@ -83,11 +86,12 @@ pub fn main(init: std.process.Init) !void {
         else
             .f32;
         try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4], act);
-    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check") or std.mem.eql(u8, cmd, "bench")) {
+    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check") or std.mem.eql(u8, cmd, "bench") or std.mem.eql(u8, cmd, "profile")) {
         const is_chat = std.mem.eql(u8, cmd, "chat");
         const is_check = std.mem.eql(u8, cmd, "engine-check");
         const is_bench = std.mem.eql(u8, cmd, "bench");
-        const fixed: usize = if (is_chat or is_check or (is_bench and args.len == 3)) 3 else 4;
+        const is_profile = std.mem.eql(u8, cmd, "profile");
+        const fixed: usize = if (is_chat or is_check or ((is_bench or is_profile) and args.len == 3)) 3 else 4;
         if (args.len < fixed) return fail(usage);
         var opts = gen.Options.parse(arena, args[fixed..]) catch |err| switch (err) {
             error.InvalidUsage => return fail(usage),
@@ -106,7 +110,11 @@ pub fn main(init: std.process.Init) !void {
         const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
         defer rt.destroy();
         std.debug.print("[{s}; loaded in {d} ms; context {d}, {t} KV]\n", .{ rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
-        if (is_bench) {
+        if (is_profile) {
+            const chunk = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 32;
+            if (chunk == 0) return fail(usage);
+            try profile.run(rt, chunk, out);
+        } else if (is_bench) {
             const fill = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 1024;
             if (fill == 0 or fill >= opts.context) return fail(usage);
             try bench.run(rt, fill, out);
