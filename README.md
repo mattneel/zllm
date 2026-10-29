@@ -9,7 +9,7 @@ LLM inference on WebGPU from one Zig codebase, built to the standard of a server
 - **One core, two backends.** The same Zig core targets `wasm32-freestanding` behind a thin TypeScript shim in the browser, and Dawn natively for tests.
 - **Kernels shaped to your GPU.** WGSL is generated from templates, then autotuned, fused and cached for each GPU and model.
 - **Hybrid models first.** The first targets are Qwen 3.5, 3.6 and 3.8 (Gated DeltaNet plus full attention), from 0.8B to 27B.
-- **OpenAI-style streaming API.** It's meant as a drop-in `engineFactory` for WebLLM.
+- **OpenAI-style streaming API.** `chat.completions.create` in the browser, with the model cached on disk after the first load.
 
 > **Status: M3 done, so Qwen 3.5 0.8B runs in the browser on WebGPU, at native speed.** M0 delivered the GGUF reader, the Qwen tokenizer and a CPU f32 reference forward pass, checked against llama.cpp and Hugging Face. M1 put the forward pass on the GPU through Dawn, matching the reference on all 818 eval positions. M2 added generation:
 >
@@ -18,7 +18,7 @@ LLM inference on WebGPU from one Zig codebase, built to the standard of a server
 > - a GPU sampler with vLLM's semantics;
 > - the fixed Qwen chat template.
 >
-> M3 builds the core to `zllm.wasm` behind the `zllm.js` shim: Chrome generates the same tokens as the native host at 252–295 tok/s on an RTX 5090 Laptop, through `generate` and OpenAI-style `chat.completions.create`.
+> M3 builds the core to `zllm.wasm` behind the `zllm.js` shim: Chrome generates the same tokens as the native host at 252–295 tok/s on an RTX 5090 Laptop, through `generate` and OpenAI-style `chat.completions.create`, and reloads the cached model in about a second.
 >
 > M4's decode kernels and M5's fusion rules have started: generation runs at about 285 tok/s and prefill at about 2,890 tok/s, up from 25–34 and 1,560 at M2. See [Browser](https://mattneel.github.io/zllm/browser.html), [Generation](https://mattneel.github.io/zllm/generation.html), [Validation](https://mattneel.github.io/zllm/validation.html) and the [roadmap](https://mattneel.github.io/zllm/introduction.html#status).
 

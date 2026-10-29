@@ -20,6 +20,7 @@ import * as zllm from "./zllm.js";
 const engine = await zllm.load({
   model: "/models/Qwen3.5-0.8B-BF16.gguf", // URL (range requests), File, Blob or FileSystemFileHandle
   onProgress: ({ loaded, total }) => console.log(loaded / total),
+  // cache: false, to skip the weight cache
 });
 
 for await (const chunk of engine.generate({ prompt: "Once upon a time", maxTokens: 200 })) {
@@ -34,6 +35,7 @@ const reply = await engine.chat.completions.create({ messages, enable_thinking: 
 engine.tokenize("text"); engine.detokenize(ids);
 engine.interruptGenerate(); // or pass `signal`, or stop reading the stream
 engine.stats(); await engine.unload();
+await zllm.cacheUsage(); await zllm.clearCache();
 ```
 
 - **Requests** run one at a time; a second waits for the first. `generate`
@@ -83,6 +85,36 @@ sequenceDiagram
   in one fixed block of wasm memory. A negative return leaves an error
   message there.
 
+### Weight cache
+
+A model loaded from a URL is kept in the origin private file system (OPFS),
+so later loads read it from disk (`web/src/zllm/cache.ts`).
+
+- **Key:** a hash of the URL, the server's `ETag` or `Last-Modified`, and the
+  file size. A changed file has a new validator and so a new key, and an
+  entry is never stale. URLs served without a validator aren't cached, since
+  a change couldn't be detected. The probe that reads the validator bypasses
+  the HTTP cache, which would otherwise answer it with an old one; weight
+  reads bypass it too, so the bytes aren't stored twice.
+- **Filling:** a first load writes every range it reads into the entry,
+  which is committed, and marked complete, only after the load succeeds.
+  An interrupted load leaves an incomplete entry that later loads ignore and
+  replace. Filling a new version of a URL removes the old one.
+- **Room:** an entry is only started when the storage estimate has room for
+  the whole file, and the page asks for persistent storage so the browser
+  doesn't evict it under pressure. Local files aren't cached: they are on
+  disk already.
+
+| Qwen 3.5 0.8B BF16 (1.5 GB), Chrome | Load | Model requests |
+|---|---|---|
+| Uncached, over HTTP from localhost | 3.9–4.1 s | 248 |
+| First load, filling the cache | 4.8–5.9 s | 248 |
+| Cached | 1.0–1.2 s | 1 (the validator probe) |
+
+The cached load's output was identical to the native host's after each of:
+a fill, a reload, a changed file (refilled, one entry left), and a fill
+interrupted halfway.
+
 ### Two steps in flight
 
 A mapped readback in Chrome resolves about 3 ms after its submit, even on
@@ -124,8 +156,6 @@ ones don't.
 
 - **Model and template coverage:** only the Qwen 3.5 BF16 GGUFs, with the
   fixed Qwen template. Rendering a GGUF's own chat template with
-  `@huggingface/jinja`, tool-call parsers and WebLLM's `engineFactory` are
-  still to come.
-- **Weight cache:** weights are fetched on every load; an OPFS or IndexedDB
-  cache is one of the spec's deferred decisions.
-- **Plan cache:** a plan cache (M4) would skip setup work on reload.
+  `@huggingface/jinja`, and tool-call parsers, are still to come.
+- **Plan cache:** a plan cache (M4) would skip setup work that a cached
+  load still does: compiling pipelines and calibrating.
