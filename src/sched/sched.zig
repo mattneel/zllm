@@ -50,14 +50,25 @@ const Stream = @import("../tokenizer/stream.zig").Stream;
 
 /// Target GPU time per submission (spec §8).
 pub const budget_ns = 150 * std.time.ns_per_ms;
-/// Prefill chunk once the fixed cost is known but the per-token cost is not.
+/// Largest prefill chunk while the per-token cost is not yet known. Below it
+/// the first chunk is as many tokens as one-token steps fit in 90% of the
+/// budget: a prefill token costs no more than a whole decode step, so even a
+/// large model's first chunk stays within the budget (and far from GPU
+/// watchdogs).
 pub const first_chunk = 64;
 /// Prefill chunks end at multiples of this (or at the prompt's last two
 /// positions). Steps of a few tokens run the decode kernels, which round
 /// differently from the prefill kernels, so aligned boundaries make the
 /// kernels each prompt position goes through depend on the prompt alone,
-/// not on step timings.
-pub const chunk_align = 64;
+/// not on step timings: an aligned step has more tokens than the decode
+/// kernels take, so it runs the prefill kernels, which give the same result
+/// however a prompt is split. Small, so that a large model's steps can stay
+/// short.
+pub const chunk_align = 8;
+
+comptime {
+    std.debug.assert(chunk_align > @import("../kernels/kernels.zig").decode_max_rows);
+}
 
 pub const Request = struct {
     prompt: []const u32,
@@ -341,7 +352,7 @@ pub const Engine = struct {
         const pos = e.prefill_pos;
         const left: u32 = @intCast(e.req.prompt.len - pos);
         // Without calibration, measure the fixed cost first.
-        var m: u32 = if (e.step_ns == 0) 1 else first_chunk;
+        var m: u32 = if (e.step_ns == 0) 1 else @intCast(std.math.clamp(budget_ns / 10 * 9 / e.step_ns, 1, first_chunk));
         if (e.token_ns != 0) {
             const target: u64 = @max(budget_ns / 10 * 9, 2 * e.step_ns);
             const fit = (target -| e.step_ns) / e.token_ns;

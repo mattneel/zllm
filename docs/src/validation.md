@@ -257,7 +257,7 @@ real engine after earlier requests left state behind. Then it repeats each
 one after dropping all state. Each sampled step's logits must match, and the
 reused prompt length must be what the reuse rules say. Logits must be
 bitwise identical wherever both runs put each position through the same
-kernels. Prefill chunks end at multiples of 64, so that holds for every
+kernels. Prefill chunks end at multiples of 8, so that holds for every
 scenario but one: a prompt that extends a turn reuses the reply's tokens,
 which went through the decode kernels. That one must agree within 1e-4
 relative L2.

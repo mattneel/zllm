@@ -62,8 +62,11 @@ budget:
   - **Per-token part:** taken from the latest prefill step, because it grows
     with position (attention). That growth is also why the target is 90%.
   - **Ramp:** a chunk grows at most 4× past the step its rate came from,
-    since the rate also rises with the chunk size. The first chunk is 64
-    tokens.
+    since the rate also rises with the chunk size. Before any prefill step
+    has been measured, the first chunk is as many tokens as one-token steps
+    fit in 90% of the budget, at most 64. A prefill token never costs more
+    than a whole decode step, so this holds even for the 27B, whose
+    one-token step is far slower.
 - **Slow GPUs:** where a one-token step alone takes more than half the
   budget, smaller chunks would only add steps that each pay that cost. The
   target becomes twice the fixed cost instead. On llvmpipe, where one step
@@ -71,11 +74,14 @@ budget:
 - **Checkpoint boundaries:** chunks also end at multiples of 512 and just
   before the prompt's last token. That token then runs as its own step, which
   measures the fixed cost and produces the logits to sample.
-- **Alignment:** otherwise chunks end only at multiples of 64. Steps of at
+- **Alignment:** otherwise chunks end only at multiples of 8. Steps of at
   most 4 tokens run the decode kernels, which round differently from the
-  prefill kernels ([GPU backend](gpu.md#step-program)). Aligned boundaries
-  make the kernels each prompt position goes through depend on the prompt
-  alone, not on step timings.
+  prefill kernels ([GPU backend](gpu.md#step-program)). Every aligned step
+  is longer than that, and the prefill kernels give the same result however
+  a prompt is split, so the kernels each prompt position goes through depend
+  on the prompt alone, not on step timings. The alignment was 64 until the
+  27B: its 64-token steps alone took seconds, past Windows' 2 s GPU
+  watchdog.
 - **Decode:** one token per step. The sampler writes the token straight into
   the next step's input on the GPU, so the CPU only reads back the token id
   and its stop flag.
