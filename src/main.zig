@@ -2,6 +2,7 @@
 //! the parity harness in tools/.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const zllm = @import("zllm");
 
@@ -16,9 +17,11 @@ const usage =
     \\                                       run the CPU f32 reference on little-endian int32
     \\                                       token ids; write activation records (format in
     \\                                       tools/llama-dump/dump.cpp)
+    \\  gpu-info                            open Dawn and print the adapter and limits as JSON
     \\
     \\environment:
     \\  ZLLM_THREADS   worker threads for `forward` (default: one per physical core)
+    \\  ZLLM_DAWN      path to the Dawn library (default: libwebgpu_dawn.so / webgpu_dawn.dll)
     \\
 ;
 
@@ -36,17 +39,17 @@ pub fn main(init: std.process.Init) !void {
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "gguf-index")) {
         if (args.len != 3) return fail(usage);
-        const mapped = try mapFile(io, args[2]);
-        defer std.posix.munmap(mapped);
-        var file = try zllm.gguf.parse(gpa, mapped, true);
+        const mapped = try FileBytes.open(gpa, io, args[2]);
+        defer mapped.close(gpa);
+        var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
         defer file.deinit(gpa);
         try writeIndexJson(out, file);
     } else if (std.mem.eql(u8, cmd, "tokenize")) {
         if (args.len != 4) return fail(usage);
-        const mapped = try mapFile(io, args[2]);
-        defer std.posix.munmap(mapped);
+        const mapped = try FileBytes.open(gpa, io, args[2]);
+        defer mapped.close(gpa);
         // The tokenizer needs only metadata, so a header-only prefix suffices.
-        var file = try zllm.gguf.parse(gpa, mapped, false);
+        var file = try zllm.gguf.parse(gpa, mapped.bytes, false);
         defer file.deinit(gpa);
         var tok = try zllm.tokenizer.Tokenizer.load(gpa, file);
         defer tok.deinit(gpa);
@@ -56,6 +59,9 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "forward")) {
         if (args.len != 5) return fail(usage);
         try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4]);
+    } else if (std.mem.eql(u8, cmd, "gpu-info")) {
+        if (args.len != 2) return fail(usage);
+        try gpuInfo(gpa, init.environ_map, out);
     } else {
         return fail(usage);
     }
@@ -91,13 +97,13 @@ fn tokenizeLines(gpa: std.mem.Allocator, tok: *const zllm.tokenizer.Tokenizer, t
 }
 
 fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u8, tokens_path: []const u8, out_path: []const u8) !void {
-    const mapped = try mapFile(io, model_path);
-    defer std.posix.munmap(mapped);
-    var file = try zllm.gguf.parse(gpa, mapped, true);
+    const mapped = try FileBytes.open(gpa, io, model_path);
+    defer mapped.close(gpa);
+    var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
     defer file.deinit(gpa);
     const pool = try zllm.ref.Pool.init(gpa, io, threads);
     defer pool.deinit();
-    var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped);
+    var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped.bytes);
     defer model.deinit();
 
     const raw = try Io.Dir.cwd().readFileAlloc(io, tokens_path, gpa, .unlimited);
@@ -150,11 +156,57 @@ fn fail(msg: []const u8) error{InvalidUsage} {
     return error.InvalidUsage;
 }
 
-fn mapFile(io: Io, path: []const u8) ![]align(std.heap.page_size_min) const u8 {
-    const file = try Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    const len = try file.length(io);
-    return std.posix.mmap(null, @intCast(len), .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+/// A whole file in memory: mapped read-only on POSIX, read into the heap on
+/// Windows (where std has no mmap).
+const FileBytes = struct {
+    bytes: []align(std.heap.page_size_min) const u8,
+
+    fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !FileBytes {
+        if (builtin.os.tag == .windows) {
+            const data = try Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .unlimited, .fromByteUnits(std.heap.page_size_min), null);
+            return .{ .bytes = data };
+        }
+        const file = try Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const len = try file.length(io);
+        return .{ .bytes = try std.posix.mmap(null, @intCast(len), .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0) };
+    }
+
+    fn close(f: FileBytes, gpa: std.mem.Allocator) void {
+        if (builtin.os.tag == .windows) gpa.free(f.bytes) else std.posix.munmap(f.bytes);
+    }
+};
+
+fn gpuInfo(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *Io.Writer) !void {
+    const lib = env.get("ZLLM_DAWN") orelse zllm.gpu.dawn.default_library;
+    const d = zllm.gpu.dawn.Device.init(gpa, lib) catch |err| {
+        std.log.err("cannot open Dawn ({s}): {t}", .{ lib, err });
+        return err;
+    };
+    defer d.deinit(gpa);
+    var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
+    const info = d.info(&raw);
+    defer d.freeInfo(raw);
+
+    var s: std.json.Stringify = .{ .writer = out, .options = .{ .whitespace = .indent_1 } };
+    try s.write(.{
+        .vendor = info.vendor,
+        .architecture = info.architecture,
+        .device = info.device,
+        .description = info.description,
+        .backend = info.backend,
+        .adapter_type = info.adapter_type,
+        .shader_f16 = d.has_f16,
+        .limits = .{
+            .max_storage_buffer_binding_size = d.limits.maxStorageBufferBindingSize,
+            .max_buffer_size = d.limits.maxBufferSize,
+            .max_storage_buffers_per_shader_stage = d.limits.maxStorageBuffersPerShaderStage,
+            .max_compute_workgroup_storage_size = d.limits.maxComputeWorkgroupStorageSize,
+            .max_compute_invocations_per_workgroup = d.limits.maxComputeInvocationsPerWorkgroup,
+            .max_compute_workgroups_per_dimension = d.limits.maxComputeWorkgroupsPerDimension,
+        },
+    });
+    try out.writeByte('\n');
 }
 
 /// JSON shape mirrored by tools/check_gguf.py. Arrays are summarized by type,

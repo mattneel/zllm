@@ -4,6 +4,7 @@ pub const gguf = @import("gguf/gguf.zig");
 pub const tokenizer = @import("tokenizer/tokenizer.zig");
 pub const graph = @import("graph/graph.zig");
 pub const ref = @import("ref/ref.zig");
+pub const gpu = @import("gpu/gpu.zig");
 
 test {
     const std = @import("std");
