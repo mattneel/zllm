@@ -1,5 +1,5 @@
-// Decode attention, part 2: merges attn_split's blocks for one (query head
-// h, token t) and applies the sigmoid output gate:
+// Attention, part 2: merges attn_split's blocks for one (query head h,
+// token row0 + t) and applies the sigmoid output gate:
 //
 //   M = max_b m_b,  L = Σ_b l_b · e^(m_b − M),  o = Σ_b o_b · e^(m_b − M) / L
 //   out = o · sigmoid(gate)
@@ -14,7 +14,7 @@ struct Params {
     scale: f32,
     max_blocks: u32,
     q_row: u32,
-    _pad1: u32,
+    row0: u32,
 }
 
 struct Step {
@@ -38,11 +38,12 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     let d = lid3.x;
     let h = wg.x;
     let t = wg.y;
+    let row = p.row0 + t;
     let hd = p.head_dim;
     if (d >= hd) {
         return;
     }
-    let keys = step.pos0 + t + 1u;
+    let keys = step.pos0 + row + 1u;
     let blocks = (keys + BLOCK - 1u) / BLOCK;
     let base0 = (t * p.heads + h) * p.max_blocks * (hd + 2u);
 
@@ -58,6 +59,6 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
         l += part[base + 1u] * w;
         o += part[base + 2u + d] * w;
     }
-    let gate = qg[t * p.q_row + 2u * h * hd + hd + d];
-    out[(t * p.heads + h) * hd + d] = o / l / (1.0 + exp(-gate));
+    let gate = qg[row * p.q_row + 2u * h * hd + hd + d];
+    out[(row * p.heads + h) * hd + d] = o / l / (1.0 + exp(-gate));
 }

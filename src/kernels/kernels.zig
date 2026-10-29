@@ -25,7 +25,6 @@ pub const Kernel = enum {
     silu_mul,
     embed_bf16,
     rope_append,
-    attention,
     attn_split,
     attn_combine,
     delta_prep,
@@ -151,12 +150,20 @@ pub const matvec_quant_rows = 8;
 /// Widest input `matvec_bf16` stages in workgroup memory, which its RMSNorm
 /// prologue needs.
 pub const matvec_max_staged = 3584;
-/// Widest head `attention` and `delta_rule` handle.
+/// Widest head attention and `delta_rule` handle.
 pub const max_head_dim = 256;
 /// State columns per `delta_rule` workgroup.
 pub const delta_cols = 32;
 /// Cache positions per `attn_split` workgroup, and the largest GQA group.
 pub const attn_block = 64;
+/// Tokens per `attn_split` launch of a prefill step: a step's attention runs
+/// in chunks of this many rows, so the partials hold one chunk.
+pub const attn_rows = 32;
+
+comptime {
+    // Decode steps use the first chunk.
+    std.debug.assert(decode_max_rows <= attn_rows);
+}
 pub const attn_max_group = 8;
 /// Widest DeltaNet head `delta_prep` normalizes in one workgroup.
 pub const max_delta_head = 256;
@@ -249,17 +256,8 @@ pub const params = struct {
         eps: f32,
         _pad: [3]u32 = @splat(0),
     };
+    /// `attn_split` and `attn_combine`, for tokens row0 ...
     pub const Attention = extern struct {
-        heads: u32,
-        kv_heads: u32,
-        head_dim: u32,
-        f16: u32,
-        scale: f32,
-        q_row: u32,
-        _pad: [2]u32 = @splat(0),
-    };
-    /// `attn_split` and `attn_combine`.
-    pub const AttnDecode = extern struct {
         heads: u32,
         kv_heads: u32,
         head_dim: u32,
@@ -267,7 +265,7 @@ pub const params = struct {
         scale: f32,
         max_blocks: u32,
         q_row: u32,
-        _pad: u32 = 0,
+        row0: u32 = 0,
     };
     pub const DeltaPrep = extern struct {
         channels: u32,
@@ -495,8 +493,11 @@ pub const Grid = union(enum) {
     tiles_y: struct { x: u32, tile: u32, z: u32 = 1 },
     /// One thread per element of rows × width (`Launcher.elementwise`).
     elems: u32,
-    /// (x, ⌈keys / block⌉, rows): blocks of cache positions per token.
-    key_blocks: struct { x: u32, block: u32 },
+    /// (x, ⌈keys / block⌉, rows past row0, at most max_rows): blocks of
+    /// cache positions per token.
+    key_blocks: struct { x: u32, block: u32, row0: u32 = 0, max_rows: u32 = std.math.maxInt(u32) },
+    /// (x, rows past row0, at most max_rows, 1)
+    rows_y_from: struct { x: u32, row0: u32, max_rows: u32 },
 
     pub fn resolve(g: Grid, e: Extent) [3]u32 {
         const rows = e.rows;
@@ -506,7 +507,8 @@ pub const Grid = union(enum) {
             .rows_y => |x| .{ x, rows, 1 },
             .tiles_y => |t| .{ t.x, std.math.divCeil(u32, rows, t.tile) catch unreachable, t.z },
             .elems => |w| Launcher.elementwise(@as(usize, rows) * w),
-            .key_blocks => |k| .{ k.x, std.math.divCeil(u32, e.keys, k.block) catch unreachable, rows },
+            .key_blocks => |k| .{ k.x, std.math.divCeil(u32, e.keys, k.block) catch unreachable, @min(k.max_rows, rows -| k.row0) },
+            .rows_y_from => |r| .{ r.x, @min(r.max_rows, rows -| r.row0), 1 },
         };
     }
 };
@@ -519,8 +521,12 @@ pub const Launch = struct {
     bind_group: cmd.BindGroup,
     grid: Grid,
 
+    /// Records the launch for extent `e`; nothing if its grid is empty (a
+    /// chunk past the step's rows).
     pub fn record(l: Launch, gpa: Allocator, rec: *cmd.Recorder, e: Extent) Allocator.Error!void {
-        try rec.dispatch(gpa, l.pipeline, l.grid.resolve(e), &.{l.bind_group});
+        const g = l.grid.resolve(e);
+        if (g[0] == 0 or g[1] == 0 or g[2] == 0) return;
+        try rec.dispatch(gpa, l.pipeline, g, &.{l.bind_group});
     }
 };
 

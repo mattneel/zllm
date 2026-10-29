@@ -760,30 +760,44 @@ fn attnWant(c: *Ctx, qg: []const f32, k: []const f32, v: []const f32, first: u32
     return want;
 }
 
-/// Prefill attention for 17 queries after 270 cached positions: 287 keys
-/// span two of the kernel's 256-key tiles.
+/// Prefill attention for 70 queries after 270 cached positions, as a step
+/// runs it: attn_split and attn_combine over chunks of attn_rows tokens (32,
+/// 32, 6), each over 64-position blocks of the 340 keys, the last partial.
 fn attentionCase(c: *Ctx, name: []const u8, half: bool) !Result {
     const S = AttnShape;
     const first = 270;
-    const second = 17;
+    const second = 70;
     const total = first + second;
     const k = try c.random(total * S.width, 1);
     const v = try c.random(total * S.width, 1);
     const qg = try c.random(second * S.q_row, 1);
     const out = try c.output(second * S.heads * S.hd);
-    try c.launcher().launch(.attention, P.Attention{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = @intFromBool(half), .scale = S.scale, .q_row = S.q_row }, &.{
-        try c.upload(qg), try c.upload(try cacheWords(c, k, half)), try c.upload(try cacheWords(c, v, half)), out, try c.step(second, first, 0),
-    }, .{ S.heads, second, 1 });
+    const max_blocks = std.math.divCeil(u32, total, kernels.attn_block) catch unreachable;
+    const part = try c.output(kernels.attn_rows * S.heads * max_blocks * (S.hd + 2));
+    const qa = try c.upload(qg);
+    const ka = try c.upload(try cacheWords(c, k, half));
+    const va = try c.upload(try cacheWords(c, v, half));
+    const step = try c.step(second, first, 0);
+    const l = c.launcher();
+    var row0: u32 = 0;
+    while (row0 < second) : (row0 += kernels.attn_rows) {
+        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = @intFromBool(half), .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .row0 = row0 };
+        const split: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } };
+        const combine: kernels.Grid = .{ .rows_y_from = .{ .x = S.heads, .row0 = row0, .max_rows = kernels.attn_rows } };
+        const e: kernels.Extent = .{ .rows = second, .keys = total };
+        try l.launch(.attn_split, params, &.{ qa, ka, va, part, step }, split.resolve(e));
+        try l.launch(.attn_combine, params, &.{ qa, part, out, step }, combine.resolve(e));
+    }
     const got = try c.read(out);
     return .{ .name = name, .err = relErr(got, try attnWant(c, qg, k, v, first, second)), .tolerance = 1e-5 };
 }
 
 fn checkAttentionF32(c: *Ctx) !Result {
-    return attentionCase(c, "attention (f32 cache)", false);
+    return attentionCase(c, "attention, 3 chunks (f32 cache)", false);
 }
 
 fn checkAttentionF16(c: *Ctx) !Result {
-    return attentionCase(c, "attention (f16 cache)", true);
+    return attentionCase(c, "attention, 3 chunks (f16 cache)", true);
 }
 
 /// Decode attention: 3 queries after 150 cached positions, through
@@ -801,7 +815,7 @@ fn checkAttnDecode(c: *Ctx) !Result {
     const part = try c.output(second * S.heads * max_blocks * (S.hd + 2));
     const l = c.launcher();
     const step = try c.step(second, first, 0);
-    const params: P.AttnDecode = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row };
+    const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row };
     const qa = try c.upload(qg);
     const grid: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block } };
     try l.launch(.attn_split, params, &.{ qa, try c.upload(try cacheWords(c, k, true)), try c.upload(try cacheWords(c, v, true)), part, step }, grid.resolve(.{ .rows = second, .keys = total }));

@@ -1,5 +1,7 @@
-// Decode attention, part 1 (flash-decoding): one workgroup per (KV head g,
-// block b of BLOCK cache positions, query token t). For the GQA group of
+// Attention, part 1 (flash-decoding), for decode and prefill steps: one
+// workgroup per (KV head g, block b of BLOCK cache positions, query token
+// row0 + t). Prefill steps run it in chunks of rows starting at row0, so
+// `part` holds one chunk. For the GQA group of
 // query heads that read KV head g, it scores the block's keys (positions up
 // to pos0 + t, causal), takes a softmax local to the block, and writes per
 // head (max score, sum of exp, Σ exp · v) to `part` for attn_combine.
@@ -9,7 +11,11 @@
 // group. Cache format as in `attention` (f16 pairs or f32 bits).
 //
 // part layout per (t, head, block): [max, sum, o_0 .. o_{head_dim−1}], at
-// ((t · heads + head) · blocks + b) · (head_dim + 2), blocks = max_blocks.
+// ((t · heads + head) · blocks + b) · (head_dim + 2), blocks = max_blocks,
+// t counted from row0.
+//
+// A token's result depends only on its position and the fixed blocks, not
+// on how the sequence was split into steps or chunks.
 
 struct Params {
     heads: u32,
@@ -19,7 +25,7 @@ struct Params {
     scale: f32,
     max_blocks: u32,
     q_row: u32,
-    _pad1: u32,
+    row0: u32,
 }
 
 struct Step {
@@ -68,16 +74,17 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     let g = wg.x;
     let b = wg.y;
     let t = wg.z;
+    let row = p.row0 + t;
     let hd = p.head_dim;
     let group = p.heads / p.kv_heads;
-    let keys = step.pos0 + t + 1u;
+    let keys = step.pos0 + row + 1u;
     let k0 = b * BLOCK;
     let kv_stride = p.kv_heads * hd;
     let q_stride = p.q_row;
 
     for (var i = lid; i < group * hd; i += WG) {
         let h = g * group + i / hd;
-        qs[i] = qg[t * q_stride + 2u * h * hd + i % hd];
+        qs[i] = qg[row * q_stride + 2u * h * hd + i % hd];
     }
     workgroupBarrier();
 

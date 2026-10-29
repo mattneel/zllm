@@ -456,10 +456,11 @@ pub const Program = struct {
         const prompt_mask = try a.storage(hp.vocab);
         const counts = try a.storage(hp.vocab);
         const work = try a.storage(hp.vocab);
-        // Decode attention's per-block partials: (max, sum, output) per
-        // (token, head, block of cache positions).
+        // Attention's per-block partials: (max, sum, output) per (token,
+        // head, block of cache positions), for one chunk of a step's rows.
         const max_blocks: u32 = std.math.divCeil(u32, cfg.context, kernels.attn_block) catch unreachable;
-        const attn_part = try a.storage(@as(u64, kernels.decode_max_rows) * hp.n_head * max_blocks * (hp.head_dim + 2));
+        const attn_chunk: u64 = @min(cap, kernels.attn_rows);
+        const attn_part = try a.storage(attn_chunk * hp.n_head * max_blocks * (hp.head_dim + 2));
         const sample_state = try a.storage(kernels.sampleStateWords(hp.vocab));
 
         var b: kernels.Builder = .{ .gpa = gpa, .arena = arena, .rec = rec, .set = set };
@@ -503,26 +504,19 @@ pub const Program = struct {
                         .f16 = half,
                         .eps = hp.rms_eps,
                     }, &.{ qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
-                    const decode: P.AttnDecode = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .f16 = half, .scale = scale, .max_blocks = max_blocks, .q_row = q_row };
+                    // Split attention over blocks of cache positions, in
+                    // chunks of attn_rows tokens; a step records the chunks
+                    // its rows reach.
+                    var attn: std.ArrayList(kernels.Launch) = .empty;
+                    var row0: u32 = 0;
+                    while (row0 < capn) : (row0 += kernels.attn_rows) {
+                        const params: P.Attention = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .f16 = half, .scale = scale, .max_blocks = max_blocks, .q_row = q_row, .row0 = row0 };
+                        try attn.append(arena, try b.add(.attn_split, params, &.{ qkv, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } }));
+                        try attn.append(arena, try b.add(.attn_combine, params, &.{ qkv, attn_part, att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = row0, .max_rows = kernels.attn_rows } }));
+                    }
                     try body.append(arena, .{ .fork = .{
-                        .prefill = try concat(arena, &.{
-                            &.{try b.add(.attention, P.Attention{
-                                .heads = hp.n_head,
-                                .kv_heads = hp.n_head_kv,
-                                .head_dim = hp.head_dim,
-                                .f16 = half,
-                                .scale = scale,
-                                .q_row = q_row,
-                            }, &.{ qkv, kc, vc, att, step }, .{ .rows_y = hp.n_head })},
-                            try mm.tiled(x, .{ .plain = att }, &w.wo, true),
-                        }),
-                        .decode = try concat(arena, &.{
-                            &.{
-                                try b.add(.attn_split, decode, &.{ qkv, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block } }),
-                                try b.add(.attn_combine, decode, &.{ qkv, attn_part, att, step }, .{ .rows_y = hp.n_head }),
-                            },
-                            try mm.vector(x, att, &w.wo, .{ .accumulate = true }),
-                        }),
+                        .prefill = try concat(arena, &.{ attn.items, try mm.tiled(x, .{ .plain = att }, &w.wo, true) }),
+                        .decode = try concat(arena, &.{ attn.items[0..2], try mm.vector(x, att, &w.wo, .{ .accumulate = true }) }),
                     } });
                 },
                 .delta_net => |*w| {
