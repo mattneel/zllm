@@ -6,7 +6,7 @@
 //! and sampling the next token on the GPU. Prefill is a step with many
 //! tokens, decode a step with one.
 //!
-//! Layout: matrices stay bf16 and are split by rows into chunks that each fit
+//! Layout: matrices stay as stored (BF16, F16 or quantized) and are split by rows into chunks that each fit
 //! one storage binding (`maxStorageBufferBindingSize`).
 
 const std = @import("std");
@@ -28,14 +28,14 @@ pub const Limits = struct {
     offset_align: u64,
 };
 
-/// A bf16 matrix of `n` rows × `k` (row j = output j's weights), split by
+/// A weight matrix of `n` rows × `k` (row j = output j's weights), split by
 /// rows into chunks.
 pub const Matrix = struct {
     n: u32,
     k: u32,
     chunks: []const Chunk,
 
-    /// `type`: bf16 or a quantized type (kernels.Kernel.quant).
+    /// `type`: BF16, F16 or a quantized type (kernels.Kernel.weight).
     pub const Chunk = struct { arg: Arg, row0: u32, rows: u32, type: gguf.TensorType };
 };
 
@@ -180,7 +180,7 @@ const Upload = struct {
         return ti;
     }
 
-    /// A matrix weight: bf16, or a type the quantized kernels decode.
+    /// A matrix weight: BF16, F16, or a type the quantized kernels decode.
     fn weightInfo(u: *Upload, comptime fmt: []const u8, layer: ?usize, shape: []const u64) !*const gguf.TensorInfo {
         var buf: [96]u8 = undefined;
         const name = if (comptime std.mem.indexOf(u8, fmt, "{d}") != null)
@@ -189,7 +189,7 @@ const Upload = struct {
             fmt;
         const ti = u.file.tensor(name) orelse return error.MissingTensor;
         if (!std.mem.eql(u64, ti.shape(), shape)) return error.BadShape;
-        if (ti.type != .bf16 and kernels.Kernel.quant(.matvec, ti.type) == null) return error.UnsupportedTensorType;
+        if (kernels.Kernel.weight(.matvec, ti.type) == null) return error.UnsupportedTensorType;
         return ti;
     }
 
@@ -212,7 +212,7 @@ const Upload = struct {
         return u.tensor(fmt, layer, &.{n});
     }
 
-    /// A GGML {k, n} weight (bf16 or quantized), split into chunks of whole
+    /// A GGML {k, n} weight (half-precision or quantized), split into chunks of whole
     /// rows.
     fn matrix(u: *Upload, comptime fmt: []const u8, layer: ?usize, k: u64, n: u64) !Matrix {
         return u.stacked(layer, k, &.{.{ fmt, n }});
@@ -802,7 +802,7 @@ const Mm = struct {
             k: u64 = 0,
             fn add(s: *@This(), w: *const Matrix) void {
                 for (w.chunks) |ch| {
-                    if (ch.type != .bf16 and kernels.actBlock(ch.type) == s.block) s.k = @max(s.k, w.k);
+                    if (!kernels.isHalf(ch.type) and kernels.actBlock(ch.type) == s.block) s.k = @max(s.k, w.k);
                 }
             }
         };
@@ -820,7 +820,7 @@ const Mm = struct {
             floats: u64 = 1,
             fn add(s: *@This(), w: *const Matrix) void {
                 for (w.chunks) |ch| {
-                    if (ch.type == .bf16) continue;
+                    if (kernels.isHalf(ch.type)) continue;
                     const slices = kernels.matmulSlices(ch.rows, w.k);
                     if (slices.count > 1) s.floats = @max(s.floats, @as(u64, slices.count) * ch.rows * s.cap);
                 }
@@ -860,21 +860,21 @@ const Mm = struct {
     fn tiled(mm: Mm, out: Arg, in: Input, w: *const Matrix, accumulate: bool) Allocator.Error![]const kernels.Launch {
         std.debug.assert(w.k % kernels.matmul_tile_k == 0);
         var list: std.ArrayList(kernels.Launch) = .empty;
-        var bf16 = false;
-        for (w.chunks) |ch| bf16 = bf16 or ch.type == .bf16;
+        var half = false;
+        for (w.chunks) |ch| half = half or kernels.isHalf(ch.type);
         const x: Arg = switch (in) {
             .plain => |a| a,
             .rmsnorm => |r| r.out,
             .silu => |s| s.out,
         };
-        if (bf16) switch (in) {
+        if (half) switch (in) {
             .plain => {},
             .rmsnorm => |r| try list.append(mm.arena, try mm.b.add(.rmsnorm, P.RmsNorm{ .rows = mm.cap, .dim = w.k, .eps = mm.eps }, &.{ r.x, r.w, r.out }, .rows_x)),
             .silu => |s| try list.append(mm.arena, try mm.b.add(.silu_mul, P.SiluMul{ .count = mm.cap * s.width, .width = s.width }, &.{ s.gu, s.out }, .{ .elems = s.width })),
         };
         var rounded: [2]bool = @splat(false);
         for (w.chunks) |ch| {
-            if (ch.type == .bf16) continue;
+            if (kernels.isHalf(ch.type)) continue;
             // quantize_q8 takes 256 values per workgroup.
             std.debug.assert(w.k % 256 == 0);
             const block = kernels.actBlock(ch.type);
@@ -892,8 +892,8 @@ const Mm = struct {
         for (w.chunks) |ch| {
             const tiles = kernels.matmulTiles(ch.type);
             const x_tiles = std.math.divCeil(u32, ch.rows, tiles[0]) catch unreachable;
-            if (ch.type == .bf16) {
-                try list.append(mm.arena, try mm.b.add(.matmul_bf16, P.MatmulBf16{
+            if (kernels.isHalf(ch.type)) {
+                try list.append(mm.arena, try mm.b.add(weightKernel(.matmul, ch.type), P.MatmulBf16{
                     .rows = mm.cap,
                     .n = ch.rows,
                     .k = w.k,
@@ -952,8 +952,8 @@ const Mm = struct {
         const flags: P.MatvecBf16.Flags = .{ .norm = fuse.norm != null, .accumulate = fuse.accumulate, .silu_pair = fuse.silu_pair != null };
         const list = try mm.arena.alloc(kernels.Launch, w.chunks.len);
         for (w.chunks, list) |ch, *l| {
-            // The bf16 kernel normalizes only staged inputs.
-            if (ch.type == .bf16 and fuse.norm != null and w.k > kernels.matvec_max_staged) return error.BadConfig;
+            // The half-precision kernel normalizes only staged inputs.
+            if (kernels.isHalf(ch.type) and fuse.norm != null and w.k > kernels.matvec_max_staged) return error.BadConfig;
             const n = fuse.silu_pair orelse ch.rows;
             l.* = try mm.b.add(weightKernel(.matvec, ch.type), P.MatvecBf16{
                 .n = n,
@@ -967,21 +967,16 @@ const Mm = struct {
                 x,                       ch.arg, out,
                 // Unread without the norm; the weight is a read-only stand-in.
                 fuse.norm orelse ch.arg,
-            }, .{ .rows_y = std.math.divCeil(u32, n, if (ch.type == .bf16) kernels.matvec_rows else kernels.matvec_quant_rows) catch unreachable });
+            }, .{ .rows_y = std.math.divCeil(u32, n, if (kernels.isHalf(ch.type)) kernels.matvec_rows else kernels.matvec_quant_rows) catch unreachable });
         }
         return list;
     }
 };
 
-/// The kernel for operation `op` on a weight chunk of type `t` (bf16, or a
+/// The kernel for operation `op` on a weight chunk of type `t` (BF16, F16, or a
 /// quantized type Upload.weightInfo accepted).
 fn weightKernel(comptime op: kernels.QuantOp, t: gguf.TensorType) kernels.Kernel {
-    if (t == .bf16) return switch (op) {
-        .matvec => .matvec_bf16,
-        .matmul => .matmul_bf16,
-        .embed => .embed_bf16,
-    };
-    return kernels.Kernel.quant(op, t).?;
+    return kernels.Kernel.weight(op, t).?;
 }
 
 fn concat(arena: Allocator, parts: []const []const kernels.Launch) Allocator.Error![]const kernels.Launch {

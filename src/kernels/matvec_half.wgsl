@@ -1,10 +1,11 @@
 // out[t][col0 + j] = Σ_i x[t][i] · w[j][i]: the matrix multiply for steps of
-// a few tokens (decode). Same layout as matmul_bf16: w holds `n` rows of `k`
-// bf16 values, packed two per u32, possibly one chunk of a larger matrix.
+// a few tokens (decode). Same layout as matmul_half: w holds `n` rows of `k`
+// half-precision values (BF16 or F16, by the helper file before this one,
+// half/<type>.wgsl), packed two per u32, possibly one chunk of a larger matrix.
 // k % 8 == 0.
 //
 // A workgroup computes 8 rows for token t = workgroup_id.y. Each row's dot
-// product is split across 32 lanes: lane l reads 16-byte vectors (8 bf16
+// product is split across 32 lanes: lane l reads 16-byte vectors (8 half
 // weights) l, l + 32, ... of the row, so the lanes' loads are contiguous,
 // then the 32 partial sums are reduced in a fixed tree. The token's x is
 // staged in workgroup memory first when it fits (k ≤ MAX_STAGED), so the
@@ -47,17 +48,9 @@ var<workgroup> partial: array<f32, WG>;
 var<workgroup> partial2: array<f32, WG>;
 var<workgroup> xs: array<vec4f, MAX_STAGED / 4u>;
 
-fn lo(word: u32) -> f32 {
-    return bitcast<f32>(word << 16u);
-}
-
-fn hi(word: u32) -> f32 {
-    return bitcast<f32>(word & 0xffff0000u);
-}
-
 fn dot8(x0: vec4f, x1: vec4f, ww: vec4u) -> f32 {
-    return x0.x * lo(ww.x) + x0.y * hi(ww.x) + x0.z * lo(ww.y) + x0.w * hi(ww.y) +
-        x1.x * lo(ww.z) + x1.y * hi(ww.z) + x1.z * lo(ww.w) + x1.w * hi(ww.w);
+    return x0.x * half_lo(ww.x) + x0.y * half_hi(ww.x) + x0.z * half_lo(ww.y) + x0.w * half_hi(ww.y) +
+        x1.x * half_lo(ww.z) + x1.y * half_hi(ww.z) + x1.z * half_lo(ww.w) + x1.w * half_hi(ww.w);
 }
 
 @compute @workgroup_size(WG)

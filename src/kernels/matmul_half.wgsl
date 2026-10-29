@@ -1,6 +1,7 @@
 // out[t][col0 + j] = Σ_i x[t][i] · w[j][i] for t < rows, j < n.
 //
-// w holds `n` rows of `k` bf16 values (row j contiguous), packed two per u32
+// w holds `n` rows of `k` half-precision values (BF16 or F16, by the helper
+// file before this one, half/<type>.wgsl; row j contiguous), packed two per u32
 // little-endian. It may be one chunk of a larger matrix: `col0` places its
 // outputs, `out_stride` is the full output row width. k % TK == 0. With
 // `accumulate`, out += result (a residual add).
@@ -34,10 +35,6 @@ const WG: u32 = 256u;
 var<workgroup> xs: array<f32, TT * TK>;
 var<workgroup> ws: array<f32, TN * (TK + 1u)>;
 
-fn bf16(word: u32, hi: bool) -> f32 {
-    return bitcast<f32>(select(word << 16u, word & 0xffff0000u, hi));
-}
-
 @compute @workgroup_size(WG)
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u32) {
     let j0 = wg.x * TN;
@@ -63,8 +60,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
             if (j < p.n) {
                 word = w[(j * p.k + k0) / 2u + c];
             }
-            ws[r * (TK + 1u) + 2u * c] = bf16(word, false);
-            ws[r * (TK + 1u) + 2u * c + 1u] = bf16(word, true);
+            ws[r * (TK + 1u) + 2u * c] = half_lo(word);
+            ws[r * (TK + 1u) + 2u * c + 1u] = half_hi(word);
         }
         workgroupBarrier();
         for (var c = 0u; c < TK; c++) {

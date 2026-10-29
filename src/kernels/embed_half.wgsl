@@ -24,7 +24,6 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
     let base = (tok - p.row0) * p.dim;
     for (var i = lid.x; i < p.dim; i += 256u) {
         let word = table[(base + i) / 2u];
-        let bits = select(word << 16u, word & 0xffff0000u, (i & 1u) == 1u);
-        out[t * p.dim + i] = bitcast<f32>(bits);
+        out[t * p.dim + i] = select(half_lo(word), half_hi(word), (i & 1u) == 1u);
     }
 }

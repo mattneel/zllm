@@ -40,15 +40,16 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,         checkMatvecNorm,
-        checkMatvecSiluPair, checkSiluMul,         checkEmbed,             checkRopeAppendF32,  checkRopeAppendF16,
-        checkAttentionF32,   checkAttentionF16,    checkAttnDecode,        checkDeltaPrep,      checkDeltaRule,
-        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,     checkSamplePlain,
-        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec,
-        Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,
-        Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul,
-        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantTiles,
-        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,   checkQuantizeSilu,
+        checkRmsNorm,         checkMatmul,            checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair,  checkMatmulF16,         checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,         checkEmbed,             checkRopeAppendF32,  checkRopeAppendF16,     checkAttentionF32,
+        checkAttentionF16,    checkAttnDecode,        checkDeltaPrep,      checkDeltaRule,         checkSampleGreedy,
+        checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,     checkSamplePlain,       checkSampleTopK1,
+        checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec,    Quant(.q8_0).matmul,
+        Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,     Quant(.q4_k).matvec,
+        Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul,    Quant(.q5_k).embed,
+        Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantTiles,        checkQuantSiluPair,
+        checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -96,14 +97,23 @@ const Ctx = struct {
     }
 
     /// Random bf16 values packed two per u32, and their f32 values.
-    fn randomBf16(c: *Ctx, n: usize, scale: f32) !struct { words: []u32, values: []f32 } {
+    /// n random half-precision values of type `t` (BF16 or F16), packed two
+    /// per word, and the values they hold.
+    fn randomHalf(c: *Ctx, t: gguf.TensorType, n: usize, scale: f32) !struct { words: []u32, values: []f32 } {
         std.debug.assert(n % 2 == 0);
         const words = try c.arena.alloc(u32, n / 2);
         const values = try c.arena.alloc(f32, n);
         for (values, 0..) |*v, i| {
             const f = (c.rand.float(f32) * 2 - 1) * scale;
-            const bits: u16 = @truncate(@as(u32, @bitCast(f)) >> 16);
-            v.* = @bitCast(@as(u32, bits) << 16);
+            const bits: u16 = switch (t) {
+                .bf16 => @truncate(@as(u32, @bitCast(f)) >> 16),
+                .f16 => @bitCast(@as(f16, @floatCast(f))),
+                else => unreachable,
+            };
+            v.* = switch (t) {
+                .bf16 => @bitCast(@as(u32, bits) << 16),
+                else => @as(f16, @bitCast(bits)),
+            };
             if (i % 2 == 0) words[i / 2] = bits else words[i / 2] |= @as(u32, bits) << 16;
         }
         return .{ .words = words, .values = values };
@@ -185,9 +195,9 @@ fn checkRmsNorm(c: *Ctx) !Result {
 }
 
 /// With `accumulate`, the output starts random and the product adds to it.
-fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32, accumulate: bool) !Result {
+fn matmulCase(c: *Ctx, comptime wt: gguf.TensorType, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32, accumulate: bool) !Result {
     const x = try c.random(rows * k, 1);
-    const w = try c.randomBf16(n * k, 1);
+    const w = try c.randomHalf(wt, n * k, 1);
     const init = try c.random(rows * n, if (accumulate) 4 else 0);
     const out = try c.upload(init);
     const xa = try c.upload(x);
@@ -197,7 +207,7 @@ fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32,
     for ([_]u32{ split orelse n, n - (split orelse n) }) |cols| {
         if (cols == 0) continue;
         const wa = try c.upload(w.words[col0 * k / 2 ..][0 .. cols * k / 2]);
-        try l.launch(.matmul_bf16, P.MatmulBf16{ .rows = rows, .n = cols, .k = k, .col0 = col0, .out_stride = n, .accumulate = @intFromBool(accumulate) }, &.{ xa, wa, out }, .{
+        try l.launch(comptime kernels.Kernel.weight(.matmul, wt).?, P.MatmulBf16{ .rows = rows, .n = cols, .k = k, .col0 = col0, .out_stride = n, .accumulate = @intFromBool(accumulate) }, &.{ xa, wa, out }, .{
             std.math.divCeil(u32, cols, kernels.matmul_tile_n) catch unreachable,
             std.math.divCeil(u32, rows, kernels.matmul_tile_t) catch unreachable,
             1,
@@ -217,33 +227,41 @@ fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32,
 
 fn checkMatmul(c: *Ctx) !Result {
     // 19 tokens and 100 outputs leave partial tiles in both dimensions.
-    return matmulCase(c, "matmul_bf16", 19, 100, 1024, null, false);
+    return matmulCase(c, .bf16, "matmul_bf16", 19, 100, 1024, null, false);
+}
+
+fn checkMatmulF16(c: *Ctx) !Result {
+    return matmulCase(c, .f16, "matmul_f16", 19, 100, 1024, null, false);
 }
 
 fn checkMatmulChunked(c: *Ctx) !Result {
-    return matmulCase(c, "matmul_bf16 (2 chunks, +=)", 33, 150, 96, 70, true);
+    return matmulCase(c, .bf16, "matmul_bf16 (2 chunks, +=)", 33, 150, 96, 70, true);
 }
 
 fn checkMatvec(c: *Ctx) !Result {
     // 3 tokens, 100 outputs (a partial workgroup of rows), split into two
     // chunks; k = 4000 is too wide to stage and leaves a partial pass over
     // the 32 lanes.
-    return matvecCase(c, "matvec_bf16 (2 chunks)", 4000, 37, false);
+    return matvecCase(c, .bf16, "matvec_bf16 (2 chunks)", 4000, 37, false);
 }
 
 fn checkMatvecNorm(c: *Ctx) !Result {
-    return matvecCase(c, "matvec_bf16 norm+= (2 chunks)", 1000, 37, true);
+    return matvecCase(c, .bf16, "matvec_bf16 norm+= (2 chunks)", 1000, 37, true);
+}
+
+fn checkMatvecNormF16(c: *Ctx) !Result {
+    return matvecCase(c, .f16, "matvec_f16 norm+= (2 chunks)", 1000, 37, true);
 }
 
 /// out (+)= rmsnorm(x) · w for 3 tokens and 100 outputs in two chunks; with
 /// `fused`, the RMSNorm prologue and accumulate epilogue are on.
-fn matvecCase(c: *Ctx, name: []const u8, k: u32, split: u32, fused: bool) !Result {
+fn matvecCase(c: *Ctx, comptime wt: gguf.TensorType, name: []const u8, k: u32, split: u32, fused: bool) !Result {
     const rows = 3;
     const n = 100;
     const eps = 1e-6;
     const x = try c.random(rows * k, 3);
     const nw = try c.random(k, 1);
-    const w = try c.randomBf16(n * k, 1);
+    const w = try c.randomHalf(wt, n * k, 1);
     const init = try c.random(rows * n, if (fused) 4 else 0);
     const out = try c.upload(init);
     const xa = try c.upload(x);
@@ -251,7 +269,7 @@ fn matvecCase(c: *Ctx, name: []const u8, k: u32, split: u32, fused: bool) !Resul
     var col0: u32 = 0;
     for ([_]u32{ split, n - split }) |cols| {
         const wa = try c.upload(w.words[col0 * k / 2 ..][0 .. cols * k / 2]);
-        try c.launcher().launch(.matvec_bf16, P.MatvecBf16{
+        try c.launcher().launch(comptime kernels.Kernel.weight(.matvec, wt).?, P.MatvecBf16{
             .n = cols,
             .k = k,
             .col0 = col0,
@@ -286,15 +304,23 @@ fn normRow(out: []f64, x: []const f32, w: ?[]const f32, eps: f64) void {
 /// The FFN up-projection: act = silu(rmsnorm(x) · gate) · (rmsnorm(x) · up),
 /// gate and up stacked in one matrix.
 fn checkMatvecSiluPair(c: *Ctx) !Result {
+    return siluPairCase(c, .bf16, "matvec_bf16 norm+silu pair");
+}
+
+fn checkMatvecSiluPairF16(c: *Ctx) !Result {
+    return siluPairCase(c, .f16, "matvec_f16 norm+silu pair");
+}
+
+fn siluPairCase(c: *Ctx, comptime wt: gguf.TensorType, name: []const u8) !Result {
     const rows = 3;
     const ff = 100;
     const k = 1024;
     const eps = 1e-6;
     const x = try c.random(rows * k, 3);
     const nw = try c.random(k, 1);
-    const w = try c.randomBf16(2 * ff * k, 1);
+    const w = try c.randomHalf(wt, 2 * ff * k, 1);
     const out = try c.output(rows * ff);
-    try c.launcher().launch(.matvec_bf16, P.MatvecBf16{
+    try c.launcher().launch(comptime kernels.Kernel.weight(.matvec, wt).?, P.MatvecBf16{
         .n = ff,
         .k = k,
         .col0 = 0,
@@ -318,7 +344,7 @@ fn checkMatvecSiluPair(c: *Ctx) !Result {
             want[t * ff + j] = g * sigmoid64(g) * u;
         }
     }
-    return .{ .name = "matvec_bf16 norm+silu pair", .err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 fn checkSiluMul(c: *Ctx) !Result {
@@ -591,24 +617,32 @@ fn checkQuantSiluPair(c: *Ctx) !Result {
 }
 
 fn checkEmbed(c: *Ctx) !Result {
+    return embedCase(c, .bf16, "embed_bf16 (2 chunks)");
+}
+
+fn checkEmbedF16(c: *Ctx) !Result {
+    return embedCase(c, .f16, "embed_f16 (2 chunks)");
+}
+
+fn embedCase(c: *Ctx, comptime wt: gguf.TensorType, name: []const u8) !Result {
     const vocab = 50;
     const dim = 64;
     const split = 30;
-    const table = try c.randomBf16(vocab * dim, 1);
+    const table = try c.randomHalf(wt, vocab * dim, 1);
     const tokens = [_]u32{ 0, 29, 30, 49, 7, 30, 12 };
     const out = try c.output(tokens.len * dim);
     const ta = try c.upload(&tokens);
     const l = c.launcher();
     for ([_][2]u32{ .{ 0, split }, .{ split, vocab - split } }) |chunk| {
         const words = table.words[chunk[0] * dim / 2 ..][0 .. chunk[1] * dim / 2];
-        try l.launch(.embed_bf16, P.EmbedBf16{ .dim = dim, .row0 = chunk[0], .chunk_rows = chunk[1] }, &.{ ta, try c.upload(words), out }, .{ tokens.len, 1, 1 });
+        try l.launch(comptime kernels.Kernel.weight(.embed, wt).?, P.EmbedBf16{ .dim = dim, .row0 = chunk[0], .chunk_rows = chunk[1] }, &.{ ta, try c.upload(words), out }, .{ tokens.len, 1, 1 });
     }
     const got = try c.read(out);
     const want = try c.arena.alloc(f64, tokens.len * dim);
     for (tokens, 0..) |tok, t| for (0..dim) |i| {
         want[t * dim + i] = table.values[tok * dim + i];
     };
-    return .{ .name = "embed_bf16 (2 chunks)", .err = relErr(got, want), .tolerance = 0 };
+    return .{ .name = name, .err = relErr(got, want), .tolerance = 0 };
 }
 
 fn sigmoid64(x: f64) f64 {

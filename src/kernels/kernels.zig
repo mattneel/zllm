@@ -19,11 +19,16 @@ const gguf = @import("../gguf/gguf.zig");
 
 pub const Kernel = enum {
     rmsnorm,
+    // Half-precision weights: matvec_half.wgsl, matmul_half.wgsl and
+    // embed_half.wgsl, each composed with half/<type>.wgsl.
     matmul_bf16,
+    matmul_f16,
     matmul_reduce,
     matvec_bf16,
+    matvec_f16,
     silu_mul,
     embed_bf16,
+    embed_f16,
     rope_append,
     attn_split,
     attn_combine,
@@ -66,6 +71,15 @@ pub const Kernel = enum {
             else => null,
         };
     }
+
+    /// The kernel for operation `op` on weights of type `t`, if supported:
+    /// half-precision (BF16, F16) or quantized.
+    pub fn weight(comptime op: QuantOp, t: gguf.TensorType) ?Kernel {
+        return switch (t) {
+            inline .bf16, .f16 => |h| @field(Kernel, @tagName(op) ++ "_" ++ @tagName(h)),
+            else => quant(op, t),
+        };
+    }
 };
 
 pub const QuantOp = enum { matvec, matmul, embed };
@@ -84,9 +98,25 @@ pub fn blockStride(t: gguf.TensorType) u32 {
     };
 }
 
-/// A kernel's WGSL: its own file, or for `<op>_<type>` the shared quant
-/// helpers, the type's decoder and the operation's body.
+/// Whether weights of type `t` take the half-precision kernels, which read
+/// them as they are and multiply in f32.
+pub fn isHalf(t: gguf.TensorType) bool {
+    return t == .bf16 or t == .f16;
+}
+
+/// A kernel's WGSL: its own file, or for `<op>_<type>` the type's helpers
+/// and the operation's body: half/<type>.wgsl and <op>_half.wgsl for BF16
+/// and F16; the shared quant helpers, the type's decoder and <op>_quant.wgsl
+/// for the quantized types.
 fn composed(comptime name: []const u8) []const u8 {
+    @setEvalBranchQuota(10_000);
+    for (std.enums.values(QuantOp)) |op| {
+        for ([_][]const u8{ "bf16", "f16" }) |h| {
+            if (std.mem.eql(u8, name, @tagName(op) ++ "_" ++ h)) {
+                return @embedFile("half/" ++ h ++ ".wgsl") ++ @embedFile(@tagName(op) ++ "_half.wgsl");
+            }
+        }
+    }
     for (std.enums.values(QuantOp)) |op| {
         const prefix = @tagName(op) ++ "_q";
         if (std.mem.startsWith(u8, name, prefix)) {
@@ -99,7 +129,7 @@ fn composed(comptime name: []const u8) []const u8 {
     return @embedFile(name ++ ".wgsl");
 }
 
-/// Matrix multiply tile sizes (matmul_bf16.wgsl: TN outputs × TT tokens).
+/// Matrix multiply tile sizes (matmul_half.wgsl: TN outputs × TT tokens).
 pub const matmul_tile_n = 64;
 pub const matmul_tile_t = 16;
 pub const matmul_tile_k = 32;
@@ -135,7 +165,7 @@ pub fn actBlock(t: gguf.TensorType) u32 {
 
 /// Tile sizes (outputs, tokens) of the prefill multiply for weights of type `t`.
 pub fn matmulTiles(t: gguf.TensorType) [2]u32 {
-    return if (t == .bf16) .{ matmul_tile_n, matmul_tile_t } else .{ matmul_quant_tile_n, matmul_quant_tile_t };
+    return if (isHalf(t)) .{ matmul_tile_n, matmul_tile_t } else .{ matmul_quant_tile_n, matmul_quant_tile_t };
 }
 
 /// Steps of at most this many tokens (decoding) use the decode kernels:
