@@ -243,5 +243,62 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
     if (try c.cancelled("cancel in prefill", p1, null)) |r| {
         _ = try c.scenario("prompt after a cancelled prefill", p1, r.resident, true);
     }
+
+    // Logprobs, greedy, with the logits read back too: each token's must be
+    // its log-softmax under them, and the top entry the token itself.
+    {
+        const e = &rt.engine;
+        e.forget();
+        const logits = try arena.alloc(f32, n_gen * vocab);
+        try e.start(.{ .prompt = other, .max_tokens = n_gen, .sampling = .{ .temperature = 0 }, .logits = logits, .logprobs = 3 });
+        var i: usize = 0;
+        var worst: f64 = 0;
+        var tops_ok = true;
+        var lps: [n_gen]f32 = undefined;
+        while (true) switch (try e.next()) {
+            .submit => |words| {
+                try rt.execute(words);
+                try e.complete(0);
+            },
+            .token => |t| {
+                const row = logits[i * vocab ..][0..vocab];
+                var max: f64 = -std.math.inf(f64);
+                for (row) |l| max = @max(max, l);
+                var sum: f64 = 0;
+                for (row) |l| sum += @exp(l - max);
+                const want = row[t.id] - max - @log(sum);
+                const lp = t.logprob orelse return error.NoLogprob;
+                worst = @max(worst, @abs(lp.logprob - want));
+                if (i < n_gen) lps[i] = lp.logprob;
+                tops_ok = tops_ok and lp.top.len == 3 and lp.top[0].id == t.id and lp.top[0].logprob >= lp.top[1].logprob and lp.top[1].logprob >= lp.top[2].logprob;
+                i += 1;
+            },
+            .wait => unreachable,
+            .done => break,
+        };
+        // Again without the check's logits buffer: the engine's own rows.
+        e.forget();
+        try e.start(.{ .prompt = other, .max_tokens = n_gen, .sampling = .{ .temperature = 0 }, .logprobs = 3 });
+        var j: usize = 0;
+        var same = true;
+        while (true) switch (try e.next()) {
+            .submit => |words| {
+                try rt.execute(words);
+                try e.complete(0);
+            },
+            .token => |t| {
+                const lp = t.logprob orelse return error.NoLogprob;
+                same = same and j < n_gen and lp.logprob == lps[j];
+                j += 1;
+            },
+            .wait => unreachable,
+            .done => break,
+        };
+        const pass = i == n_gen and j == n_gen and worst <= 1e-5 and tops_ok and same;
+        c.ok = c.ok and pass;
+        try out.print("{s} {s:<34} {d} tokens; logprob vs log-softmax of the logits within {e:.1}; top 3 {s}; {s} without the check's readback\n", .{
+            if (pass) "PASS" else "FAIL", "logprobs, greedy", i, worst, if (tops_ok) "ordered, the sampled token first" else "WRONG", if (same) "identical" else "DIFFERENT",
+        });
+    }
     return c.ok;
 }

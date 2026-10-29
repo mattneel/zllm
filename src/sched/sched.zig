@@ -87,6 +87,21 @@ pub const Request = struct {
     /// For checks: each sampled step's logits (row i at i · vocab), at least
     /// max_tokens · vocab values.
     logits: ?[]f32 = null,
+    /// Each emitted token's log-probability under the model's raw logits,
+    /// and the `logprobs` most likely tokens' (at most max_top_logprobs), as
+    /// vLLM reports them by default. Null: none.
+    logprobs: ?u32 = null,
+};
+
+/// The most top log-probabilities a request may ask for.
+pub const max_top_logprobs = 20;
+
+/// A token's log-probability, with the most likely alternatives.
+pub const Logprob = struct {
+    logprob: f32,
+    top: []const Top,
+
+    pub const Top = struct { id: u32, logprob: f32 };
 };
 
 pub const Finish = enum {
@@ -114,7 +129,7 @@ pub const Event = union(enum) {
     /// next call.
     submit: []const u32,
     /// A sampled token and the text it released (valid until the next call).
-    token: struct { id: u32, text: []const u8 },
+    token: struct { id: u32, text: []const u8, logprob: ?Logprob = null },
     /// Complete the oldest outstanding batch before anything else can happen.
     wait,
     done: struct { finish: Finish, usage: Usage },
@@ -123,7 +138,7 @@ pub const Event = union(enum) {
 /// Batches outstanding at once.
 pub const max_in_flight = 2;
 
-pub const Error = Allocator.Error || Tokenizer.DecodeError || sampler.Params.Error || error{ Busy, EmptyPrompt, PromptTooLong, TooManyStops, NotSubmitted };
+pub const Error = Allocator.Error || Tokenizer.DecodeError || sampler.Params.Error || error{ Busy, EmptyPrompt, PromptTooLong, TooManyStops, TooManyLogprobs, NotSubmitted };
 
 pub const Engine = struct {
     gpa: Allocator,
@@ -168,6 +183,13 @@ pub const Engine = struct {
     placeholder: ?u32 = null,
     /// The token to emit (phase .emit).
     emit_token: u32 = 0,
+    /// Logits rows for logprobs, one per queue slot (vocab each).
+    lp_rows: []f32 = &.{},
+    /// Where each slot's sampling step reads its logits back to.
+    lp_src: [max_in_flight][]const f32 = @splat(&.{}),
+    /// The token to emit's logprobs (phase .emit), if asked for.
+    emit_logprob: ?Logprob = null,
+    lp_top: [max_top_logprobs]Logprob.Top = undefined,
     finish: ?Finish = null,
     cancelled: bool = false,
     /// `rec` holds a batch already handed to the host: the next recording
@@ -188,6 +210,7 @@ pub const Engine = struct {
         e.rec.deinit(e.gpa);
         e.stream.deinit(e.gpa);
         e.text.deinit(e.gpa);
+        e.gpa.free(e.lp_rows);
         e.* = undefined;
     }
 
@@ -229,6 +252,15 @@ pub const Engine = struct {
         if (req.prompt.len > cfg.context) return error.PromptTooLong;
         if (req.stop_tokens.len > @import("../kernels/kernels.zig").max_stops) return error.TooManyStops;
         try req.sampling.validate(e.program.hp.vocab);
+        if (req.logprobs) |n| {
+            if (n > max_top_logprobs) return error.TooManyLogprobs;
+            const vocab = e.program.hp.vocab;
+            if (e.lp_rows.len < max_in_flight * vocab) {
+                e.gpa.free(e.lp_rows);
+                e.lp_rows = &.{};
+                e.lp_rows = try e.gpa.alloc(f32, max_in_flight * vocab);
+            }
+        }
 
         e.rec.clear();
         e.handed = false;
@@ -265,7 +297,7 @@ pub const Engine = struct {
             .idle => return error.NotSubmitted,
             .emit => {
                 e.phase = .decode;
-                return .{ .token = .{ .id = e.emit_token, .text = e.text.items } };
+                return .{ .token = .{ .id = e.emit_token, .text = e.text.items, .logprob = e.emit_logprob } };
             },
             .prefill, .decode => {},
         }
@@ -326,6 +358,7 @@ pub const Engine = struct {
 
         const token = e.sampled[slot][0];
         e.last_token = token;
+        e.emit_logprob = if (e.req.logprobs) |n| e.logprob(e.lp_src[slot], token, n) else null;
         if (e.placeholder) |i| {
             // A later step already processes this token.
             e.seq.tokens.items[i] = token;
@@ -403,7 +436,7 @@ pub const Engine = struct {
             .logit_rows = @intFromBool(last),
             .draw = if (last) e.draws.next() else null,
             .sampled = if (slot) |s| &e.sampled[s] else null,
-            .readback = if (last) e.logitsReadback() else null,
+            .readback = if (slot) |s| e.logitsReadback(s) else null,
         });
         try e.seq.append(e.gpa, tokens);
         e.prefill_pos += m;
@@ -424,7 +457,7 @@ pub const Engine = struct {
             .logit_rows = 1,
             .draw = e.draws.next(),
             .sampled = &e.sampled[slot],
-            .readback = e.logitsReadback(),
+            .readback = e.logitsReadback(slot),
         });
         const unknown = for (e.queue[0..e.queued]) |q| {
             if (q.slot != null) break true;
@@ -443,11 +476,39 @@ pub const Engine = struct {
         return slot;
     }
 
-    /// Where the logits of the sampling step being recorded go, for checks.
-    fn logitsReadback(e: *const Engine) ?plan.Program.Readback {
-        const all = e.req.logits orelse return null;
+    /// Where the logits of the sampling step being recorded (in `slot`) go:
+    /// the request's buffer, for checks, or the slot's row for logprobs.
+    fn logitsReadback(e: *Engine, slot: u32) ?plan.Program.Readback {
         const vocab = e.program.hp.vocab;
-        return .{ .logits = all[(e.samples_recorded - 1) * vocab ..][0..vocab] };
+        const row: []f32 = if (e.req.logits) |all|
+            all[(e.samples_recorded - 1) * vocab ..][0..vocab]
+        else if (e.req.logprobs != null)
+            e.lp_rows[slot * vocab ..][0..vocab]
+        else
+            return null;
+        e.lp_src[slot] = row;
+        return .{ .logits = row };
+    }
+
+    /// The log-probability of `token` under `logits`, and the `n` most likely
+    /// tokens', most likely first (ties: lower id first).
+    fn logprob(e: *Engine, logits: []const f32, token: u32, n: u32) Logprob {
+        var max: f32 = -std.math.inf(f32);
+        for (logits) |l| max = @max(max, l);
+        var sum: f64 = 0;
+        for (logits) |l| sum += @exp(@as(f64, l) - max);
+        const lse: f64 = @as(f64, max) + @log(sum);
+        const top = e.lp_top[0..n];
+        var have: usize = 0;
+        for (logits, 0..) |l, id| {
+            if (have == n and (n == 0 or l <= top[n - 1].logprob)) continue;
+            var i = if (have < n) have else n - 1;
+            while (i > 0 and top[i - 1].logprob < l) : (i -= 1) top[i] = top[i - 1];
+            top[i] = .{ .id = @intCast(id), .logprob = l };
+            if (have < n) have += 1;
+        }
+        for (top[0..have]) |*t| t.logprob = @floatCast(@as(f64, t.logprob) - lse);
+        return .{ .logprob = @floatCast(@as(f64, logits[token]) - lse), .top = top[0..have] };
     }
 
     /// Drops the resident sequence and its checkpoints: the next request
@@ -472,3 +533,21 @@ pub const Engine = struct {
         e.queued += 1;
     }
 };
+
+test "logprobs: the sampled token's and the top ones, most likely first" {
+    var e: Engine = undefined;
+    const logits = [_]f32{ 1.0, 3.0, -2.0, 3.0, 0.5, 2.0 };
+    var sum: f64 = 0;
+    for (logits) |l| sum += @exp(@as(f64, l));
+    const lse = @log(sum);
+    const lp = e.logprob(&logits, 4, 3);
+    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(0.5 - lse)), lp.logprob, 1e-6);
+    // Ties keep the lower id first.
+    try std.testing.expectEqual(@as(usize, 3), lp.top.len);
+    try std.testing.expectEqual(@as(u32, 1), lp.top[0].id);
+    try std.testing.expectEqual(@as(u32, 3), lp.top[1].id);
+    try std.testing.expectEqual(@as(u32, 5), lp.top[2].id);
+    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(2.0 - lse)), lp.top[2].logprob, 1e-6);
+    try std.testing.expectEqual(@as(usize, 0), e.logprob(&logits, 0, 0).top.len);
+    try std.testing.expectEqual(@as(usize, 6), e.logprob(&logits, 0, 20).top.len);
+}
