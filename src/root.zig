@@ -9,6 +9,7 @@ pub const kernels = @import("kernels/kernels.zig");
 pub const kernel_check = @import("kernels/check.zig");
 pub const plan = @import("plan/plan.zig");
 pub const sampler = @import("sampler/sampler.zig");
+pub const state = @import("state/state.zig");
 
 test {
     const std = @import("std");
