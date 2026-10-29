@@ -41,7 +41,7 @@ M5 has started too. The spec's fusion rules are applied by hand in the Qwen
 from 441 dispatches to 182, and decoding to about 285 tok/s. The fusion
 pass itself, which needs M4's templates, is still to come.
 
-M6 is under way. Qwen 3.8 27B at Q3_K_M loads and runs: quantized kernels
+M6 is done. Qwen 3.8 27B at Q3_K_M loads and runs: quantized kernels
 decode Q3_K to Q8_0 weights as ggml does. On the GPU it matches the CPU
 reference on every eval position, and the reference matches llama.cpp up to
 llama.cpp's own activation rounding ([Validation](validation.md#the-27b)).
@@ -61,7 +61,7 @@ See [Validation](validation.md), [GPU backend](gpu.md),
 | M3 | wasm build, JS shim, browser streaming | done |
 | M4 | Templates, tuning, plan cache | |
 | M5 | Fuser | |
-| M6 | 27B on an RTX 5090 Laptop meets the performance bar | started |
+| M6 | 27B on an RTX 5090 Laptop meets the performance bar | done |
 | M7 | Llama and Qwen3 dense, MTP speculative decoding | |
 
 ## Reading this book
