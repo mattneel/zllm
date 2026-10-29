@@ -22,7 +22,8 @@ pub fn run(rt: *gen.Runtime, context: u32, out: *Io.Writer) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Prefill `context` random tokens.
+    // Prefill `context` random tokens, in steps short enough for any model
+    // (a large one's 512-token step would trip GPU watchdogs).
     var prng: std.Random.DefaultPrng = .init(1);
     const tokens = try arena.alloc(u32, context);
     for (tokens) |*t| t.* = prng.random().uintLessThan(u32, p.hp.vocab);
@@ -31,7 +32,7 @@ pub fn run(rt: *gen.Runtime, context: u32, out: *Io.Writer) !void {
     try p.recordRequest(gpa, &rec, .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .presence_penalty = 1.5 }, tokens, &.{});
     var pos: u32 = 0;
     while (pos < context) {
-        const m = @min(p.cfg.max_tokens, context - pos);
+        const m = @min(zllm.sched.chunk_align, context - pos);
         try p.recordStep(gpa, &rec, .{ .pos0 = pos, .tokens = tokens[pos..][0..m] });
         try rec.submit(gpa, 1);
         _ = try time(rt, &rec);
