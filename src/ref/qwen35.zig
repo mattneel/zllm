@@ -62,8 +62,22 @@ const Layer = struct {
     },
 };
 
+/// The multi-token prediction (NextN) block: from position t's final hidden
+/// state and token t+1, logits for token t+2 (llama.cpp's qwen35 graph_mtp).
+const Mtp = struct {
+    enorm: []f32,
+    hnorm: []f32,
+    /// [enorm(embedding), hnorm(hidden)] → n_embd.
+    eh_proj: Matrix,
+    /// A full-attention decoder block with its own cache.
+    block: Layer,
+    head_norm: []f32,
+};
+
 pub const Model = struct {
     hp: Hparams,
+    /// The MTP block, for models that have one.
+    mtp: ?Mtp = null,
     /// Embeddings (row j = token j), also the LM head when tied.
     tok_embd: Matrix,
     /// Separate LM head, or null when tied to `tok_embd`.
@@ -101,19 +115,7 @@ pub const Model = struct {
                 .ffn_up = try l.matrix("blk.{d}.ffn_up.weight", i, &.{ e, ff }),
                 .ffn_down = try l.matrix("blk.{d}.ffn_down.weight", i, &.{ ff, e }),
                 .mixer = switch (kind) {
-                    .attention => blk: {
-                        const hd: u64 = hp.head_dim;
-                        const q_out = 2 * hd * hp.n_head;
-                        const kv_out = hd * hp.n_head_kv;
-                        break :blk .{ .attention = .{
-                            .wq = try l.matrix("blk.{d}.attn_q.weight", i, &.{ e, q_out }),
-                            .wk = try l.matrix("blk.{d}.attn_k.weight", i, &.{ e, kv_out }),
-                            .wv = try l.matrix("blk.{d}.attn_v.weight", i, &.{ e, kv_out }),
-                            .wo = try l.matrix("blk.{d}.attn_output.weight", i, &.{ hd * hp.n_head, e }),
-                            .q_norm = try l.get("blk.{d}.attn_q_norm.weight", i, &.{hd}),
-                            .k_norm = try l.get("blk.{d}.attn_k_norm.weight", i, &.{hd}),
-                        } };
-                    },
+                    .attention => .{ .attention = try l.attention(hp, i) },
                     .delta_net => blk: {
                         const d: u64 = hp.gdn_head_dim;
                         const key_dim = d * hp.gdn_k_heads;
@@ -134,8 +136,31 @@ pub const Model = struct {
             };
         }
 
+        const mtp: ?Mtp = if (hp.n_layer_nextn == 1) blk: {
+            const i: usize = hp.n_layer;
+            break :blk .{
+                .enorm = try l.get("blk.{d}.nextn.enorm.weight", i, &.{e}),
+                .hnorm = try l.get("blk.{d}.nextn.hnorm.weight", i, &.{e}),
+                .eh_proj = try l.matrix("blk.{d}.nextn.eh_proj.weight", i, &.{ 2 * e, e }),
+                .block = .{
+                    .attn_norm = try l.get("blk.{d}.attn_norm.weight", i, &.{e}),
+                    .post_norm = try l.get("blk.{d}.post_attention_norm.weight", i, &.{e}),
+                    .ffn_gate = try l.matrix("blk.{d}.ffn_gate.weight", i, &.{ e, ff }),
+                    .ffn_up = try l.matrix("blk.{d}.ffn_up.weight", i, &.{ e, ff }),
+                    .ffn_down = try l.matrix("blk.{d}.ffn_down.weight", i, &.{ ff, e }),
+                    .mixer = .{ .attention = try l.attention(hp, i) },
+                },
+                // The model's output norm where the block has no own.
+                .head_norm = if (l.has("blk.{d}.nextn.shared_head_norm.weight", i))
+                    try l.get("blk.{d}.nextn.shared_head_norm.weight", i, &.{e})
+                else
+                    try l.global("output_norm.weight", &.{e}),
+            };
+        } else null;
+
         return .{
             .hp = hp,
+            .mtp = mtp,
             .tok_embd = try l.globalMatrix("token_embd.weight", &.{ e, vocab }),
             .output = if (file.tensor("output.weight") != null)
                 try l.globalMatrix("output.weight", &.{ e, vocab })
@@ -155,8 +180,10 @@ pub const Model = struct {
 
     /// Runs `tokens` from an empty state. Reports `l_out-<i>` after each
     /// layer, then `result_norm` and `result_output` (logits), matching the
-    /// llama.cpp tensor names.
-    pub fn forward(m: *const Model, gpa: Allocator, tokens: []const u32, pool: *Pool, obs: Observer, act: mm.Activations) !void {
+    /// llama.cpp tensor names. With `mtp` (and an MTP block), then also
+    /// `mtp_logits`: row i is the block's prediction of token i + 2 from
+    /// position i's final hidden state and token i + 1 (at position i + 1).
+    pub fn forward(m: *const Model, gpa: Allocator, tokens: []const u32, pool: *Pool, obs: Observer, act: mm.Activations, mtp: bool) !void {
         const hp = m.hp;
         const n = tokens.len;
         const e: usize = hp.n_embd;
@@ -184,7 +211,7 @@ pub const Model = struct {
             _ = scratch_arena.reset(.retain_capacity);
             normRows(h, x, layer.attn_norm, hp.rms_eps);
             switch (layer.mixer) {
-                .attention => |*att| try attention(scratch, hp, att, h, mix, n, pool, act),
+                .attention => |*att| try attention(scratch, hp, att, h, mix, n, 0, pool, act),
                 .delta_net => |*dn| try deltaNet(scratch, hp, dn, h, mix, n, pool, act),
             }
             for (x, mix) |*a, b| a.* += b;
@@ -203,8 +230,36 @@ pub const Model = struct {
         const vocab: usize = hp.vocab;
         const logits = try gpa.alloc(f32, n * vocab);
         defer gpa.free(logits);
-        mm.matmul(pool, logits, h, if (m.output) |*o| o else &m.tok_embd, n, act);
+        const head = if (m.output) |*o| o else &m.tok_embd;
+        mm.matmul(pool, logits, h, head, n, act);
         try obs.emit(obs.ctx, "result_output", logits, vocab, n);
+
+        const block = m.mtp orelse return;
+        if (!mtp or n < 2) return;
+        // Rows i = 0 .. n − 2: [enorm(embed(t_{i+1})), hnorm(h_i)].
+        const r = n - 1;
+        _ = scratch_arena.reset(.retain_capacity);
+        const cat = try scratch.alloc(f32, r * 2 * e);
+        for (0..r) |i| {
+            const row = cat[i * 2 * e ..][0 .. 2 * e];
+            m.tok_embd.row(tokens[i + 1], row[0..e]);
+            ops.rmsNorm(row[0..e], block.enorm, hp.rms_eps);
+            @memcpy(row[e..], h[i * e ..][0..e]);
+            ops.rmsNorm(row[e..], block.hnorm, hp.rms_eps);
+        }
+        const mx = x[0 .. r * e];
+        mm.matmul(pool, mx, cat, &block.eh_proj, r, act);
+        const mh = h[0 .. r * e];
+        const mmix = mix[0 .. r * e];
+        normRows(mh, mx, block.block.attn_norm, hp.rms_eps);
+        try attention(scratch, hp, &block.block.mixer.attention, mh, mmix, r, 1, pool, act);
+        for (mx, mmix) |*a, b| a.* += b;
+        normRows(mh, mx, block.block.post_norm, hp.rms_eps);
+        try ffn(scratch, hp, &block.block, mh, mmix, r, pool, act);
+        for (mx, mmix) |*a, b| a.* += b;
+        normRows(mh, mx, block.head_norm, hp.rms_eps);
+        mm.matmul(pool, logits[0 .. r * vocab], mh, head, r, act);
+        try obs.emit(obs.ctx, "mtp_logits", logits[0 .. r * vocab], vocab, r);
     }
 };
 
@@ -236,6 +291,26 @@ const Loader = struct {
     fn matrix(l: *Loader, comptime fmt: []const u8, layer: usize, shape: *const [2]u64) tensor.Error!Matrix {
         var buf: [96]u8 = undefined;
         return l.globalMatrix(std.fmt.bufPrint(&buf, fmt, .{layer}) catch unreachable, shape);
+    }
+
+    fn has(l: *Loader, comptime fmt: []const u8, layer: usize) bool {
+        var buf: [96]u8 = undefined;
+        return l.file.tensor(std.fmt.bufPrint(&buf, fmt, .{layer}) catch unreachable) != null;
+    }
+
+    /// Layer `i`'s gated full attention.
+    fn attention(l: *Loader, hp: Hparams, i: usize) tensor.Error!Attention {
+        const e: u64 = hp.n_embd;
+        const hd: u64 = hp.head_dim;
+        const kv_out = hd * hp.n_head_kv;
+        return .{
+            .wq = try l.matrix("blk.{d}.attn_q.weight", i, &.{ e, 2 * hd * hp.n_head }),
+            .wk = try l.matrix("blk.{d}.attn_k.weight", i, &.{ e, kv_out }),
+            .wv = try l.matrix("blk.{d}.attn_v.weight", i, &.{ e, kv_out }),
+            .wo = try l.matrix("blk.{d}.attn_output.weight", i, &.{ hd * hp.n_head, e }),
+            .q_norm = try l.get("blk.{d}.attn_q_norm.weight", i, &.{hd}),
+            .k_norm = try l.get("blk.{d}.attn_k_norm.weight", i, &.{hd}),
+        };
     }
 };
 
@@ -269,7 +344,8 @@ fn ffn(gpa: Allocator, hp: Hparams, layer: *const Layer, h: []const f32, out: []
 
 /// Gated full attention: joint Q+gate projection, per-head Q/K RMSNorm,
 /// partial NeoX RoPE, causal GQA softmax attention, sigmoid output gate.
-fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, out: []f32, n: usize, pool: *Pool, act: mm.Activations) !void {
+/// Row t is position pos0 + t.
+fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, out: []f32, n: usize, pos0: u32, pool: *Pool, act: mm.Activations) !void {
     const hd: usize = hp.head_dim;
     const n_head: usize = hp.n_head;
     const n_kv: usize = hp.n_head_kv;
@@ -290,6 +366,7 @@ fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, o
         v: []const f32,
         attn: []f32,
         n: usize,
+        pos0: u32,
 
         fn q(c: *const @This(), t: usize, hh: usize) []f32 {
             const hd_ = c.hp.head_dim;
@@ -308,7 +385,7 @@ fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, o
         fn normRope(c: *const @This(), first: usize, last: usize) void {
             const hd_ = c.hp.head_dim;
             for (first..last) |t| {
-                const pos: u32 = @intCast(t);
+                const pos: u32 = c.pos0 + @as(u32, @intCast(t));
                 for (0..c.hp.n_head) |hh| {
                     ops.rmsNorm(c.q(t, hh), c.w.q_norm, c.hp.rms_eps);
                     ops.rope(c.q(t, hh), pos, c.hp.n_rot, c.hp.rope_base);
@@ -349,7 +426,7 @@ fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, o
             }
         }
     };
-    const ctx: Ctx = .{ .hp = hp, .w = w, .qg = qg, .k = k, .v = v, .attn = attn, .n = n };
+    const ctx: Ctx = .{ .hp = hp, .w = w, .qg = qg, .k = k, .v = v, .attn = attn, .n = n, .pos0 = pos0 };
     pool.parallelFor(n, 1, 1, &ctx, Ctx.normRope);
     pool.parallelFor(n_head * n, 1, 1, &ctx, Ctx.attend);
     mm.matmul(pool, out, attn, &w.wo, n, act);

@@ -19,12 +19,14 @@ const usage =
     \\  gguf-index <model.gguf>             print header, metadata and tensor index as JSON
     \\  tokenize <model.gguf> <texts.jsonl>  for each {"text": ...} line, print
     \\                                       {"ids": [...], "decoded": ...} as one JSON line
-    \\  forward <model.gguf> <tokens.i32> <out.bin> [--llama-activations]
+    \\  forward <model.gguf> <tokens.i32> <out.bin> [--llama-activations] [--mtp]
     \\                                       run the CPU f32 reference on little-endian int32
     \\                                       token ids; write activation records (format in
     \\                                       tools/llama-dump/dump.cpp). --llama-activations
     \\                                       rounds each multiply's input as llama.cpp's CPU
-    \\                                       backend does (bf16, Q8_0 or Q8_K blocks)
+    \\                                       backend does (bf16, Q8_0 or Q8_K blocks). --mtp
+    \\                                       also writes mtp_logits: the MTP block's draft of
+    \\                                       token i + 2 at each position
     \\  dequant <type> <in.bin> <out.f32>  decode raw blocks of a GGML type (q8_0, q3_k, q4_k,
     \\                                       q5_k, q6_k, f16, bf16) to little-endian f32
     \\  chat-render <cases.jsonl>           for each {"name", "messages", "options"} line, print
@@ -87,12 +89,17 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(texts);
         try tokenizeLines(gpa, &tok, texts, out);
     } else if (std.mem.eql(u8, cmd, "forward")) {
-        if (args.len < 5 or args.len > 6) return fail(usage);
-        const act: zllm.ref.matmul.Activations = if (args.len == 6)
-            (if (std.mem.eql(u8, args[5], "--llama-activations")) .llama_cpp else return fail(usage))
-        else
-            .f32;
-        try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4], act);
+        if (args.len < 5 or args.len > 7) return fail(usage);
+        var act: zllm.ref.matmul.Activations = .f32;
+        var mtp = false;
+        for (args[5..]) |flag| {
+            if (std.mem.eql(u8, flag, "--llama-activations")) {
+                act = .llama_cpp;
+            } else if (std.mem.eql(u8, flag, "--mtp")) {
+                mtp = true;
+            } else return fail(usage);
+        }
+        try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4], act, mtp);
     } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check") or std.mem.eql(u8, cmd, "bench") or std.mem.eql(u8, cmd, "profile") or std.mem.eql(u8, cmd, "soak") or std.mem.eql(u8, cmd, "benchmark")) {
         const is_chat = std.mem.eql(u8, cmd, "chat");
         const is_check = std.mem.eql(u8, cmd, "engine-check");
@@ -228,7 +235,7 @@ fn chatRender(gpa: std.mem.Allocator, cases: []const u8, out: *Io.Writer) !void 
     }
 }
 
-fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u8, tokens_path: []const u8, out_path: []const u8, act: zllm.ref.matmul.Activations) !void {
+fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u8, tokens_path: []const u8, out_path: []const u8, act: zllm.ref.matmul.Activations, mtp: bool) !void {
     const mapped = try FileBytes.open(gpa, io, model_path);
     defer mapped.close(gpa);
     var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
@@ -247,7 +254,7 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
     var fw: Io.File.Writer = .init(out_file, io, &buf);
     var rec: RecordWriter = .{ .w = &fw.interface };
 
-    try model.forward(gpa, tokens, pool, .{ .ctx = &rec, .emit = RecordWriter.emit }, act);
+    try model.forward(gpa, tokens, pool, .{ .ctx = &rec, .emit = RecordWriter.emit }, act, mtp);
     try fw.interface.flush();
 }
 
