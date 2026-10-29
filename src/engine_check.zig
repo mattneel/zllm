@@ -300,5 +300,7 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
             if (pass) "PASS" else "FAIL", "logprobs, greedy", i, worst, if (tops_ok) "ordered, the sampled token first" else "WRONG", if (same) "identical" else "DIFFERENT",
         });
     }
+    // A failed check returns an error past the caller's flush.
+    try out.flush();
     return c.ok;
 }
