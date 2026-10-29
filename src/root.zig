@@ -10,6 +10,7 @@ pub const kernel_check = @import("kernels/check.zig");
 pub const plan = @import("plan/plan.zig");
 pub const sampler = @import("sampler/sampler.zig");
 pub const state = @import("state/state.zig");
+pub const sched = @import("sched/sched.zig");
 
 test {
     const std = @import("std");
