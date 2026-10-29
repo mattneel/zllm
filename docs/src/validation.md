@@ -148,10 +148,11 @@ hit every tile and chunk remainder:
   DeltaNet front end runs in steps of 5, 2, 1 and 4 tokens, with the delta
   rule advancing the conv history between them; steps shorter than the
   history shift it. The delta rule runs as two steps.
-- **Attention** spans two of its 256-key tiles, over a cache filled from the
-  host, with query rows padded past their gates as in the fused Q, K, V
-  projection. Decode attention spans three of its 64-position blocks, for
-  three query tokens.
+- **Attention** runs 70 query tokens after 270 cached positions as a
+  prefill step runs them, in chunks of 32, 32 and 6 tokens over six
+  64-position blocks, the last partial, with f32 and f16 caches, query
+  rows padded past their gates as in the fused Q, K, V projection. Decode
+  attention covers three query tokens over three blocks.
 - **`rope_append`** is checked over the whole projection, including the
   gates, K and V it must leave untouched, and over the cache, including the
   positions before the step, which must stay zero.
@@ -170,7 +171,7 @@ errors to within a factor of 2.
 | embed_bf16 | 0 | 0 |
 | rope_append, f32 cache | 9.3e-8 | 1e-5 |
 | rope_append, f16 cache | 5.6e-4 | 1e-3 (one f16 step) |
-| attention, f32 and f16 cache | 6.0e-7 | 1e-5 |
+| attention in 3 chunks, f32 and f16 cache | 3.0e-7 | 1e-5 |
 | attn_split + attn_combine | 2.8e-7 | 1e-5 |
 | delta_prep (4 steps) | 4.0e-8 | 1e-5 |
 | delta_rule + gated_norm (2 steps) | 2.5e-7 | 1e-5 |
@@ -400,7 +401,27 @@ and an earlier bug that left the state dirty after dropping the sequence
 failed all five. Leaving the pipelined placeholder unfilled fails the
 scenario after the pipelined stop (699 of 736 reused, want 706).
 
-## Browser
+## GPU safety
+
+The spec allows no submission over 250 ms and no device hang in a soak
+test. `zllm soak <model.gguf> [minutes]` runs requests of every shape
+through the engine: prompts of 1 to 3,000 random tokens, about half
+extending the previous one (prefix reuse, checkpoint restores), greedy and
+sampled, replies of 1 to 256 tokens, and cancellations. It times every
+submission and fails on a device error or one past the cap.
+
+| Model, RTX 5090 Laptop (D3D12) | Minutes | Submissions | Max | p99 | Over 250 ms | Device errors |
+|---|---|---|---|---|---|---|
+| Qwen 3.5 0.8B BF16 | 2 | 15,861 | 155 ms | 123 ms | 0 | 0 |
+| Qwen 3.8 27B Q3_K_M | 10 | 9,703 | 222 ms | 180 ms | 0 | 0 |
+
+The first 27B soak failed twice over. Prefill attention grew with position
+until 32-token steps at 5,000 positions took over 200 ms, now split over
+blocks of cache positions. And a step of a few tokens, run by the decode
+kernels, set the per-token rate a later chunk was sized by, making it
+three tiles long (295 ms); such steps no longer set the rate. Long
+contexts still bring 32-token steps near 220 ms.
+
 
 In Chrome on the RTX 5090, greedy generation gives the same 256 tokens as
 the native host, loaded both over HTTP and from a local file
