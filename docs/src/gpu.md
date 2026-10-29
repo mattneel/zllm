@@ -3,7 +3,10 @@
 The GPU path has three layers. The core records a **command stream**, a
 **host** executes it on WebGPU, and **kernels** are WGSL compute shaders the
 stream launches. M1 provides all three, with Dawn as the host, and runs the
-full Qwen 3.5 forward pass on the GPU at parity with the CPU reference.
+full Qwen 3.5 forward pass on the GPU at parity with the CPU reference. M2
+turns the forward pass into a **step program**: prebuilt launches that
+process any number of tokens against a KV cache and the DeltaNet state, and
+sample the next token on the GPU ([Generation](generation.md)).
 
 ## Hosts
 
@@ -22,7 +25,7 @@ Dawn's C++, and the vendored header in `third_party/dawn` fixes the ABI.
 scripts/fixtures.sh dawn          # Linux .so; under WSL with Visual Studio, also the DLL
 zig build gpu-check               # every kernel vs a CPU computation (llvmpipe)
 zig build gpu-check -Dgpu-host=d3d12
-zig build check-gpu               # full forward pass vs the CPU reference
+zig build check-gpu               # forward pass vs the CPU reference, step splits, engine
 zig build check-gpu -Dgpu-host=d3d12
 ```
 
@@ -61,6 +64,7 @@ per dispatch.
 | `read_buffer` | token, buffer, offset, size, destination |
 | `submit` | token |
 | `destroy` | kind, id |
+| `clear_buffer` | buffer, offset, size (zero-fill, ordered with dispatches) |
 
 ## Kernels
 
@@ -74,25 +78,58 @@ and widened in the shader; activations and accumulation are f32.
 | `rmsnorm` | Row RMSNorm | One workgroup per row |
 | `matmul_bf16` | x · Wᵀ | 16 tokens × 64 outputs per workgroup; tiles staged in workgroup memory |
 | `silu_mul`, `add` | SwiGLU, residual | Elementwise |
-| `qk_norm_rope` | Per-head Q/K RMSNorm, then partial NeoX RoPE | Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π] |
-| `attention` | Causal GQA with the sigmoid output gate | Scores in workgroup memory (≤ 4096 tokens) |
-| `conv_silu`, `l2norm_heads`, `gates` | DeltaNet front end | |
+| `qk_norm_rope` | Per-head Q/K RMSNorm, then partial NeoX RoPE at positions pos0 + t | Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π] |
+| `kv_append` | K and V rows into the cache at pos0 + t | f16 pairs (`pack2x16float`) or f32 |
+| `attention` | Causal GQA over the cache, with the sigmoid output gate | Online softmax over 256-key tiles; no length limit |
+| `conv_silu` | DeltaNet causal conv | One thread per channel; reads and advances the last 3 inputs |
+| `l2norm_heads`, `gates` | DeltaNet front end | |
 | `delta_rule` | Gated delta rule, then SiLU(z)-gated RMSNorm | One workgroup per value head, one thread per state column |
+| `mark_tokens` | The prompt's token set, for the repetition penalty | |
+| `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | One workgroup; see [Generation](generation.md#sampling) |
 
-These are plain WGSL in M1, written to be correct and reasonably fast. M4
+These are plain WGSL, written to be correct and reasonably fast. M4
 replaces them with templates that are tuned per GPU.
 
-## Weight layout
+## Step program
 
-`src/plan/qwen35.zig` records the forward pass. Every storage binding must
-fit `maxStorageBufferBindingSize`, which is 128 MiB on llvmpipe and 2 GiB on
-the 5090:
+`src/plan/qwen35.zig` builds everything a step needs once, as the spec's
+execution plan asks:
+
+- **Buffers:** activations sized for the largest step (512 tokens), a KV
+  cache per attention layer sized for the context, every DeltaNet layer's
+  recurrent state and conv history in one buffer, checkpoint copies of that
+  buffer, and the sampler's buffers.
+- **Launches:** every dispatch with its bind group and parameters, which are
+  packed into shared 64 KiB uniform buffers.
+
+A step is then one `write_buffer` of a 16-byte `Step` uniform
+(`m` tokens, first position `pos0`, the sampler's draw `u`), the token ids
+for prefill, and a replay of the launch list:
+
+- **Step-dependent kernels:** kernels that mix tokens or use positions
+  (RoPE, the cache append, attention, the convolution, the delta rule, the
+  sampler) read the `Step` uniform.
+- **Row-local kernels:** the rest take capacity-sized parameters, and their
+  grid covers only the step's `m` rows.
+- **Logits:** the final norm's last rows are copied into the vocabulary
+  projection's input, so decoding projects one row, not 512.
+
+One `submit` per step keeps the step uniform unambiguous: queued writes land
+before the submission they precede.
+
+Every row's arithmetic is the same whatever the step's size. A query walks
+the same key tiles from position 0, and each matrix-multiply output reduces
+in the same order. So splitting a sequence into steps of any size, including
+one token at a time as decoding does, gives bitwise identical results. That
+makes prefix reuse exact, and `check-gpu` checks it.
+
+Every storage binding must fit `maxStorageBufferBindingSize`, which is
+128 MiB on llvmpipe and 2 GiB on the 5090:
 
 - **Weight matrices** are split by rows into chunks; each chunk is its own
   buffer and its own dispatch.
-- **Matrix multiplies** also split the batch into token groups whose input
-  and output each fit one binding, at offsets that satisfy
-  `minStorageBufferOffsetAlignment`. The 248,320-row vocabulary projection
-  needs both splits on llvmpipe.
-- **DeltaNet state:** each DeltaNet layer has its own recurrent state buffer,
-  which M2 keeps across steps.
+- **The vocabulary projection** runs over at most `logit_rows` rows at a
+  time (1 when generating). A check that needs every position's logits gets
+  them in passes.
+- **Recurrent state** is bound per layer at offsets aligned to
+  `minStorageBufferOffsetAlignment`.

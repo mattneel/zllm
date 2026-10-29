@@ -7,4 +7,5 @@
 - [Qwen 3.5 GGUF semantics](qwen35.md)
 - [Validation](validation.md)
 - [GPU backend](gpu.md)
+- [Generation](generation.md)
 - [Contributing](contributing.md)

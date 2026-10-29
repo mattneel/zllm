@@ -29,16 +29,21 @@ Run these before every commit; CI runs the same:
 ```sh
 zig fmt --check . && zig build test
 (cd web && bun run check)
-scripts/fixtures.sh vocab && zig build check-tokenizer
+scripts/fixtures.sh vocab && zig build check-tokenizer && zig build check-chat
 scripts/fixtures.sh dawn && zig build gpu-check
 (cd web && bun run build:book) && mdbook build docs
 ```
 
 For changes to `gguf`, `graph` or `ref`, also run the fixture-backed checks
 `zig build check-gguf` and `zig build check-forward`. For changes to `gpu`,
-`kernels` or `plan`, run `zig build check-gpu`, and on WSL with a GPU repeat
-both GPU checks with `-Dgpu-host=d3d12`. These need the 1.5 GB model and a
-llama.cpp build (`scripts/fixtures.sh`), so CI does not run them.
+`kernels`, `plan`, `sampler`, `state` or `sched`, run `zig build check-gpu`.
+These need the 1.5 GB model and a llama.cpp build (`scripts/fixtures.sh`), so
+CI does not run them.
+
+Run `check-gpu` on a real GPU: natively on Linux, or with
+`-Dgpu-host=d3d12` on WSL. On llvmpipe it is correct but takes about half an
+hour. llvmpipe is there for `gpu-check`, which takes seconds and is what CI
+runs.
 
 ## TypeScript
 

@@ -11,7 +11,14 @@ LLM inference on WebGPU from one Zig codebase, built to the standard of a server
 - **Hybrid models first.** The first targets are Qwen 3.5, 3.6 and 3.8 (Gated DeltaNet plus full attention), from 0.8B to 27B.
 - **OpenAI-style streaming API.** It's meant as a drop-in `engineFactory` for WebLLM.
 
-> **Status: M1 done, so the forward pass runs on the GPU.** M0 delivered the GGUF reader, the Qwen tokenizer and a CPU f32 reference forward pass for Qwen 3.5 0.8B, checked against llama.cpp (99.76% top-1) and Hugging Face `tokenizers`. M1 added the Dawn backend, a command stream and eleven WGSL kernels. The full forward pass on the GPU matches the CPU reference on all 818 eval positions (relative error ~1e-5), on an RTX 5090 through D3D12 and on llvmpipe in CI. Next is M2: state, scheduling, sampling and a native chat. See [Validation](https://mattneel.github.io/zllm/validation.html) and the [roadmap](https://mattneel.github.io/zllm/introduction.html#status).
+> **Status: M2 done, so `zllm chat` runs Qwen 3.5 0.8B on the GPU natively.** M0 delivered the GGUF reader, the Qwen tokenizer and a CPU f32 reference forward pass, checked against llama.cpp and Hugging Face. M1 put the forward pass on the GPU through Dawn, matching the reference on all 818 eval positions. M2 added generation:
+>
+> - an engine that schedules steps under a 150 ms budget;
+> - KV-cache and DeltaNet-state reuse, bitwise exact against fresh runs;
+> - a GPU sampler with vLLM's semantics;
+> - the fixed Qwen chat template.
+>
+> Decode speed is an M2 baseline that M4's kernels address. Next is M3: the browser. See [Generation](https://mattneel.github.io/zllm/generation.html), [Validation](https://mattneel.github.io/zllm/validation.html) and the [roadmap](https://mattneel.github.io/zllm/introduction.html#status).
 
 ## Building
 
@@ -28,9 +35,17 @@ The parity checks need the pinned fixtures (GGUF, Hugging Face tokenizer, llama.
 scripts/fixtures.sh          # downloads into .fixtures/ (gitignored)
 zig build check-gguf         # GGUF reader vs llama.cpp gguf-dump
 zig build check-tokenizer    # tokenizer vs Hugging Face
+zig build check-chat         # chat prompts vs the pinned Jinja chat template
 zig build check-forward      # CPU reference vs llama.cpp
 zig build gpu-check          # every GPU kernel vs a CPU computation
-zig build check-gpu          # GPU forward pass vs the CPU reference
+zig build check-gpu          # GPU forward pass vs the CPU reference, step splits, engine
+```
+
+To chat (after `scripts/fixtures.sh model` and `scripts/fixtures.sh dawn`):
+
+```sh
+ZLLM_DAWN=.fixtures/dawn/libwebgpu_dawn.so zig-out/bin/zllm chat .fixtures/models/Qwen3.5-0.8B-BF16.gguf
+scripts/d3d12.sh chat "$(wslpath -w .fixtures/models/Qwen3.5-0.8B-BF16.gguf)"   # WSL, Windows GPU
 ```
 
 Add `-Dgpu-host=d3d12` to the GPU checks to run them on a Windows GPU from WSL (see [GPU backend](https://mattneel.github.io/zllm/gpu.html)).

@@ -48,16 +48,22 @@ Modules not yet started contain only a `README.md` stating their contract.
 | `kernels` | M1 | WGSL compute kernels and their launch parameters; templates with schemas and cost models in M4 |
 | `tune` | M4 | Load-time candidate sweeps |
 | `fuse` | M5 | Graph fusion pass |
-| `plan` | M1 | Weight layout (row-chunked to fit bindings), activation buffers, recorded forward pass |
-| `sched` | M2 | Submission building under the time budget |
-| `state` | M2 | KV pages, DeltaNet state, checkpoints |
-| `sampler` | M2 | GPU sampling |
+| `plan` | M1, M2 | Weight layout (row-chunked to fit bindings); the step program: buffers, state, prebuilt launches |
+| `sched` | M2 | The engine: steps under the time budget, decode, stops, streaming |
+| `state` | M2 | The resident sequence, checkpoint slots, prefix reuse |
+| `sampler` | M2 | Sampling parameters, draws, the CPU reference sampler (the kernel is in `kernels`) |
+| `chat` | M2 | The fixed Qwen chat template for text conversations |
 | `gpu` | M1 | Command stream, Dawn host (`webgpu.h` loaded at run time); browser host in M3 |
 | `api` | M3 | C ABI, wasm exports, TypeScript facade |
 
 `ref` is not in the spec's table: the spec rules out a CPU inference path in
 v1 but requires a CPU f32 reference for validation. It lives in its own module
 so that nothing outside tests depends on it.
+
+`chat` is not in the table either. In the browser, the JavaScript facade
+renders chat templates with `@huggingface/jinja`; the native command line has
+no Jinja, so it carries one fixed template, checked against the Jinja
+original.
 
 ## Async model
 
