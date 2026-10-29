@@ -1,0 +1,16 @@
+[project]
+name = "zllm-tools"
+version = "0.0.0"
+description = "Parity harness: compares zllm against pinned llama.cpp and Hugging Face references"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.3",
+    "tokenizers==0.23.3",
+    # gguf-py itself is imported from the pinned llama.cpp checkout; these are its runtime deps.
+    "pyyaml>=6",
+    "requests>=2.25",
+    "tqdm>=4.27",
+]
+
+[tool.uv]
+package = false
