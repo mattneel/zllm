@@ -53,7 +53,18 @@ export interface GenerateRequest {
   sampling?: Sampling;
   /** Strings that end generation; not part of the output. */
   stop?: string[];
+  /**
+   * Report each token's log-probability and this many most likely tokens'
+   * (0 to 20), under the model's raw logits.
+   */
+  logprobs?: number;
   signal?: AbortSignal;
+}
+
+/** A token's log-probability, with the most likely tokens'. */
+export interface TokenLogprob {
+  logprob: number;
+  top: { token: number; logprob: number }[];
 }
 
 export interface Usage {
@@ -70,6 +81,8 @@ export interface GenerateChunk {
   /** Text released by this token (may be empty while UTF-8 or a stop string is pending). */
   text: string;
   tokens: number[];
+  /** With `logprobs`. */
+  logprob?: TokenLogprob;
   /** Set on the last chunk, with `usage`. */
   finish?: FinishReason;
   usage?: Usage;
@@ -108,6 +121,9 @@ export interface ChatRequest {
   /** Qwen thinking (default on), and its effort ("none" turns it off). */
   enable_thinking?: boolean;
   reasoning_effort?: string;
+  /** Each content token's log-probability, and `top_logprobs` alternatives. */
+  logprobs?: boolean;
+  top_logprobs?: number;
   /** Functions the model may call. */
   tools?: Tool[];
   /** "auto" (default): call tools or not; "none": tools are left out. */
@@ -128,6 +144,7 @@ export interface ChatCompletionChunk {
       reasoning_content?: string;
       tool_calls?: (ToolCall & { index: number })[];
     };
+    logprobs?: { content: ChatLogprob[] } | null;
     finish_reason: ChatFinishReason | null;
   }[];
   usage?: OpenAIUsage;
@@ -146,9 +163,18 @@ export interface ChatCompletion {
       reasoning_content?: string;
       tool_calls?: ToolCall[];
     };
+    logprobs?: { content: ChatLogprob[] } | null;
     finish_reason: ChatFinishReason;
   }[];
   usage: OpenAIUsage;
+}
+
+/** A generated token's log-probability, as OpenAI reports it. */
+export interface ChatLogprob {
+  token: string;
+  logprob: number;
+  bytes: number[];
+  top_logprobs: { token: string; logprob: number; bytes: number[] }[];
 }
 
 export interface OpenAIUsage {
@@ -171,6 +197,7 @@ interface RequestJson extends SamplingJson {
   tools?: Tool[];
   enable_thinking?: boolean;
   reasoning_effort?: string | null;
+  logprobs?: number;
   max_tokens: number;
   stop: string[];
 }
@@ -315,6 +342,9 @@ export class Engine {
       stop: req.stop ?? [],
       ...samplingJson(req.sampling ?? {}),
     };
+    if (req.logprobs !== undefined) {
+      body.logprobs = req.logprobs;
+    }
     if (req.tokens !== undefined) {
       body.tokens = req.tokens;
     } else {
@@ -417,12 +447,24 @@ export class Engine {
           check(x, x.zllm_complete(await oldest));
           break;
         }
-        case Event.token:
-          yield {
+        case Event.token: {
+          const chunk: GenerateChunk = {
             text: readText(x, out.getUint32(Out.ptr, true), out.getUint32(Out.len, true)),
             tokens: [out.getUint32(Out.token, true)],
           };
+          const logprob = out.getFloat32(Out.logprob, true);
+          if (!Number.isNaN(logprob)) {
+            const at = out.getUint32(Out.topPtr, true);
+            const view = new DataView(x.memory.buffer, at, 8 * out.getUint32(Out.topCount, true));
+            const top: TokenLogprob["top"] = [];
+            for (let i = 0; i < view.byteLength; i += 8) {
+              top.push({ token: view.getUint32(i, true), logprob: view.getFloat32(i + 4, true) });
+            }
+            chunk.logprob = { logprob, top };
+          }
+          yield chunk;
           break;
+        }
         case Event.done: {
           const usage: Usage = {
             promptTokens: out.getUint32(Out.promptTokens, true),
@@ -513,6 +555,7 @@ export class Engine {
       ...(offersTools(req) ? { tools: req.tools } : {}),
       enable_thinking: thinking,
       reasoning_effort: req.reasoning_effort ?? null,
+      ...(req.logprobs === true ? { logprobs: req.top_logprobs ?? 0 } : {}),
       max_tokens: req.max_completion_tokens ?? req.max_tokens ?? 4096,
       stop: typeof req.stop === "string" ? [req.stop] : (req.stop ?? []),
       ...samplingJson(sampling),
@@ -551,7 +594,20 @@ export class Engine {
       }
     }
     for await (const c of this.#request(this.#chatBody(req), req.signal)) {
-      yield* parts(split.push(c.text));
+      const out = [...parts(split.push(c.text))];
+      if (c.logprob !== undefined) {
+        // The token's logprobs ride on its first chunk, or on an empty one
+        // while its text is held back.
+        const first = out[0] ?? chunk({}, null);
+        if (out.length === 0) {
+          out.push(first);
+        }
+        const choice = first.choices[0];
+        if (choice !== undefined) {
+          choice.logprobs = { content: [this.#chatLogprob(c.tokens[0] ?? 0, c.logprob)] };
+        }
+      }
+      yield* out;
       if (c.finish !== undefined && c.usage !== undefined) {
         yield* parts(split.flush());
         let finish: ChatFinishReason = c.finish;
@@ -576,9 +632,11 @@ export class Engine {
     let content = "";
     let reasoning = "";
     const toolCalls: ToolCall[] = [];
+    const logprobs: ChatLogprob[] = [];
     let last: ChatCompletionChunk | null = null;
     for await (const c of this.#chatStream(req)) {
       const delta = c.choices[0]?.delta;
+      logprobs.push(...(c.choices[0]?.logprobs?.content ?? []));
       content += delta?.content ?? "";
       reasoning += delta?.reasoning_content ?? "";
       for (const { index: _, ...call } of delta?.tool_calls ?? []) {
@@ -600,13 +658,33 @@ export class Engine {
     if (toolCalls.length > 0) {
       message.tool_calls = toolCalls;
     }
+    const choice: ChatCompletion["choices"][number] = { index: 0, message, finish_reason: finish };
+    if (req.logprobs === true) {
+      choice.logprobs = { content: logprobs };
+    }
     return {
       id: last.id,
       object: "chat.completion",
       created: last.created,
       model: last.model,
-      choices: [{ index: 0, message, finish_reason: finish }],
+      choices: [choice],
       usage: last.usage,
+    };
+  }
+
+  /** A token's logprobs as OpenAI reports them. */
+  #chatLogprob(id: number, lp: TokenLogprob): ChatLogprob {
+    const text = (token: number) => this.detokenize([token]);
+    const bytes = (s: string) => Array.from(new TextEncoder().encode(s));
+    const token = text(id);
+    return {
+      token,
+      logprob: lp.logprob,
+      bytes: bytes(token),
+      top_logprobs: lp.top.map((t) => {
+        const s = text(t.token);
+        return { token: s, logprob: t.logprob, bytes: bytes(s) };
+      }),
     };
   }
 

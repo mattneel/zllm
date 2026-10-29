@@ -62,6 +62,13 @@ await zllm.cacheUsage(); await zllm.clearCache();
   Streamed text stops at the first call, and the calls arrive in one
   `tool_calls` delta at the end. `tool_choice: "none"` leaves the tools
   out; forcing a call (`"required"` or a named function) isn't supported.
+- **Logprobs:** `logprobs: true` with `top_logprobs` (0 to 20) returns
+  each generated token's log-probability under the model's raw logits and
+  its most likely alternatives, in OpenAI's `choices[].logprobs.content`
+  (`generate` takes `logprobs` and puts them on each chunk). In a stream,
+  a token's entry comes with its first chunk, or an empty one while its
+  text is held back. Token text comes from detokenizing the single token,
+  so a token that ends inside a UTF-8 character shows as U+FFFD.
 - **Cancelling** (`interruptGenerate`, the request's `AbortSignal`, or a
   consumer that stops reading) ends the request after the GPU step in
   flight, with finish reason `abort`.

@@ -66,8 +66,11 @@ export const Out = {
   cachedTokens: 24,
   completionTokens: 28,
   prefillSteps: 32,
+  topCount: 36,
   prefillMs: 40,
   decodeMs: 48,
+  logprob: 56,
+  topPtr: 60,
 } as const;
 
 /** Command stream opcodes (src/gpu/cmd.zig `Op`). */

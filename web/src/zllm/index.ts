@@ -10,6 +10,7 @@ export {
   type ChatCompletion,
   type ChatCompletionChunk,
   type ChatFinishReason,
+  type ChatLogprob,
   type ChatMessage,
   type ChatRequest,
   Engine,
@@ -20,6 +21,7 @@ export {
   type OpenAIUsage,
   type Sampling,
   type Stats,
+  type TokenLogprob,
   type Usage,
 } from "./engine";
 export type { LoadProgress } from "./gpu";

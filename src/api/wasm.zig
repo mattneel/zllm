@@ -55,10 +55,18 @@ const Out = extern struct {
     cached_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     prefill_steps: u32 = 0,
-    _pad: u32 = 0,
+    /// Entries at top_ptr, for a token with logprobs.
+    top_count: u32 = 0,
     prefill_ms: f64 = 0,
     decode_ms: f64 = 0,
+    /// The token's log-probability; NaN if the request didn't ask.
+    logprob: f32 = std.math.nan(f32),
+    /// The most likely tokens': top_count (id, logprob) pairs.
+    top_ptr: u32 = 0,
 };
+
+/// Where a token's top logprobs go for the shim to read.
+var top: [zllm.sched.max_top_logprobs]extern struct { id: u32, logprob: f32 } = undefined;
 
 const Event = enum(i32) { submit = 0, token = 1, done = 2, idle = 3, wait = 4 };
 
@@ -210,6 +218,8 @@ const RequestJson = struct {
     tools: []const std.json.Value = &.{},
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
+    /// Top logprobs per token (zllm.sched.Request.logprobs).
+    logprobs: ?u32 = null,
     max_tokens: u32,
     stop: []const []const u8 = &.{},
     temperature: ?f32 = null,
@@ -310,6 +320,14 @@ const Runtime = struct {
             .token => |t| {
                 out.token = t.id;
                 setText(t.text);
+                out.logprob = std.math.nan(f32);
+                out.top_count = 0;
+                if (t.logprob) |lp| {
+                    out.logprob = lp.logprob;
+                    for (lp.top, top[0..lp.top.len]) |s, *d| d.* = .{ .id = s.id, .logprob = s.logprob };
+                    out.top_count = @intCast(lp.top.len);
+                    out.top_ptr = @intCast(@intFromPtr(&top));
+                }
                 return .token;
             },
             .done => |d| {
@@ -384,6 +402,7 @@ const Runtime = struct {
         try rt.engine.start(.{
             .prompt = prompt.items,
             .max_tokens = r.max_tokens,
+            .logprobs = r.logprobs,
             .sampling = p,
             .stop_tokens = rt.stop_tokens.items,
             .stop = r.stop,

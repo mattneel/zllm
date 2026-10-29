@@ -388,6 +388,7 @@ relative L2.
 | That prompt, its stopped reply, and 30 more tokens | 706 | relative L2 2.3e-5 |
 | After a 300-token prompt cancelled after 3 tokens: it, those 3, and 30 more | 302: the prompt and the 2 processed tokens | relative L2 8.8e-5 |
 | After a 700-token prompt cancelled after its first prefill step: the same prompt | 448: the chunk that ran | bitwise identical |
+| Logprobs: a 300-token prompt, greedy, top 3 | (fresh) | each token's logprob within 1.2e-7 of the log-softmax of its read-back logits, the top entry the sampled token; identical without the check's readback |
 
 The pipelined run completes each batch only when the engine asks for it
 (`wait`), so every decode step is recorded before the previous token is
