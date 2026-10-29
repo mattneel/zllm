@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const zllm = @import("zllm");
+const gen = @import("generate.zig");
 
 const usage =
     \\usage: zllm <command> [args]
@@ -26,6 +27,7 @@ const usage =
     \\                                       as `forward`, on the GPU through Dawn, in
     \\                                       steps of N tokens (default 512; f32 KV)
     \\
+++ gen.usage ++
     \\environment:
     \\  ZLLM_THREADS   worker threads for `forward` (default: one per physical core)
     \\  ZLLM_DAWN      path to the Dawn library (default: libwebgpu_dawn.so / webgpu_dawn.dll)
@@ -66,6 +68,33 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "forward")) {
         if (args.len != 5) return fail(usage);
         try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4]);
+    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat")) {
+        const is_chat = std.mem.eql(u8, cmd, "chat");
+        const fixed: usize = if (is_chat) 3 else 4;
+        if (args.len < fixed) return fail(usage);
+        const opts = gen.Options.parse(arena, args[fixed..]) catch |err| switch (err) {
+            error.InvalidUsage => return fail(usage),
+            else => return err,
+        };
+        const mapped = try FileBytes.open(gpa, io, args[2]);
+        defer mapped.close(gpa);
+        var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
+        defer file.deinit(gpa);
+        const d = try openDawn(gpa, init.environ_map);
+        defer d.deinit(gpa);
+        var host = zllm.gpu.Host.init(gpa, d);
+        defer host.deinit();
+        const t0 = Io.Timestamp.now(io, .awake);
+        const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
+        defer rt.destroy();
+        std.debug.print("[loaded in {d} ms; context {d}, {t} KV]\n", .{ t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
+        if (is_chat) {
+            var in_buf: [64 * 1024]u8 = undefined;
+            var stdin: Io.File.Reader = .init(.stdin(), io, &in_buf);
+            try gen.chatLoop(rt, opts, &stdin.interface, out);
+        } else {
+            try gen.generate(rt, args[3], opts, out);
+        }
     } else if (std.mem.eql(u8, cmd, "chat-render")) {
         if (args.len != 3) return fail(usage);
         const cases = try Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .unlimited);
