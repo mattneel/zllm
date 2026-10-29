@@ -34,6 +34,7 @@ pub const Kernel = enum {
     mark_tokens,
     sample,
     repad,
+    repack_q3_k,
     quantize_q8,
     // Quantized weights: matvec_quant.wgsl, matmul_quant.wgsl and
     // embed_quant.wgsl, each composed with its type's decoder.
@@ -72,11 +73,13 @@ pub const QuantOp = enum { matvec, matmul, embed };
 
 /// Bytes per block of type `t` as the quantized kernels read it: the GGUF
 /// block size, padded to a multiple of 16 where it is not one already
-/// (`repad` lays the blocks out), so blocks take 16-byte loads. Q8_0 keeps
-/// its 34 bytes: padding would cost 41%, and its kernels read words.
+/// (`repad` lays the blocks out), so blocks take 16-byte loads. Q3_K is
+/// repacked instead, into eight self-contained 16-byte units
+/// (repack_q3_k.wgsl). Q8_0 keeps its 34 bytes: padding would cost 41%, and
+/// its kernels read words.
 pub fn blockStride(t: gguf.TensorType) u32 {
     return switch (t) {
-        .q3_k => 112,
+        .q3_k => 128,
         .q6_k => 224,
         else => t.layout().?.block_bytes,
     };
@@ -230,6 +233,7 @@ pub const params = struct {
         mode: u32 = 0,
         eps: f32 = 0,
     };
+    pub const RepackQ3K = extern struct { blocks: u32, _pad: [3]u32 = @splat(0) };
     pub const Repad = extern struct { blocks: u32, src_bytes: u32, dst_bytes: u32, _pad: u32 = 0 };
     pub const SiluMul = extern struct { count: u32, width: u32, _pad: [2]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
@@ -452,6 +456,19 @@ pub const Launcher = struct {
         const pipeline = l.set.pipelines.get(kernel);
         const bg = try bindGroup(l.gpa, l.rec, pipeline, uniform, args);
         try l.rec.dispatch(l.gpa, pipeline, groups, &.{bg});
+    }
+
+    /// Lays out `blocks` raw GGUF blocks of type `t` from `src` in `dst` as
+    /// the quantized kernels read them (blockStride): Q3_K repacked, other
+    /// types padded.
+    pub fn layout(l: Launcher, t: gguf.TensorType, src: Arg, dst: Arg, blocks: u64) Allocator.Error!void {
+        const bytes = t.layout().?.block_bytes;
+        const stride = blockStride(t);
+        if (t == .q3_k) {
+            try l.launch(.repack_q3_k, params.RepackQ3K{ .blocks = @intCast(blocks) }, &.{ src, dst }, elementwise(@intCast(blocks * 8)));
+        } else {
+            try l.launch(.repad, params.Repad{ .blocks = @intCast(blocks), .src_bytes = bytes, .dst_bytes = stride }, &.{ src, dst }, elementwise(@intCast(blocks * stride / 4)));
+        }
     }
 
     /// Workgroup grid for `count` threads at 256 per group, folded into y

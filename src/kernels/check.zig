@@ -363,8 +363,8 @@ fn quantRows(c: *Ctx, t: gguf.TensorType, rows: usize, k: usize) !struct { bytes
 }
 
 /// Uploads raw GGUF blocks of type `t` in the layout the quantized kernels
-/// read: as they are, or for a padded type through `repad`, as the model
-/// loader does.
+/// read: as they are, or padded or repacked by Launcher.layout, as the
+/// model loader does.
 fn gpuWeights(c: *Ctx, t: gguf.TensorType, raw: []const u8) !kernels.Arg {
     const l = t.layout().?;
     const stride = kernels.blockStride(t);
@@ -375,7 +375,7 @@ fn gpuWeights(c: *Ctx, t: gguf.TensorType, raw: []const u8) !kernels.Arg {
     const src = try c.upload(padded);
     if (stride == l.block_bytes) return src;
     const out = try c.output(std.mem.alignForward(usize, blocks * stride, 16) / 4);
-    try c.launcher().launch(.repad, P.Repad{ .blocks = @intCast(blocks), .src_bytes = l.block_bytes, .dst_bytes = stride }, &.{ src, out }, kernels.Launcher.elementwise(blocks * stride / 4));
+    try c.launcher().layout(t, src, out, blocks);
     return out;
 }
 

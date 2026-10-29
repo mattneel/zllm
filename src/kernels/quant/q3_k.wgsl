@@ -3,57 +3,44 @@
 // j = s%4 within it; weight l takes bits 2j of qs[32n + l], minus 4 unless
 // bit 4n + j of hmask[l] is set, times d·(scale − 32) for scale
 // 8n + 2j + l/16.
+//
+// On the GPU the blocks are repacked at load (repack_q3_k.wgsl, 128 bytes
+// each): every unit is one 16-byte vector holding its 2-bit values (two
+// words), its high bits (one word), its two scales − 32 as signed bytes and
+// d, so a unit decodes from a single load.
 const BLOCK_ELEMS: u32 = 256u;
-// 110 bytes in the file, padded to 112 on the GPU (kernels.blockStride), so
-// hmask, qs and scales | d each start on a 16-byte boundary.
-const BLOCK_BYTES: u32 = 112u;
+const BLOCK_BYTES: u32 = 128u;
 
-// Scale i (0..16) of the 12 scale bytes held as three words: low 4 bits
-// from bytes 0..8, high 2 bits from 8..12.
-fn scale3(sw: vec3u, i: u32) -> i32 {
-    let k = i % 4u;
-    let g = i / 4u;
-    let low = (byte12(sw, 4u * (g % 2u) + k) >> (4u * (g / 2u))) & 0xfu;
-    let high = (byte12(sw, 8u + k) >> (2u * g)) & 3u;
-    return i32(low | (high << 4u)) - 32;
-}
+const ACT_BLOCK: u32 = 256u;
+const HAS_MIN: bool = false;
 
 struct Head {
-    qs: u32,
-    hm: u32,
-    shift: u32,
-    bit: u32,
+    lo: vec2u,
+    hi: u32,
     // d·(scale − 32) for the unit's two halves of 16.
     dl0: f32,
     dl1: f32,
 }
 
 fn head(row_byte: u32, u: u32) -> Head {
-    let b = row_byte + (u / 8u) * BLOCK_BYTES;
-    let s = u % 8u;
-    let n = s / 4u;
-    let j = s % 4u;
-    let sv = w[(b + 96u) >> 4u];
-    let d_all = unpack2x16float(sv.w).x;
-    return Head(b + 32u + 32u * n, b, 2u * j, 4u * n + j,
-                d_all * f32(scale3(sv.xyz, 8u * n + 2u * j)), d_all * f32(scale3(sv.xyz, 8u * n + 2u * j + 1u)));
+    let v = w[(row_byte + 16u * u) >> 4u];
+    let d = unpack2x16float(v.w >> 16u).x;
+    let sc0 = (i32(v.w) << 24u) >> 24u;
+    let sc1 = (i32(v.w) << 16u) >> 24u;
+    return Head(v.xy, v.z, d * f32(sc0), d * f32(sc1));
 }
-
-const ACT_BLOCK: u32 = 256u;
-const HAS_MIN: bool = false;
 
 fn scales(h: Head) -> vec3f {
     return vec3f(h.dl0, h.dl1, 0.0);
 }
 
 fn quad_i8(h: Head, i0: u32) -> vec4u {
-    let qv = w[(h.qs + 4u * i0) >> 4u];
-    let hv = w[(h.hm + 4u * i0) >> 4u];
+    let l = h.lo[i0 / 4u];
     var r: vec4u;
     for (var e = 0u; e < 4u; e++) {
         // q + 4·hbit for four positions at once, one byte each (0..7), then
         // minus 4 per byte without borrows.
-        let c = ((qv[e] >> h.shift) & 0x03030303u) | (((hv[e] >> h.bit) & 0x01010101u) << 2u);
+        let c = ((l >> (2u * e)) & 0x03030303u) | (((h.hi >> (i0 + e)) & 0x01010101u) << 2u);
         r[e] = (c + 0x7c7c7c7cu) ^ 0x80808080u;
     }
     return r;
