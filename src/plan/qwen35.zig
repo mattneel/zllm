@@ -47,10 +47,8 @@ const Attention = struct {
 };
 
 const DeltaNet = struct {
-    wqkv: Matrix,
-    wgate: Matrix,
-    wbeta: Matrix,
-    walpha: Matrix,
+    /// qkv | z (the output gate) | β | α, stacked by rows.
+    wproj: Matrix,
     wout: Matrix,
     conv: Arg,
     dt_bias: Arg,
@@ -114,10 +112,12 @@ pub const Model = struct {
                     .delta_net => blk: {
                         const conv_dim: u64 = 2 * hp.gdn_head_dim * hp.gdn_k_heads + hp.gdn_inner;
                         break :blk .{ .delta_net = .{
-                            .wqkv = try u.matrix("blk.{d}.attn_qkv.weight", i, e, conv_dim),
-                            .wgate = try u.matrix("blk.{d}.attn_gate.weight", i, e, hp.gdn_inner),
-                            .wbeta = try u.matrix("blk.{d}.ssm_beta.weight", i, e, hp.gdn_v_heads),
-                            .walpha = try u.matrix("blk.{d}.ssm_alpha.weight", i, e, hp.gdn_v_heads),
+                            .wproj = try u.stacked(i, e, &.{
+                                .{ "blk.{d}.attn_qkv.weight", conv_dim },
+                                .{ "blk.{d}.attn_gate.weight", hp.gdn_inner },
+                                .{ "blk.{d}.ssm_beta.weight", hp.gdn_v_heads },
+                                .{ "blk.{d}.ssm_alpha.weight", hp.gdn_v_heads },
+                            }),
                             .wout = try u.matrix("blk.{d}.ssm_out.weight", i, hp.gdn_inner, e),
                             .conv = try u.tensor("blk.{d}.ssm_conv1d.weight", i, &.{ hp.conv_kernel, conv_dim }),
                             .dt_bias = try u.vector("blk.{d}.ssm_dt.bias", i, hp.gdn_v_heads),
@@ -336,7 +336,7 @@ pub const Program = struct {
     pub fn build(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *const kernels.Set, m: *const Model, cfg: Config, limits: Limits) BuildError!Program {
         const hp = m.hp;
         if (cfg.max_tokens == 0 or cfg.logit_rows == 0 or cfg.context < cfg.max_tokens or cfg.checkpoints == 0) return error.BadConfig;
-        if (hp.conv_kernel > kernels.max_conv_taps or hp.head_dim > kernels.max_head_dim or hp.gdn_head_dim > kernels.max_head_dim) return error.BadConfig;
+        if (hp.head_dim > kernels.max_head_dim or hp.gdn_head_dim > kernels.max_delta_head) return error.BadConfig;
         if (hp.n_head % hp.n_head_kv != 0 or hp.n_head / hp.n_head_kv > kernels.attn_max_group) return error.BadConfig;
         const e: u64 = hp.n_embd;
         const cap: u64 = cfg.max_tokens;
@@ -353,9 +353,10 @@ pub const Program = struct {
         const qkv_row: u64 = 2 * @as(u64, hp.head_dim) * hp.n_head + 2 * kv_dim;
         const qkv = try a.storage(cap * qkv_row);
         const att = try a.storage(cap * hp.head_dim * hp.n_head);
-        const proj = try a.storage(cap * conv_dim);
+        // The DeltaNet input projection: qkv | z | β | α for each token.
+        const proj_row: u64 = conv_dim + hp.gdn_inner + 2 * @as(u64, hp.gdn_v_heads);
+        const proj = try a.storage(cap * proj_row);
         const conv = try a.storage(cap * conv_dim);
-        const z = try a.storage(cap * hp.gdn_inner);
         const beta = try a.storage(cap * hp.gdn_v_heads);
         const g = try a.storage(cap * hp.gdn_v_heads);
         const o = try a.storage(cap * hp.gdn_inner);
@@ -448,21 +449,33 @@ pub const Program = struct {
                     const state: Arg = .{ .buffer = recurrent.buffer, .offset = base, .size = state_bytes };
                     const hist: Arg = .{ .buffer = recurrent.buffer, .offset = base + std.mem.alignForward(u64, state_bytes, al), .size = hist_bytes };
                     const d = hp.gdn_head_dim;
-                    try matmul(&b, arena, &body, proj, h, &w.wqkv, capn);
-                    try matmul(&b, arena, &body, z, h, &w.wgate, capn);
-                    try matmul(&b, arena, &body, beta, h, &w.wbeta, capn);
-                    try matmul(&b, arena, &body, g, h, &w.walpha, capn);
-                    try body.append(arena, .{ .launch = try b.add(.gates, P.Gates{ .count = capn * hp.gdn_v_heads, .heads = hp.gdn_v_heads }, &.{ beta, g, w.dt_bias, w.a }, .{ .elems = hp.gdn_v_heads }) });
-                    try body.append(arena, .{ .launch = try b.add(.conv_silu, P.ConvSilu{ .channels = @intCast(conv_dim), .taps = hp.conv_kernel }, &.{ proj, w.conv, hist, conv, step }, .{ .fixed = kernels.Launcher.elementwise(conv_dim) }) });
-                    try body.append(arena, .{ .launch = try b.add(.l2norm_heads, P.L2NormHeads{ .heads = 2 * hp.gdn_k_heads, .dim = d, .row_stride = @intCast(conv_dim), .eps = hp.rms_eps }, &.{conv}, .{ .rows_y = 2 * hp.gdn_k_heads }) });
+                    try matmul(&b, arena, &body, proj, h, &w.wproj, capn);
+                    try body.append(arena, .{ .launch = try b.add(.delta_prep, P.DeltaPrep{
+                        .channels = @intCast(conv_dim),
+                        .taps = hp.conv_kernel,
+                        .key_channels = 2 * d * hp.gdn_k_heads,
+                        .head = d,
+                        .row = @intCast(proj_row),
+                        .v_heads = hp.gdn_v_heads,
+                        .beta_off = @intCast(conv_dim + hp.gdn_inner),
+                        .alpha_off = @intCast(conv_dim + hp.gdn_inner + hp.gdn_v_heads),
+                        .eps = hp.rms_eps,
+                    }, &.{ proj, w.conv, hist, conv, w.dt_bias, w.a, g, beta }, .{ .rows_y = @intCast(conv_dim / d + 1) }) });
                     try body.append(arena, .{ .launch = try b.add(.delta_rule, P.DeltaRule{
                         .k_heads = hp.gdn_k_heads,
                         .v_heads = hp.gdn_v_heads,
                         .dim = d,
                         .conv_stride = @intCast(conv_dim),
+                        .taps = hp.conv_kernel,
+                        .row = @intCast(proj_row),
+                    }, &.{ conv, g, beta, state, o, step, proj, hist }, .{ .fixed = .{ hp.gdn_v_heads, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 } }) });
+                    try body.append(arena, .{ .launch = try b.add(.gated_norm, P.GatedNorm{
+                        .v_heads = hp.gdn_v_heads,
+                        .dim = d,
                         .eps = hp.rms_eps,
-                    }, &.{ conv, g, beta, state, o, step }, .{ .fixed = .{ hp.gdn_v_heads, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 } }) });
-                    try body.append(arena, .{ .launch = try b.add(.gated_norm, P.GatedNorm{ .v_heads = hp.gdn_v_heads, .dim = d, .eps = hp.rms_eps }, &.{ o, z, w.norm }, .{ .rows_y = hp.gdn_v_heads }) });
+                        .z_row = @intCast(proj_row),
+                        .z_off = @intCast(conv_dim),
+                    }, &.{ o, proj, w.norm }, .{ .rows_y = hp.gdn_v_heads }) });
                     try matmul(&b, arena, &body, mix, o, &w.wout, capn);
                 },
             }

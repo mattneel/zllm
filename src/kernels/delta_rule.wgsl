@@ -10,6 +10,10 @@
 //
 // o goes to `out` un-normalized; gated_norm applies the RMSNorm and gate.
 //
+// It also advances the conv history that delta_prep read: hist becomes the
+// last K − 1 raw inputs (rows of the fused projection `proj`) of the
+// sequence including this step.
+//
 // Column b of S depends only on column b, so a head's columns split across
 // workgroups: workgroup (j, c) owns columns [c·COLS, (c+1)·COLS), and thread
 // (row group r, column) keeps rows [r·dim/R, (r+1)·dim/R) of its column in
@@ -21,10 +25,10 @@ struct Params {
     v_heads: u32,
     dim: u32,
     conv_stride: u32,
-    eps: f32,
+    taps: u32,
+    row: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 struct Step {
@@ -41,6 +45,8 @@ struct Step {
 @group(0) @binding(4) var<storage, read_write> state: array<f32>;
 @group(0) @binding(5) var<storage, read_write> out: array<f32>;
 @group(0) @binding(6) var<uniform> step: Step;
+@group(0) @binding(7) var<storage, read> proj: array<f32>;
+@group(0) @binding(8) var<storage, read_write> hist: array<f32>;
 
 const WG: u32 = 256u;
 const COLS: u32 = 32u;
@@ -53,9 +59,27 @@ var<workgroup> ks: array<f32, MAX_DIM>;
 var<workgroup> red: array<f32, WG>;
 var<workgroup> delta: array<f32, COLS>;
 
+// hist[i] ← the input K − 1 − i positions before the step's end, for
+// every channel: one thread per channel, oldest slot first, so slots still
+// to be read are not yet overwritten.
+fn advance_history(id: u32, threads: u32) {
+    let back = p.taps - 1u;
+    for (var c = id; c < p.conv_stride; c += threads) {
+        for (var i = 0u; i < back; i++) {
+            let j = step.m + i;
+            if (j < back) {
+                hist[i * p.conv_stride + c] = hist[j * p.conv_stride + c];
+            } else {
+                hist[i * p.conv_stride + c] = proj[(j - back) * p.row + c];
+            }
+        }
+    }
+}
+
 @compute @workgroup_size(WG)
-fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: vec3u) {
+fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: vec3u, @builtin(num_workgroups) nwg: vec3u) {
     let lid = lid3.x;
+    advance_history((wg.y * nwg.x + wg.x) * WG + lid, nwg.x * nwg.y * WG);
     let j = wg.x;
     let col = lid % COLS;
     let r = lid / COLS;

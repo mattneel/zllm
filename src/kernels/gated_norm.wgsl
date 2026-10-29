@@ -1,11 +1,17 @@
 // In place, per value head j of token t: o ← rmsnorm(o) · w · silu(z), the
-// DeltaNet output gate after delta_rule. One workgroup per (head, token).
+// DeltaNet output gate after delta_rule. z is read from the fused input
+// projection: row t at t · z_row, offset z_off. One workgroup per (head,
+// token).
 
 struct Params {
     v_heads: u32,
     dim: u32,
     eps: f32,
-    _pad: u32,
+    z_row: u32,
+    z_off: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -34,7 +40,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
         workgroupBarrier();
     }
     if (in_head) {
-        let zz = z[base + b];
+        let zz = z[wg.y * p.z_row + p.z_off + wg.x * p.dim + b];
         let r = 1.0 / sqrt(partial[0] / f32(p.dim) + p.eps);
         o[base + b] = v * r * w[b] * (zz / (1.0 + exp(-zz)));
     }

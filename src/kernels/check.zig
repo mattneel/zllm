@@ -37,12 +37,11 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,           checkMatmul,       checkMatmulChunked, checkMatvec,       checkMatvecNorm,
-        checkMatvecSiluPair,    checkSiluMul,      checkAdd,           checkEmbed,        checkRopeAppendF32,
-        checkRopeAppendF16,     checkAttentionF32, checkAttentionF16,  checkAttnDecode,   checkConvSilu,
-        checkL2Norm,            checkGates,        checkDeltaRule,     checkSampleGreedy, checkSampleTopKTopP,
-        checkSampleMinP,        checkSampleTopP,   checkSamplePlain,   checkSampleTopK1,  checkSampleLargeTopK,
-        checkSampleTopKSkipped, checkSampleVocab,
+        checkRmsNorm,        checkMatmul,       checkMatmulChunked,   checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair, checkSiluMul,      checkAdd,             checkEmbed,             checkRopeAppendF32,
+        checkRopeAppendF16,  checkAttentionF32, checkAttentionF16,    checkAttnDecode,        checkDeltaPrep,
+        checkDeltaRule,      checkSampleGreedy, checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
+        checkSamplePlain,    checkSampleTopK1,  checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -570,94 +569,104 @@ fn decodeCache(c: *Ctx, words: []const u32, half: bool) ![]f32 {
     return values;
 }
 
-fn checkConvSilu(c: *Ctx) !Result {
-    // Two steps of 5 and 4 tokens: the second reads the history the first left.
-    const steps = [_]u32{ 5, 4 };
-    const tokens = 9;
-    const channels = 300;
+/// delta_prep over 12 tokens of a fused DeltaNet projection (2 key heads, 4
+/// value heads of 128) in steps of 5, 2, 1 and 4 tokens, with delta_rule
+/// advancing the conv history between them: steps shorter than the history
+/// shift it. Checks the conv output (SiLU, L2 norm on q and k) and the gates
+/// of every token. α spans softplus's linear cut at 20.
+fn checkDeltaPrep(c: *Ctx) !Result {
+    const steps = [_]u32{ 5, 2, 1, 4 };
+    const tokens = 12;
+    const hk = 2;
+    const hv = 4;
+    const d = 128;
     const taps = 4;
-    const x = try c.random(tokens * channels, 2);
+    const eps = 1e-6;
+    const key_channels = 2 * hk * d;
+    const channels = key_channels + hv * d;
+    const inner = hv * d;
+    const beta_off = channels + inner;
+    const alpha_off = beta_off + hv;
+    const row = alpha_off + hv;
+    const proj = try c.random(tokens * row, 2);
+    for (0..tokens) |t| for (proj[t * row + alpha_off ..][0..hv]) |*v| {
+        v.* *= 12;
+    };
     const w = try c.random(channels * taps, 1);
-    const hist = try c.output((taps - 1) * channels);
+    const dt = try c.random(hv, 1);
+    const a = try c.random(hv, 1);
+    for (a) |*v| v.* = -@exp(v.*);
     const wa = try c.upload(w);
-    const got = try c.arena.alloc(f32, tokens * channels);
+    const dta = try c.upload(dt);
+    const aa = try c.upload(a);
+    const hist = try c.output((taps - 1) * channels);
+    const state = try c.output(hv * d * d);
+    const per = channels + 2 * hv;
+    const got = try c.arena.alloc(f32, tokens * per);
     var t0: u32 = 0;
     for (steps) |m| {
-        const out = try c.output(m * channels);
-        try c.launcher().launch(.conv_silu, P.ConvSilu{ .channels = channels, .taps = taps }, &.{
-            try c.upload(x[t0 * channels ..][0 .. m * channels]), wa, hist, out, try c.step(m, t0, 0),
-        }, kernels.Launcher.elementwise(channels));
-        @memcpy(got[t0 * channels ..][0 .. m * channels], try c.read(out));
+        const pa = try c.upload(proj[t0 * row ..][0 .. m * row]);
+        const conv = try c.output(m * channels);
+        const g = try c.output(m * hv);
+        const beta = try c.output(m * hv);
+        const step = try c.step(m, t0, 0);
+        const l = c.launcher();
+        try l.launch(.delta_prep, P.DeltaPrep{
+            .channels = channels,
+            .taps = taps,
+            .key_channels = key_channels,
+            .head = d,
+            .row = row,
+            .v_heads = hv,
+            .beta_off = beta_off,
+            .alpha_off = alpha_off,
+            .eps = eps,
+        }, &.{ pa, wa, hist, conv, dta, aa, g, beta }, .{ channels / d + 1, m, 1 });
+        try l.launch(.delta_rule, P.DeltaRule{ .k_heads = hk, .v_heads = hv, .dim = d, .conv_stride = channels, .taps = taps, .row = row }, &.{
+            conv, g, beta, state, try c.output(m * inner), step, pa, hist,
+        }, .{ hv, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 });
+        const cv = try c.read(conv);
+        const gv = try c.read(g);
+        const bv = try c.read(beta);
+        for (0..m) |t| {
+            const dst = got[(t0 + t) * per ..][0..per];
+            @memcpy(dst[0..channels], cv[t * channels ..][0..channels]);
+            @memcpy(dst[channels..][0..hv], gv[t * hv ..][0..hv]);
+            @memcpy(dst[channels + hv ..][0..hv], bv[t * hv ..][0..hv]);
+        }
         t0 += m;
     }
 
-    const want = try c.arena.alloc(f64, tokens * channels);
-    for (0..tokens) |t| for (0..channels) |ch| {
-        var sum: f64 = 0;
-        for (0..taps) |tap| {
-            const back = taps - 1 - tap;
-            if (t >= back) sum += @as(f64, w[ch * taps + tap]) * x[(t - back) * channels + ch];
+    const want = try c.arena.alloc(f64, tokens * per);
+    for (0..tokens) |t| {
+        const dst = want[t * per ..][0..per];
+        for (0..channels) |ch| {
+            var sum: f64 = 0;
+            for (0..taps) |tap| {
+                const back = taps - 1 - tap;
+                if (t >= back) sum += @as(f64, w[ch * taps + tap]) * proj[(t - back) * row + ch];
+            }
+            dst[ch] = sum * sigmoid64(sum);
         }
-        want[t * channels + ch] = sum * sigmoid64(sum);
-    };
-    return .{ .name = "conv_silu (2 steps)", .err = relErr(got, want), .tolerance = 1e-6 };
-}
-
-fn checkL2Norm(c: *Ctx) !Result {
-    // Normalize the first 4 heads of 128 in rows of 640 (a trailing region
-    // stands in for the value heads and must stay untouched).
-    const tokens = 6;
-    const heads = 4;
-    const dim = 128;
-    const row = 640;
-    const eps = 1e-6;
-    const x = try c.random(tokens * row, 3);
-    const xa = try c.upload(x);
-    try c.launcher().launch(.l2norm_heads, P.L2NormHeads{ .heads = heads, .dim = dim, .row_stride = row, .eps = eps }, &.{xa}, .{ heads, tokens, 1 });
-    const got = try c.read(xa);
-
-    const want = try c.arena.alloc(f64, x.len);
-    for (want, x) |*o, v| o.* = v;
-    for (0..tokens) |t| for (0..heads) |h| {
-        const head = want[t * row + h * dim ..][0..dim];
-        var ss: f64 = 0;
-        for (head) |v| ss += v * v;
-        for (head) |*v| v.* /= @sqrt(ss + eps);
-    };
-    return .{ .name = "l2norm_heads", .err = relErr(got, want), .tolerance = 1e-6 };
-}
-
-fn checkGates(c: *Ctx) !Result {
-    // Inputs span softplus's linear cut at 20.
-    const tokens = 11;
-    const heads = 16;
-    const n = tokens * heads;
-    const beta = try c.random(n, 6);
-    const g = try c.random(n, 25);
-    const dt = try c.random(heads, 1);
-    const a = try c.random(heads, 1);
-    for (a) |*v| v.* = -@exp(v.*);
-    const ba = try c.upload(beta);
-    const ga = try c.upload(g);
-    try c.launcher().launch(.gates, P.Gates{ .count = n, .heads = heads }, &.{ ba, ga, try c.upload(dt), try c.upload(a) }, kernels.Launcher.elementwise(n));
-    const got_beta = try c.read(ba);
-    const got_g = try c.read(ga);
-
-    const want = try c.arena.alloc(f64, 2 * n);
-    const got = try c.arena.alloc(f32, 2 * n);
-    for (0..n) |i| {
-        want[i] = sigmoid64(beta[i]);
-        const xv = @as(f64, g[i]) + dt[i % heads];
-        want[n + i] = (if (xv > 20) xv else @log(1 + @exp(xv))) * a[i % heads];
+        for (0..2 * hk) |h| {
+            const head = dst[h * d ..][0..d];
+            var ss: f64 = 0;
+            for (head) |v| ss += v * v;
+            for (head) |*v| v.* /= @sqrt(ss + eps);
+        }
+        for (0..hv) |j| {
+            const xv = @as(f64, proj[t * row + alpha_off + j]) + dt[j];
+            dst[channels + j] = (if (xv > 20) xv else @log(1 + @exp(xv))) * a[j];
+            dst[channels + hv + j] = sigmoid64(proj[t * row + beta_off + j]);
+        }
     }
-    @memcpy(got[0..n], got_beta);
-    @memcpy(got[n..], got_g);
-    return .{ .name = "gates", .err = relErr(got, want), .tolerance = 1e-6 };
+    return .{ .name = "delta_prep (4 steps)", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 fn checkDeltaRule(c: *Ctx) !Result {
     // 4 value heads over 2 key heads (tiled mapping), dim 128, 37 tokens in
-    // two steps of 20 and 17 that carry the state between them.
+    // two steps of 20 and 17 that carry the state between them. gated_norm
+    // reads z from rows of a wider projection.
     const tokens = 37;
     const hk = 2;
     const hv = 4;
@@ -666,6 +675,8 @@ fn checkDeltaRule(c: *Ctx) !Result {
     const key_dim = hk * d;
     const inner = hv * d;
     const stride = 2 * key_dim + inner;
+    const z_off = 40;
+    const z_row = z_off + inner + 24;
     const conv = try c.random(tokens * stride, 1);
     // q, k arrive L2-normalized.
     for (0..tokens) |t| for (0..2 * hk) |h| {
@@ -678,27 +689,32 @@ fn checkDeltaRule(c: *Ctx) !Result {
     for (g) |*v| v.* = -@abs(v.*); // decays in (e^-1, 1]
     const beta = try c.random(tokens * hv, 1);
     for (beta) |*v| v.* = @abs(v.*);
-    const z = try c.random(tokens * inner, 2);
+    const zp = try c.random(tokens * z_row, 2);
     const norm_w = try c.random(d, 1);
     const state = try c.output(hv * d * d);
     const wn = try c.upload(norm_w);
+    // One tap: no conv history to advance.
+    const hist = try c.output(1);
     const got = try c.arena.alloc(f32, tokens * inner);
     var t0: u32 = 0;
     for ([_]u32{ 20, 17 }) |m| {
         const out = try c.output(m * inner);
+        const za = try c.upload(zp[t0 * z_row ..][0 .. m * z_row]);
         const l = c.launcher();
         try l.launch(.delta_rule, P.DeltaRule{
             .k_heads = hk,
             .v_heads = hv,
             .dim = d,
             .conv_stride = stride,
-            .eps = eps,
+            .taps = 1,
+            .row = z_row,
         }, &.{
             try c.upload(conv[t0 * stride ..][0 .. m * stride]), try c.upload(g[t0 * hv ..][0 .. m * hv]),
             try c.upload(beta[t0 * hv ..][0 .. m * hv]),         state,
             out,                                                 try c.step(m, t0, 0),
+            za,                                                  hist,
         }, .{ hv, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 });
-        try l.launch(.gated_norm, P.GatedNorm{ .v_heads = hv, .dim = d, .eps = eps }, &.{ out, try c.upload(z[t0 * inner ..][0 .. m * inner]), wn }, .{ hv, m, 1 });
+        try l.launch(.gated_norm, P.GatedNorm{ .v_heads = hv, .dim = d, .eps = eps, .z_row = z_row, .z_off = z_off }, &.{ out, za, wn }, .{ hv, m, 1 });
         @memcpy(got[t0 * inner ..][0 .. m * inner], try c.read(out));
         t0 += m;
     }
@@ -731,7 +747,7 @@ fn checkDeltaRule(c: *Ctx) !Result {
             }
             const r = 1 / @sqrt(ss / d + eps);
             for (0..d) |b| {
-                const zz: f64 = z[t * inner + j * d + b];
+                const zz: f64 = zp[t * z_row + z_off + j * d + b];
                 want[t * inner + j * d + b] = o[b] * r * norm_w[b] * zz * sigmoid64(zz);
             }
         }

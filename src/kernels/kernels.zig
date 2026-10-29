@@ -27,9 +27,7 @@ pub const Kernel = enum {
     attention,
     attn_split,
     attn_combine,
-    conv_silu,
-    l2norm_heads,
-    gates,
+    delta_prep,
     delta_rule,
     gated_norm,
     mark_tokens,
@@ -61,8 +59,8 @@ pub const delta_cols = 32;
 /// Cache positions per `attn_split` workgroup, and the largest GQA group.
 pub const attn_block = 64;
 pub const attn_max_group = 8;
-/// Most convolution taps `conv_silu` handles.
-pub const max_conv_taps = 8;
+/// Widest DeltaNet head `delta_prep` normalizes in one workgroup.
+pub const max_delta_head = 256;
 /// Sampler limits: logit-bias entries and stop tokens per request.
 pub const max_bias = 1024;
 pub const max_stops = 16;
@@ -140,20 +138,38 @@ pub const params = struct {
         q_row: u32,
         _pad: u32 = 0,
     };
-    pub const ConvSilu = extern struct { channels: u32, taps: u32, _pad: [2]u32 = @splat(0) };
-    pub const L2NormHeads = extern struct { heads: u32, dim: u32, row_stride: u32, eps: f32 };
-    pub const Gates = extern struct { count: u32, heads: u32, _pad: [2]u32 = @splat(0) };
+    pub const DeltaPrep = extern struct {
+        channels: u32,
+        taps: u32,
+        key_channels: u32,
+        head: u32,
+        row: u32,
+        v_heads: u32,
+        beta_off: u32,
+        alpha_off: u32,
+        eps: f32,
+        _pad: [3]u32 = @splat(0),
+    };
     pub const DeltaRule = extern struct {
         k_heads: u32,
         v_heads: u32,
         dim: u32,
         conv_stride: u32,
-        eps: f32,
-        _pad: [3]u32 = @splat(0),
+        taps: u32,
+        row: u32,
+        _pad: [2]u32 = @splat(0),
     };
     /// Which phase of `sample` a launch runs.
     pub const SamplePhase = extern struct { phase: u32, round: u32 = 0, _pad: [2]u32 = @splat(0) };
-    pub const GatedNorm = extern struct { v_heads: u32, dim: u32, eps: f32, _pad: u32 = 0 };
+    pub const GatedNorm = extern struct {
+        v_heads: u32,
+        dim: u32,
+        eps: f32,
+        z_row: u32,
+        z_off: u32,
+        _pad: [3]u32 = @splat(0),
+    };
+
     /// Per-request sampler parameters (`sample` and `mark_tokens`).
     pub const Sample = extern struct {
         vocab: u32,
