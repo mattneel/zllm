@@ -2,3 +2,14 @@
 zig-out/
 zig-pkg/
 *.o
+
+# Pinned fixtures (scripts/fixtures.sh) and harness environment
+.fixtures/
+tools/.venv/
+__pycache__/
+
+# mdBook output
+docs/book/
+
+# TypeScript
+node_modules/
