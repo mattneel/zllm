@@ -32,6 +32,7 @@ pub const Procs = struct {
     DeviceRelease: Proc(c.WGPUProcDeviceRelease),
     QueueWriteBuffer: Proc(c.WGPUProcQueueWriteBuffer),
     QueueSubmit: Proc(c.WGPUProcQueueSubmit),
+    QueueOnSubmittedWorkDone: Proc(c.WGPUProcQueueOnSubmittedWorkDone),
     QueueRelease: Proc(c.WGPUProcQueueRelease),
     BufferMapAsync: Proc(c.WGPUProcBufferMapAsync),
     BufferGetConstMappedRange: Proc(c.WGPUProcBufferGetConstMappedRange),

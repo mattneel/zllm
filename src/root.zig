@@ -15,4 +15,5 @@ test {
     _ = ref.tensor;
     _ = @import("ref/pool.zig");
     _ = ref.matmul;
+    _ = gpu.cmd;
 }
