@@ -18,7 +18,10 @@ fn block_dot(row_byte: u32, blk: u32, xb4: u32, p: u32) -> f32 {
         let c = cp + 2u * e2;
         let si = 8u * n + hh + 2u * c;
         let ds = d * f32(sbyte16(sv, si));
-        for (var e = 0u; e < 4u; e++) {
+        // Each part starts at its own word: the parts' x vectors then fall in
+        // different banks of workgroup memory.
+        for (var k = 0u; k < 4u; k++) {
+            let e = (k + p) % 4u;
             let q = ((qlv[e] >> (4u * e2)) & 0x0f0f0f0fu) | (((qhv[e] >> (2u * c)) & 0x03030303u) << 4u);
             acc += dot(ds * (vec4f(unpack4xU8(q)) - 32.0), xs[xb4 + 32u * n + 8u * c + 4u * hh + e]);
         }
