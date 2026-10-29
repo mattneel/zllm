@@ -4,6 +4,12 @@
 //! parameters in a uniform `Params` struct at binding 0. The structs below
 //! mirror those, field for field, padded to 16 bytes. Weights stay bf16 on
 //! the GPU (two per u32); activations and accumulation are f32.
+//!
+//! Kernels whose work depends on the step (its token count `m`, its first
+//! position `pos0`, the sampler's draw `u`) read them from a `Step` uniform,
+//! their last binding, so that one prebuilt bind group serves every step.
+//! Kernels that treat rows independently take capacity-sized parameters
+//! instead and are dispatched over the step's `m` rows only.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,6 +23,7 @@ pub const Kernel = enum {
     add,
     embed_bf16,
     qk_norm_rope,
+    kv_append,
     attention,
     conv_silu,
     l2norm_heads,
@@ -35,12 +42,11 @@ pub const Kernel = enum {
 /// Matrix multiply tile sizes (matmul_bf16.wgsl: TN outputs × TT tokens).
 pub const matmul_tile_n = 64;
 pub const matmul_tile_t = 16;
-/// Reduction step; `k` must be a multiple.
 pub const matmul_tile_k = 32;
-/// Longest sequence `attention` handles (its scores live in workgroup memory).
-pub const attention_max_tokens = 4096;
 /// Widest head `attention` and `delta_rule` handle.
 pub const max_head_dim = 256;
+/// Most convolution taps `conv_silu` handles.
+pub const max_conv_taps = 8;
 /// Sampler limits: logit-bias entries and stop tokens per request.
 pub const max_bias = 1024;
 pub const max_stops = 16;
@@ -65,29 +71,28 @@ pub const params = struct {
         n_rot: u32,
         row_stride: u32,
         head_stride: u32,
-        pos0: u32,
         eps: f32,
-        _pad: u32 = 0,
+        _pad: [2]u32 = @splat(0),
     };
+    pub const KvAppend = extern struct { width: u32, f16: u32, _pad: [2]u32 = @splat(0) };
     pub const Attention = extern struct {
-        tokens: u32,
         heads: u32,
         kv_heads: u32,
         head_dim: u32,
+        f16: u32,
         scale: f32,
         _pad: [3]u32 = @splat(0),
     };
-    pub const ConvSilu = extern struct { tokens: u32, channels: u32, taps: u32, _pad: u32 = 0 };
+    pub const ConvSilu = extern struct { channels: u32, taps: u32, _pad: [2]u32 = @splat(0) };
     pub const L2NormHeads = extern struct { heads: u32, dim: u32, row_stride: u32, eps: f32 };
     pub const Gates = extern struct { count: u32, heads: u32, _pad: [2]u32 = @splat(0) };
     pub const DeltaRule = extern struct {
-        tokens: u32,
         k_heads: u32,
         v_heads: u32,
         dim: u32,
         conv_stride: u32,
         eps: f32,
-        _pad: [2]u32 = @splat(0),
+        _pad: [3]u32 = @splat(0),
     };
     /// Per-request sampler parameters (`sample` and `mark_tokens`).
     pub const Sample = extern struct {
@@ -179,5 +184,89 @@ pub const Launcher = struct {
         const groups = std.math.divCeil(usize, count, 256) catch unreachable;
         if (groups <= 65535) return .{ @intCast(groups), 1, 1 };
         return .{ 65535, @intCast(std.math.divCeil(usize, groups, 65535) catch unreachable), 1 };
+    }
+};
+
+/// How a prebuilt launch's workgroup grid follows the number of rows (tokens)
+/// it covers in a step.
+pub const Grid = union(enum) {
+    fixed: [3]u32,
+    /// (rows, 1, 1): one workgroup per row.
+    rows_x,
+    /// (x, rows, 1)
+    rows_y: u32,
+    /// (x, ⌈rows / tile⌉, 1)
+    tiles_y: struct { x: u32, tile: u32 },
+    /// One thread per element of rows × width (`Launcher.elementwise`).
+    elems: u32,
+
+    pub fn resolve(g: Grid, rows: u32) [3]u32 {
+        return switch (g) {
+            .fixed => |f| f,
+            .rows_x => .{ rows, 1, 1 },
+            .rows_y => |x| .{ x, rows, 1 },
+            .tiles_y => |t| .{ t.x, std.math.divCeil(u32, rows, t.tile) catch unreachable, 1 },
+            .elems => |w| Launcher.elementwise(@as(usize, rows) * w),
+        };
+    }
+};
+
+/// A launch whose bind group (parameters and buffers) is built once; each
+/// step only dispatches it.
+pub const Launch = struct {
+    pipeline: cmd.Pipeline,
+    bind_group: cmd.BindGroup,
+    grid: Grid,
+
+    pub fn record(l: Launch, gpa: Allocator, rec: *cmd.Recorder, rows: u32) Allocator.Error!void {
+        try rec.dispatch(gpa, l.pipeline, l.grid.resolve(rows), &.{l.bind_group});
+    }
+};
+
+/// Builds `Launch`es. Parameter blocks are packed into 64 KiB uniform
+/// buffers at 256-byte slots (the largest minUniformBufferOffsetAlignment
+/// WebGPU allows), uploaded by `finish`.
+pub const Builder = struct {
+    gpa: Allocator,
+    /// Owns the parameter pages; must outlive execution of the recorded batch.
+    arena: Allocator,
+    rec: *cmd.Recorder,
+    set: *const Set,
+    pages: std.ArrayList(Page) = .empty,
+
+    const page_size = 64 * 1024;
+    const slot = 256;
+    const Page = struct { buffer: cmd.Buffer, data: []u8, used: usize };
+
+    pub fn deinit(b: *Builder) void {
+        b.pages.deinit(b.gpa);
+    }
+
+    /// A launch with its own parameters at binding 0.
+    pub fn add(b: *Builder, kernel: Kernel, p: anytype, args: []const Arg, grid: Grid) Allocator.Error!Launch {
+        const P = @TypeOf(p);
+        comptime std.debug.assert(@sizeOf(P) % 16 == 0 and @sizeOf(P) <= slot);
+        if (b.pages.items.len == 0 or b.pages.items[b.pages.items.len - 1].used == page_size) {
+            const data = try b.arena.alloc(u8, page_size);
+            @memset(data, 0);
+            const buffer = try b.rec.createBuffer(b.gpa, page_size, .{ .uniform = true, .copy_dst = true });
+            try b.pages.append(b.gpa, .{ .buffer = buffer, .data = data, .used = 0 });
+        }
+        const page = &b.pages.items[b.pages.items.len - 1];
+        @memcpy(page.data[page.used..][0..@sizeOf(P)], std.mem.asBytes(&p));
+        const uniform: Arg = .{ .buffer = page.buffer, .offset = page.used, .size = @sizeOf(P) };
+        page.used += slot;
+        return b.addWith(kernel, uniform, args, grid);
+    }
+
+    /// A launch whose binding 0 is `uniform`, a buffer the caller rewrites.
+    pub fn addWith(b: *Builder, kernel: Kernel, uniform: Arg, args: []const Arg, grid: Grid) Allocator.Error!Launch {
+        const pipeline = b.set.pipelines.get(kernel);
+        return .{ .pipeline = pipeline, .bind_group = try bindGroup(b.gpa, b.rec, pipeline, uniform, args), .grid = grid };
+    }
+
+    /// Records the upload of every parameter page.
+    pub fn finish(b: *Builder) Allocator.Error!void {
+        for (b.pages.items) |page| try b.rec.writeBuffer(b.gpa, page.buffer, 0, page.data[0..page.used]);
     }
 };

@@ -1,7 +1,8 @@
 //! GPU kernel checks: each kernel on seeded random inputs against a float64
 //! CPU computation of the same formula (the sampler against its CPU
-//! reference). Shapes are chosen to hit tile and chunk remainders. Run with
-//! `zllm gpu-check` on any Dawn host.
+//! reference). Shapes are chosen to hit tile and chunk remainders, and
+//! stateful kernels run as two steps. Run with `zllm gpu-check` on any Dawn
+//! host.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,10 +37,12 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,    checkMatmul,      checkMatmulChunked, checkSiluMul,        checkAdd,
-        checkEmbed,      checkQkNormRope,  checkAttention,     checkConvSilu,       checkL2Norm,
-        checkGates,      checkDeltaRule,   checkSampleGreedy,  checkSampleTopKTopP, checkSampleMinP,
-        checkSampleTopP, checkSamplePlain, checkSampleTopK1,   checkSampleVocab,
+        checkRmsNorm,      checkMatmul,       checkMatmulChunked, checkSiluMul,
+        checkAdd,          checkEmbed,        checkQkNormRope,    checkKvAppendF16,
+        checkAttentionF32, checkAttentionF16, checkConvSilu,      checkL2Norm,
+        checkGates,        checkDeltaRule,    checkSampleGreedy,  checkSampleTopKTopP,
+        checkSampleMinP,   checkSampleTopP,   checkSamplePlain,   checkSampleTopK1,
+        checkSampleVocab,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -283,9 +286,8 @@ fn checkQkNormRope(c: *Ctx) !Result {
         .n_rot = n_rot,
         .row_stride = row,
         .head_stride = 2 * hd,
-        .pos0 = pos0,
         .eps = eps,
-    }, &.{ xa, try c.upload(w), try c.upload(table) }, .{ heads, tokens, 1 });
+    }, &.{ xa, try c.upload(w), try c.upload(table), try c.step(tokens, pos0, 0) }, .{ heads, tokens, 1 });
     const got = try c.read(xa);
 
     const want = try c.arena.alloc(f64, x.len);
@@ -309,59 +311,130 @@ fn checkQkNormRope(c: *Ctx) !Result {
     return .{ .name = "qk_norm_rope", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
-fn checkAttention(c: *Ctx) !Result {
-    // Qwen 3.5 shape: 8 query heads over 2 KV heads, head_dim 256.
-    const tokens = 37;
+/// Two steps of kv_append, then attention for the second step's queries,
+/// checked against the values the cache actually holds.
+fn attentionCase(c: *Ctx, name: []const u8, half: bool) !Result {
+    // Qwen 3.5 shape: 8 query heads over 2 KV heads, head_dim 256. 287 keys
+    // span two of the kernel's 256-key tiles.
+    const first = 270;
+    const second = 17;
+    const total = first + second;
     const heads = 8;
     const kv = 2;
     const hd = 256;
+    const width = kv * hd;
     const scale: f32 = 1.0 / 16.0;
-    const qg = try c.random(tokens * heads * 2 * hd, 1);
-    const k = try c.random(tokens * kv * hd, 1);
-    const v = try c.random(tokens * kv * hd, 1);
-    const out = try c.output(tokens * heads * hd);
-    try c.launcher().launch(.attention, P.Attention{ .tokens = tokens, .heads = heads, .kv_heads = kv, .head_dim = hd, .scale = scale }, &.{
-        try c.upload(qg), try c.upload(k), try c.upload(v), out,
-    }, .{ heads, tokens, 1 });
+    const k = try c.random(total * width, 1);
+    const v = try c.random(total * width, 1);
+    const qg = try c.random(second * heads * 2 * hd, 1);
+    const words: u32 = if (half) width / 2 else width;
+    const kc = try c.output(total * words);
+    const vc = try c.output(total * words);
+    const out = try c.output(second * heads * hd);
+    const l = c.launcher();
+    const append: P.KvAppend = .{ .width = width, .f16 = @intFromBool(half) };
+    const step1 = try c.step(first, 0, 0);
+    try l.launch(.kv_append, append, &.{ try c.upload(k[0 .. first * width]), try c.upload(v[0 .. first * width]), kc, vc, step1 }, kernels.Launcher.elementwise(first * width / 2));
+    const step2 = try c.step(second, first, 0);
+    try l.launch(.kv_append, append, &.{ try c.upload(k[first * width ..]), try c.upload(v[first * width ..]), kc, vc, step2 }, kernels.Launcher.elementwise(second * width / 2));
+    try l.launch(.attention, P.Attention{ .heads = heads, .kv_heads = kv, .head_dim = hd, .f16 = @intFromBool(half), .scale = scale }, &.{
+        try c.upload(qg), kc, vc, out, step2,
+    }, .{ heads, second, 1 });
     const got = try c.read(out);
+    const ck = try decodeCache(c, try c.readWords(kc), half);
+    const cv = try decodeCache(c, try c.readWords(vc), half);
 
-    const want = try c.arena.alloc(f64, tokens * heads * hd);
-    const s = try c.arena.alloc(f64, tokens);
-    for (0..tokens) |t| for (0..heads) |h| {
+    const want = try c.arena.alloc(f64, second * heads * hd);
+    const s = try c.arena.alloc(f64, total);
+    for (0..second) |t| for (0..heads) |h| {
         const kvh = h / (heads / kv);
+        const keys = first + t + 1;
         const q = qg[t * heads * 2 * hd + h * 2 * hd ..][0..hd];
         var max: f64 = -std.math.inf(f64);
-        for (0..t + 1) |j| {
+        for (0..keys) |j| {
             var dot: f64 = 0;
-            for (q, k[j * kv * hd + kvh * hd ..][0..hd]) |a, b| dot += @as(f64, a) * b;
+            for (q, ck[j * width + kvh * hd ..][0..hd]) |a, b| dot += @as(f64, a) * b;
             s[j] = dot * scale;
             max = @max(max, s[j]);
         }
         var sum: f64 = 0;
-        for (s[0 .. t + 1]) |*e| {
+        for (s[0..keys]) |*e| {
             e.* = @exp(e.* - max);
             sum += e.*;
         }
         for (0..hd) |d| {
             var o: f64 = 0;
-            for (0..t + 1) |j| o += s[j] * v[j * kv * hd + kvh * hd + d];
+            for (0..keys) |j| o += s[j] * cv[j * width + kvh * hd + d];
             want[(t * heads + h) * hd + d] = o / sum * sigmoid64(qg[t * heads * 2 * hd + h * 2 * hd + hd + d]);
         }
     };
-    return .{ .name = "attention", .err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
+}
+
+/// Cache words as f32 values.
+fn decodeCache(c: *Ctx, words: []const u32, half: bool) ![]f32 {
+    if (!half) return @constCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(words)));
+    const values = try c.arena.alloc(f32, words.len * 2);
+    for (words, 0..) |w, i| {
+        values[2 * i] = @as(f16, @bitCast(@as(u16, @truncate(w))));
+        values[2 * i + 1] = @as(f16, @bitCast(@as(u16, @truncate(w >> 16))));
+    }
+    return values;
+}
+
+fn checkAttentionF32(c: *Ctx) !Result {
+    return attentionCase(c, "attention (f32 cache)", false);
+}
+
+fn checkAttentionF16(c: *Ctx) !Result {
+    return attentionCase(c, "attention (f16 cache)", true);
+}
+
+/// kv_append's f16 rounding: within one f16 step (2^-10 relative) of the input.
+fn checkKvAppendF16(c: *Ctx) !Result {
+    const tokens = 5;
+    const pos0 = 3;
+    const width = 64;
+    const k = try c.random(tokens * width, 1);
+    const v = try c.random(tokens * width, 1);
+    const kc = try c.output((pos0 + tokens) * width / 2);
+    const vc = try c.output((pos0 + tokens) * width / 2);
+    try c.launcher().launch(.kv_append, P.KvAppend{ .width = width, .f16 = 1 }, &.{
+        try c.upload(k), try c.upload(v), kc, vc, try c.step(tokens, pos0, 0),
+    }, kernels.Launcher.elementwise(tokens * width / 2));
+    const ck = try decodeCache(c, try c.readWords(kc), true);
+    const cv = try decodeCache(c, try c.readWords(vc), true);
+    const got = try c.arena.alloc(f32, 2 * tokens * width);
+    @memcpy(got[0 .. tokens * width], ck[pos0 * width ..]);
+    @memcpy(got[tokens * width ..], cv[pos0 * width ..]);
+    const want = try c.arena.alloc(f64, 2 * tokens * width);
+    for (want[0 .. tokens * width], k) |*o, x| o.* = x;
+    for (want[tokens * width ..], v) |*o, x| o.* = x;
+    // Positions before pos0 stay untouched (zero).
+    for (ck[0 .. pos0 * width]) |x| if (x != 0) return .{ .name = "kv_append (f16)", .err = 1, .tolerance = 1e-3 };
+    return .{ .name = "kv_append (f16)", .err = relErr(got, want), .tolerance = 1e-3 };
 }
 
 fn checkConvSilu(c: *Ctx) !Result {
+    // Two steps of 5 and 4 tokens: the second reads the history the first left.
+    const steps = [_]u32{ 5, 4 };
     const tokens = 9;
     const channels = 300;
     const taps = 4;
     const x = try c.random(tokens * channels, 2);
     const w = try c.random(channels * taps, 1);
-    const out = try c.output(tokens * channels);
-    try c.launcher().launch(.conv_silu, P.ConvSilu{ .tokens = tokens, .channels = channels, .taps = taps }, &.{
-        try c.upload(x), try c.upload(w), out,
-    }, kernels.Launcher.elementwise(tokens * channels));
-    const got = try c.read(out);
+    const hist = try c.output((taps - 1) * channels);
+    const wa = try c.upload(w);
+    const got = try c.arena.alloc(f32, tokens * channels);
+    var t0: u32 = 0;
+    for (steps) |m| {
+        const out = try c.output(m * channels);
+        try c.launcher().launch(.conv_silu, P.ConvSilu{ .channels = channels, .taps = taps }, &.{
+            try c.upload(x[t0 * channels ..][0 .. m * channels]), wa, hist, out, try c.step(m, t0, 0),
+        }, kernels.Launcher.elementwise(channels));
+        @memcpy(got[t0 * channels ..][0 .. m * channels], try c.read(out));
+        t0 += m;
+    }
 
     const want = try c.arena.alloc(f64, tokens * channels);
     for (0..tokens) |t| for (0..channels) |ch| {
@@ -372,7 +445,7 @@ fn checkConvSilu(c: *Ctx) !Result {
         }
         want[t * channels + ch] = sum * sigmoid64(sum);
     };
-    return .{ .name = "conv_silu", .err = relErr(got, want), .tolerance = 1e-6 };
+    return .{ .name = "conv_silu (2 steps)", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 fn checkL2Norm(c: *Ctx) !Result {
@@ -428,7 +501,8 @@ fn checkGates(c: *Ctx) !Result {
 }
 
 fn checkDeltaRule(c: *Ctx) !Result {
-    // 4 value heads over 2 key heads (tiled mapping), dim 128, 37 tokens.
+    // 4 value heads over 2 key heads (tiled mapping), dim 128, 37 tokens in
+    // two steps of 20 and 17 that carry the state between them.
     const tokens = 37;
     const hk = 2;
     const hv = 4;
@@ -452,16 +526,26 @@ fn checkDeltaRule(c: *Ctx) !Result {
     const z = try c.random(tokens * inner, 2);
     const norm_w = try c.random(d, 1);
     const state = try c.output(hv * d * d);
-    const out = try c.output(tokens * inner);
-    try c.launcher().launch(.delta_rule, P.DeltaRule{
-        .tokens = tokens,
-        .k_heads = hk,
-        .v_heads = hv,
-        .dim = d,
-        .conv_stride = stride,
-        .eps = eps,
-    }, &.{ try c.upload(conv), try c.upload(g), try c.upload(beta), try c.upload(z), try c.upload(norm_w), state, out }, .{ hv, 1, 1 });
-    const got = try c.read(out);
+    const wn = try c.upload(norm_w);
+    const got = try c.arena.alloc(f32, tokens * inner);
+    var t0: u32 = 0;
+    for ([_]u32{ 20, 17 }) |m| {
+        const out = try c.output(m * inner);
+        try c.launcher().launch(.delta_rule, P.DeltaRule{
+            .k_heads = hk,
+            .v_heads = hv,
+            .dim = d,
+            .conv_stride = stride,
+            .eps = eps,
+        }, &.{
+            try c.upload(conv[t0 * stride ..][0 .. m * stride]), try c.upload(g[t0 * hv ..][0 .. m * hv]),
+            try c.upload(beta[t0 * hv ..][0 .. m * hv]),         try c.upload(z[t0 * inner ..][0 .. m * inner]),
+            wn,                                                  state,
+            out,                                                 try c.step(m, t0, 0),
+        }, .{ hv, 1, 1 });
+        @memcpy(got[t0 * inner ..][0 .. m * inner], try c.read(out));
+        t0 += m;
+    }
 
     const want = try c.arena.alloc(f64, tokens * inner);
     const s = try c.arena.alloc(f64, d * d);
@@ -496,7 +580,7 @@ fn checkDeltaRule(c: *Ctx) !Result {
             }
         }
     }
-    return .{ .name = "delta_rule", .err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = "delta_rule (2 steps)", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 /// Gaussian logits (σ = 2): every threshold (top-k, top-p, min-p) cuts

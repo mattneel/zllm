@@ -19,8 +19,9 @@ const usage =
     \\                                       tools/llama-dump/dump.cpp)
     \\  gpu-info                            open Dawn and print the adapter and limits as JSON
     \\  gpu-check                           check every GPU kernel against a CPU computation
-    \\  gpu-forward <model.gguf> <tokens.i32> <out.bin>
-    \\                                       as `forward`, on the GPU through Dawn
+    \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
+    \\                                       as `forward`, on the GPU through Dawn, in
+    \\                                       steps of N tokens (default 512; f32 KV)
     \\
     \\environment:
     \\  ZLLM_THREADS   worker threads for `forward` (default: one per physical core)
@@ -69,8 +70,8 @@ pub fn main(init: std.process.Init) !void {
         if (args.len != 2) return fail(usage);
         try gpuCheck(gpa, init.environ_map, out);
     } else if (std.mem.eql(u8, cmd, "gpu-forward")) {
-        if (args.len != 5) return fail(usage);
-        try gpuForward(gpa, io, init.environ_map, args[2], args[3], args[4]);
+        if (args.len < 5) return fail(usage);
+        try gpuForward(gpa, io, init.environ_map, args[2], args[3], args[4], try ForwardOptions.parse(args[5..]));
     } else {
         return fail(usage);
     }
@@ -215,9 +216,31 @@ fn gpuCheck(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *I
     if (!ok) return error.KernelCheckFailed;
 }
 
+const ForwardOptions = struct {
+    /// Tokens per step; 1 runs the sequence the way decoding does.
+    chunk: u32 = 512,
+    kv: zllm.plan.qwen35.KvFormat = .f32,
+
+    fn parse(args: []const []const u8) !ForwardOptions {
+        var o: ForwardOptions = .{};
+        var i: usize = 0;
+        while (i < args.len) : (i += 2) {
+            if (i + 1 == args.len) return fail(usage);
+            if (std.mem.eql(u8, args[i], "--chunk")) {
+                o.chunk = std.fmt.parseInt(u32, args[i + 1], 10) catch return fail(usage);
+                if (o.chunk == 0) return fail(usage);
+            } else if (std.mem.eql(u8, args[i], "--kv")) {
+                o.kv = std.meta.stringToEnum(zllm.plan.qwen35.KvFormat, args[i + 1]) orelse return fail(usage);
+            } else return fail(usage);
+        }
+        return o;
+    }
+};
+
 /// The GPU forward pass, with the same arguments and activation records as
-/// `forward`. Load and forward timings go to stderr.
-fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, model_path: []const u8, tokens_path: []const u8, out_path: []const u8) !void {
+/// `forward`, run as steps of `chunk` tokens against the KV cache and the
+/// recurrent state. Load and forward timings go to stderr.
+fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, model_path: []const u8, tokens_path: []const u8, out_path: []const u8, opts: ForwardOptions) !void {
     const plan = zllm.plan.qwen35;
     const t_start = Io.Timestamp.now(io, .awake);
     const mapped = try FileBytes.open(gpa, io, model_path);
@@ -244,30 +267,54 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     var completions: std.ArrayList(zllm.gpu.cmd.Completion) = .empty;
     defer completions.deinit(gpa);
 
+    const n: u32 = @intCast(tokens.len);
+    const chunk = @min(opts.chunk, n);
     const set = try zllm.kernels.Set.create(gpa, &rec);
     const model = try plan.Model.upload(arena, gpa, &rec, file, mapped.bytes, limits);
-    const n: u32 = @intCast(tokens.len);
-    const hp = model.hp;
-    const rope = try zllm.kernels.ropeTable(arena, n, hp.n_rot, hp.rope_base);
-    const acts = try plan.Activations.create(arena, gpa, &rec, hp, n, rope);
+    var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{
+        .max_tokens = chunk,
+        .context = n,
+        .logit_rows = @min(chunk, 64),
+        .kv = opts.kv,
+        .checkpoints = 1,
+    }, limits);
+    try program.recordReset(gpa, &rec);
     try rec.submit(gpa, 0);
     try runBatch(&host, &rec, &completions);
     const t_loaded = Io.Timestamp.now(io, .awake);
 
+    const hp = model.hp;
+    const e: usize = hp.n_embd;
     const layer_out = try arena.alloc([]f32, hp.n_layer);
-    for (layer_out) |*o| o.* = try arena.alloc(f32, tokens.len * hp.n_embd);
-    const readback: plan.Readback = .{
-        .layer_out = layer_out,
-        .result_norm = try arena.alloc(f32, tokens.len * hp.n_embd),
-        .logits = try arena.alloc(f32, tokens.len * hp.vocab),
-    };
-    const l: zllm.kernels.Launcher = .{ .gpa = gpa, .arena = arena, .rec = &rec, .set = &set };
-    try plan.recordForward(l, limits, &model, &acts, tokens, readback);
-    try rec.submit(gpa, std.math.maxInt(u32));
-    try runBatch(&host, &rec, &completions);
+    for (layer_out) |*o| o.* = try arena.alloc(f32, n * e);
+    const result_norm = try arena.alloc(f32, n * e);
+    const logits = try arena.alloc(f32, @as(usize, n) * hp.vocab);
+    const step_layers = try arena.alloc([]f32, hp.n_layer);
+    var pos0: u32 = 0;
+    var steps: u32 = 0;
+    while (pos0 < n) : (steps += 1) {
+        const m = @min(chunk, n - pos0);
+        for (step_layers, layer_out) |*s, o| s.* = o[pos0 * e ..][0 .. m * e];
+        try program.recordStep(gpa, &rec, .{
+            .pos0 = pos0,
+            .tokens = tokens[pos0..][0..m],
+            .logit_rows = m,
+            .readback = .{
+                .layer_out = step_layers,
+                .result_norm = result_norm[pos0 * e ..][0 .. m * e],
+                .logits = logits[@as(usize, pos0) * hp.vocab ..][0 .. @as(usize, m) * hp.vocab],
+            },
+        });
+        try rec.submit(gpa, steps + 1);
+        try runBatch(&host, &rec, &completions);
+        pos0 += m;
+    }
     const t_done = Io.Timestamp.now(io, .awake);
-    std.debug.print("gpu-forward: {d} tokens; load {d} ms, forward {d} ms\n", .{
+    std.debug.print("gpu-forward: {d} tokens in {d} steps of up to {d} ({t} KV); load {d} ms, forward {d} ms\n", .{
         n,
+        steps,
+        chunk,
+        opts.kv,
         t_start.durationTo(t_loaded).toMilliseconds(),
         t_loaded.durationTo(t_done).toMilliseconds(),
     });
@@ -279,10 +326,10 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     var rw: RecordWriter = .{ .w = &fw.interface };
     var name_buf: [32]u8 = undefined;
     for (layer_out, 0..) |o, il| {
-        try RecordWriter.emit(&rw, std.fmt.bufPrint(&name_buf, "l_out-{d}", .{il}) catch unreachable, o, hp.n_embd, tokens.len);
+        try RecordWriter.emit(&rw, std.fmt.bufPrint(&name_buf, "l_out-{d}", .{il}) catch unreachable, o, e, n);
     }
-    try RecordWriter.emit(&rw, "result_norm", readback.result_norm, hp.n_embd, tokens.len);
-    try RecordWriter.emit(&rw, "result_output", readback.logits, hp.vocab, tokens.len);
+    try RecordWriter.emit(&rw, "result_norm", result_norm, e, n);
+    try RecordWriter.emit(&rw, "result_output", logits, hp.vocab, n);
     try fw.interface.flush();
 }
 

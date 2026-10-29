@@ -1,6 +1,6 @@
 // In place, per head of per-token rows: x ← rmsnorm(x) · w, then NeoX RoPE on
 // the first n_rot dims, pairs (i, i + n_rot/2) rotated by the angle of
-// position pos0 + t. One workgroup per (head, token).
+// position pos0 + t (from the step). One workgroup per (head, token).
 //
 // Head h of token t starts at t · row_stride + h · head_stride, which covers
 // both Q (heads interleaved with their output gates) and K. `rope` holds
@@ -13,8 +13,15 @@ struct Params {
     n_rot: u32,
     row_stride: u32,
     head_stride: u32,
-    pos0: u32,
     eps: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+struct Step {
+    m: u32,
+    pos0: u32,
+    u: f32,
     _pad: u32,
 }
 
@@ -22,6 +29,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> x: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<f32>;
 @group(0) @binding(3) var<storage, read> rope: array<vec2f>;
+@group(0) @binding(4) var<uniform> step: Step;
 
 const WG: u32 = 256u;
 var<workgroup> partial: array<f32, WG>;
@@ -53,7 +61,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
     storageBarrier();
 
     let half = p.n_rot / 2u;
-    let row = (p.pos0 + t) * half;
+    let row = (step.pos0 + t) * half;
     for (var i = lid.x; i < half; i += WG) {
         let cs = rope[row + i];
         let x0 = x[base + i];

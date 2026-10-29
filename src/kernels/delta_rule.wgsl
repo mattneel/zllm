@@ -1,4 +1,4 @@
-// Gated delta rule over a batch of tokens, then the SiLU(z)-gated RMSNorm.
+// Gated delta rule over the step's m tokens, then the SiLU(z)-gated RMSNorm.
 // One workgroup per value head j; thread b owns value column b of the state
 // S (dim × dim, S[a][b] at state[j·dim² + a·dim + b]), so the recurrence
 // needs no cross-thread reduction. Per token t, with q, k, v the head's
@@ -14,7 +14,6 @@
 // The state persists in its buffer across dispatches.
 
 struct Params {
-    tokens: u32,
     k_heads: u32,
     v_heads: u32,
     dim: u32,
@@ -22,6 +21,14 @@ struct Params {
     eps: f32,
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
+}
+
+struct Step {
+    m: u32,
+    pos0: u32,
+    u: f32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -32,6 +39,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read> norm_w: array<f32>;
 @group(0) @binding(6) var<storage, read_write> state: array<f32>;
 @group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> step: Step;
 
 const MAX_DIM: u32 = 256u;
 var<workgroup> qs: array<f32, MAX_DIM>;
@@ -50,7 +58,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
     let inner = p.v_heads * d;
     let scale = 1.0 / sqrt(f32(d));
 
-    for (var t = 0u; t < p.tokens; t++) {
+    for (var t = 0u; t < step.m; t++) {
         let row = t * p.conv_stride;
         if (in_head) {
             qs[b] = conv[row + kh * d + b];
