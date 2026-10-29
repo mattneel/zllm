@@ -21,4 +21,5 @@ test {
     _ = @import("ref/pool.zig");
     _ = ref.matmul;
     _ = gpu.cmd;
+    _ = @import("tokenizer/stream.zig");
 }
