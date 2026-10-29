@@ -26,6 +26,8 @@ pub const Kernel = enum {
     qk_norm_rope,
     kv_append,
     attention,
+    attn_split,
+    attn_combine,
     conv_silu,
     l2norm_heads,
     gates,
@@ -46,7 +48,7 @@ pub const matmul_tile_n = 64;
 pub const matmul_tile_t = 16;
 pub const matmul_tile_k = 32;
 /// Steps of at most this many tokens (decoding) use the decode kernels:
-/// `matvec_bf16`.
+/// `matvec_bf16` and split attention.
 pub const decode_max_rows = 4;
 /// Rows per `matvec_bf16` workgroup.
 pub const matvec_rows = 8;
@@ -54,6 +56,9 @@ pub const matvec_rows = 8;
 pub const max_head_dim = 256;
 /// State columns per `delta_rule` workgroup.
 pub const delta_cols = 32;
+/// Cache positions per `attn_split` workgroup, and the largest GQA group.
+pub const attn_block = 64;
+pub const attn_max_group = 8;
 /// Most convolution taps `conv_silu` handles.
 pub const max_conv_taps = 8;
 /// Sampler limits: logit-bias entries and stop tokens per request.
@@ -96,6 +101,16 @@ pub const params = struct {
         f16: u32,
         scale: f32,
         _pad: [3]u32 = @splat(0),
+    };
+    /// `attn_split` and `attn_combine`.
+    pub const AttnDecode = extern struct {
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        f16: u32,
+        scale: f32,
+        max_blocks: u32,
+        _pad: [2]u32 = @splat(0),
     };
     pub const ConvSilu = extern struct { channels: u32, taps: u32, _pad: [2]u32 = @splat(0) };
     pub const L2NormHeads = extern struct { heads: u32, dim: u32, row_stride: u32, eps: f32 };
@@ -278,8 +293,11 @@ pub const Launcher = struct {
     }
 };
 
-/// How a prebuilt launch's workgroup grid follows the number of rows (tokens)
-/// it covers in a step.
+/// What a launch covers in a step: its rows (tokens), and the cache
+/// positions the step's last token attends to.
+pub const Extent = struct { rows: u32, keys: u32 = 0 };
+
+/// How a prebuilt launch's workgroup grid follows the step's extent.
 pub const Grid = union(enum) {
     fixed: [3]u32,
     /// (rows, 1, 1): one workgroup per row.
@@ -290,14 +308,18 @@ pub const Grid = union(enum) {
     tiles_y: struct { x: u32, tile: u32 },
     /// One thread per element of rows × width (`Launcher.elementwise`).
     elems: u32,
+    /// (x, ⌈keys / block⌉, rows): blocks of cache positions per token.
+    key_blocks: struct { x: u32, block: u32 },
 
-    pub fn resolve(g: Grid, rows: u32) [3]u32 {
+    pub fn resolve(g: Grid, e: Extent) [3]u32 {
+        const rows = e.rows;
         return switch (g) {
             .fixed => |f| f,
             .rows_x => .{ rows, 1, 1 },
             .rows_y => |x| .{ x, rows, 1 },
             .tiles_y => |t| .{ t.x, std.math.divCeil(u32, rows, t.tile) catch unreachable, 1 },
             .elems => |w| Launcher.elementwise(@as(usize, rows) * w),
+            .key_blocks => |k| .{ k.x, std.math.divCeil(u32, e.keys, k.block) catch unreachable, rows },
         };
     }
 };
@@ -309,8 +331,8 @@ pub const Launch = struct {
     bind_group: cmd.BindGroup,
     grid: Grid,
 
-    pub fn record(l: Launch, gpa: Allocator, rec: *cmd.Recorder, rows: u32) Allocator.Error!void {
-        try rec.dispatch(gpa, l.pipeline, l.grid.resolve(rows), &.{l.bind_group});
+    pub fn record(l: Launch, gpa: Allocator, rec: *cmd.Recorder, e: Extent) Allocator.Error!void {
+        try rec.dispatch(gpa, l.pipeline, l.grid.resolve(e), &.{l.bind_group});
     }
 };
 

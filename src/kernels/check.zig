@@ -37,11 +37,11 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,      checkMatmul,          checkMatmulChunked,     checkMatvec,      checkSiluMul,
-        checkAdd,          checkEmbed,           checkQkNormRope,        checkKvAppendF16, checkAttentionF32,
-        checkAttentionF16, checkConvSilu,        checkL2Norm,            checkGates,       checkDeltaRule,
-        checkSampleGreedy, checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,  checkSamplePlain,
-        checkSampleTopK1,  checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
+        checkRmsNorm,      checkMatmul,       checkMatmulChunked,   checkMatvec,            checkSiluMul,
+        checkAdd,          checkEmbed,        checkQkNormRope,      checkKvAppendF16,       checkAttentionF32,
+        checkAttentionF16, checkAttnDecode,   checkConvSilu,        checkL2Norm,            checkGates,
+        checkDeltaRule,    checkSampleGreedy, checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
+        checkSamplePlain,  checkSampleTopK1,  checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -397,6 +397,67 @@ fn attentionCase(c: *Ctx, name: []const u8, half: bool) !Result {
         }
     };
     return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
+}
+
+/// Decode attention: a cache of 150 positions, then 3 query tokens attending
+/// through attn_split (three 64-position blocks, the last partial) and
+/// attn_combine, checked against the values the cache holds.
+fn checkAttnDecode(c: *Ctx) !Result {
+    const first = 150;
+    const second = 3;
+    const total = first + second;
+    const heads = 8;
+    const kv = 2;
+    const hd = 256;
+    const width = kv * hd;
+    const scale: f32 = 1.0 / 16.0;
+    const k = try c.random(total * width, 1);
+    const v = try c.random(total * width, 1);
+    const qg = try c.random(second * heads * 2 * hd, 1);
+    const kc = try c.output(total * width / 2);
+    const vc = try c.output(total * width / 2);
+    const out = try c.output(second * heads * hd);
+    const max_blocks = 4;
+    const part = try c.output(second * heads * max_blocks * (hd + 2));
+    const l = c.launcher();
+    const append: P.KvAppend = .{ .width = width, .f16 = 1 };
+    try l.launch(.kv_append, append, &.{ try c.upload(k[0 .. first * width]), try c.upload(v[0 .. first * width]), kc, vc, try c.step(first, 0, 0) }, kernels.Launcher.elementwise(first * width / 2));
+    const step2 = try c.step(second, first, 0);
+    try l.launch(.kv_append, append, &.{ try c.upload(k[first * width ..]), try c.upload(v[first * width ..]), kc, vc, step2 }, kernels.Launcher.elementwise(second * width / 2));
+    const params: P.AttnDecode = .{ .heads = heads, .kv_heads = kv, .head_dim = hd, .f16 = 1, .scale = scale, .max_blocks = max_blocks };
+    const qa = try c.upload(qg);
+    const grid: kernels.Grid = .{ .key_blocks = .{ .x = kv, .block = kernels.attn_block } };
+    try l.launch(.attn_split, params, &.{ qa, kc, vc, part, step2 }, grid.resolve(.{ .rows = second, .keys = total }));
+    try l.launch(.attn_combine, params, &.{ qa, part, out, step2 }, .{ heads, second, 1 });
+    const got = try c.read(out);
+    const ck = try decodeCache(c, try c.readWords(kc), true);
+    const cv = try decodeCache(c, try c.readWords(vc), true);
+
+    const want = try c.arena.alloc(f64, second * heads * hd);
+    const s = try c.arena.alloc(f64, total);
+    for (0..second) |t| for (0..heads) |h| {
+        const kvh = h / (heads / kv);
+        const keys = first + t + 1;
+        const q = qg[t * heads * 2 * hd + h * 2 * hd ..][0..hd];
+        var max: f64 = -std.math.inf(f64);
+        for (0..keys) |j| {
+            var dot: f64 = 0;
+            for (q, ck[j * width + kvh * hd ..][0..hd]) |a, b| dot += @as(f64, a) * b;
+            s[j] = dot * scale;
+            max = @max(max, s[j]);
+        }
+        var sum: f64 = 0;
+        for (s[0..keys]) |*e| {
+            e.* = @exp(e.* - max);
+            sum += e.*;
+        }
+        for (0..hd) |d| {
+            var o: f64 = 0;
+            for (0..keys) |j| o += s[j] * cv[j * width + kvh * hd + d];
+            want[(t * heads + h) * hd + d] = o / sum * sigmoid64(qg[t * heads * 2 * hd + h * 2 * hd + hd + d]);
+        }
+    };
+    return .{ .name = "attn_split + combine", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 /// Cache words as f32 values.

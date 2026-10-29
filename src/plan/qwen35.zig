@@ -217,11 +217,29 @@ pub const Config = struct {
 const Item = union(enum) {
     launch: kernels.Launch,
     matmul: Matmul,
+    attention: Attend,
     layer_end: u32,
 };
 
+/// An attention layer's attention, prebuilt both ways: per query for
+/// prefill, split over blocks of cache positions for decoding.
+pub const Attend = struct {
+    full: kernels.Launch,
+    split: kernels.Launch,
+    combine: kernels.Launch,
+
+    fn record(a: Attend, gpa: Allocator, rec: *cmd.Recorder, e: kernels.Extent, path: Path) Allocator.Error!void {
+        if (path == .decode) {
+            try a.split.record(gpa, rec, e);
+            try a.combine.record(gpa, rec, e);
+        } else {
+            try a.full.record(gpa, rec, e);
+        }
+    }
+};
+
 /// Which kernels a step runs: the tiled prefill kernels, or the decode
-/// kernels (matrix-vector multiplies) for steps of at most
+/// kernels (matrix-vector multiplies, split attention) for steps of at most
 /// `kernels.decode_max_rows` tokens. Each is bitwise independent of how a
 /// sequence is split into steps, but the two round differently.
 pub const Path = enum {
@@ -296,6 +314,7 @@ pub const Program = struct {
         const hp = m.hp;
         if (cfg.max_tokens == 0 or cfg.logit_rows == 0 or cfg.context < cfg.max_tokens or cfg.checkpoints == 0) return error.BadConfig;
         if (hp.conv_kernel > kernels.max_conv_taps or hp.head_dim > kernels.max_head_dim or hp.gdn_head_dim > kernels.max_head_dim) return error.BadConfig;
+        if (hp.n_head % hp.n_head_kv != 0 or hp.n_head / hp.n_head_kv > kernels.attn_max_group) return error.BadConfig;
         const e: u64 = hp.n_embd;
         const cap: u64 = cfg.max_tokens;
         const conv_dim: u64 = 2 * hp.gdn_head_dim * hp.gdn_k_heads + hp.gdn_inner;
@@ -347,6 +366,10 @@ pub const Program = struct {
         const prompt_mask = try a.storage(hp.vocab);
         const counts = try a.storage(hp.vocab);
         const work = try a.storage(hp.vocab);
+        // Decode attention's per-block partials: (max, sum, output) per
+        // (token, head, block of cache positions).
+        const max_blocks: u32 = std.math.divCeil(u32, cfg.context, kernels.attn_block) catch unreachable;
+        const attn_part = try a.storage(@as(u64, kernels.decode_max_rows) * hp.n_head * max_blocks * (hp.head_dim + 2));
         const sample_state = try a.storage(kernels.sampleStateWords(hp.vocab));
 
         var b: kernels.Builder = .{ .gpa = gpa, .arena = arena, .rec = rec, .set = set };
@@ -387,13 +410,19 @@ pub const Program = struct {
                     }, &.{ k, w.k_norm, rope, step }, .{ .rows_y = hp.n_head_kv }) });
                     const half: u32 = @backingInt(cfg.kv);
                     try body.append(arena, .{ .launch = try b.add(.kv_append, P.KvAppend{ .width = @intCast(kv_dim), .f16 = half }, &.{ k, v, kc, vc, step }, .{ .elems = @intCast(kv_dim / 2) }) });
-                    try body.append(arena, .{ .launch = try b.add(.attention, P.Attention{
-                        .heads = hp.n_head,
-                        .kv_heads = hp.n_head_kv,
-                        .head_dim = hd,
-                        .f16 = half,
-                        .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
-                    }, &.{ qg, kc, vc, att, step }, .{ .rows_y = hp.n_head }) });
+                    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+                    const decode: P.AttnDecode = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hd, .f16 = half, .scale = scale, .max_blocks = max_blocks };
+                    try body.append(arena, .{ .attention = .{
+                        .full = try b.add(.attention, P.Attention{
+                            .heads = hp.n_head,
+                            .kv_heads = hp.n_head_kv,
+                            .head_dim = hd,
+                            .f16 = half,
+                            .scale = scale,
+                        }, &.{ qg, kc, vc, att, step }, .{ .rows_y = hp.n_head }),
+                        .split = try b.add(.attn_split, decode, &.{ qg, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block } }),
+                        .combine = try b.add(.attn_combine, decode, &.{ qg, attn_part, att, step }, .{ .rows_y = hp.n_head }),
+                    } });
                     try matmul(&b, arena, &body, mix, att, &w.wo, capn);
                 },
                 .delta_net => |*w| {
@@ -508,7 +537,7 @@ pub const Program = struct {
         if (prompt.len > 0) try rec.writeBuffer(gpa, p.prompt_ids.buffer, 0, std.mem.sliceAsBytes(p.prompt_stage[0..prompt.len]));
         try rec.clearBuffer(gpa, p.counts.buffer, 0, p.counts.size);
         try rec.clearBuffer(gpa, p.prompt_mask.buffer, 0, p.prompt_mask.size);
-        if (prompt.len > 0) try p.mark.record(gpa, rec, @intCast(prompt.len));
+        if (prompt.len > 0) try p.mark.record(gpa, rec, .{ .rows = @intCast(prompt.len) });
     }
 
     pub const Step = struct {
@@ -553,9 +582,11 @@ pub const Program = struct {
             try rec.writeBuffer(gpa, p.token_ids.buffer, 0, std.mem.sliceAsBytes(p.token_stage[0..t.len]));
         }
 
+        const ext: kernels.Extent = .{ .rows = m, .keys = s.pos0 + m };
         for (p.body) |item| switch (item) {
-            .launch => |l| try l.record(gpa, rec, m),
-            .matmul => |mm| try mm.pick(path).record(gpa, rec, m),
+            .launch => |l| try l.record(gpa, rec, ext),
+            .matmul => |mm| try mm.pick(path).record(gpa, rec, ext),
+            .attention => |at| try at.record(gpa, rec, ext, path),
             .layer_end => |il| if (s.readback) |r| if (r.layer_out.len > 0) {
                 try rec.readBuffer(gpa, read_token, p.x.buffer, 0, std.mem.sliceAsBytes(r.layer_out[il][0 .. m * e]));
             },
@@ -568,7 +599,7 @@ pub const Program = struct {
         while (r0 < m) {
             const n = @min(p.cfg.logit_rows, m - r0);
             try rec.copyBuffer(gpa, p.h.buffer, r0 * e * 4, p.lm_in.buffer, 0, n * e * 4);
-            for (p.head) |mm| try mm.pick(if (path == .decode and n <= kernels.decode_max_rows) .decode else .prefill).record(gpa, rec, n);
+            for (p.head) |mm| try mm.pick(if (path == .decode and n <= kernels.decode_max_rows) .decode else .prefill).record(gpa, rec, .{ .rows = n });
             if (s.readback) |r| if (r.logits) |dst| {
                 const at = (r0 - (m - s.logit_rows)) * vocab;
                 try rec.readBuffer(gpa, read_token, p.logits.buffer, 0, std.mem.sliceAsBytes(dst[at..][0 .. n * vocab]));
@@ -578,7 +609,7 @@ pub const Program = struct {
 
         if (s.draw != null) {
             std.debug.assert(p.sample_len > 0);
-            for (p.sample_steps[0..p.sample_len]) |ss| try p.sample.get(ss.phase)[ss.round].record(gpa, rec, 1);
+            for (p.sample_steps[0..p.sample_len]) |ss| try p.sample.get(ss.phase)[ss.round].record(gpa, rec, .{ .rows = 1 });
             try rec.readBuffer(gpa, read_token, p.sample_state.buffer, 0, std.mem.asBytes(s.sampled.?));
         }
     }
