@@ -138,6 +138,20 @@ file read through the `\\wsl` share. The first request after load runs its
 prefill pipelines for the first time, which costs about 130 ms more; later
 ones don't.
 
+### The 27B
+
+Qwen 3.8 27B at Q3_K_M (13.75 GB) runs in Chrome on the same GPU:
+
+| Phase | Chrome |
+|---|---|
+| Load, uncached, over HTTP from localhost | 25.8 s |
+| Decode, 3,016 tokens of a chat reply | 27.3 tok/s |
+
+The spec's bar for a warm load is 40 s, from the weight cache. On this
+machine Chrome gives the origin a 12.3 GB quota, which follows the disk's
+free space (53 GB), so the 13.75 GB file doesn't fit and the cache
+declines it. Loading it uncached over localhost already takes 25.8 s.
+
 ## Validation
 
 - **Same output as native.** In Chrome on the RTX 5090, greedy generation
