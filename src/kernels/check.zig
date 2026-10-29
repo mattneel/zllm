@@ -38,8 +38,8 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
     var ok = true;
     inline for (.{
         checkRmsNorm,           checkMatmul,       checkMatmulChunked, checkMatvec,       checkMatvecNorm,
-        checkMatvecSiluPair,    checkSiluMul,      checkAdd,           checkEmbed,        checkQkNormRope,
-        checkKvAppendF16,       checkAttentionF32, checkAttentionF16,  checkAttnDecode,   checkConvSilu,
+        checkMatvecSiluPair,    checkSiluMul,      checkAdd,           checkEmbed,        checkRopeAppendF32,
+        checkRopeAppendF16,     checkAttentionF32, checkAttentionF16,  checkAttnDecode,   checkConvSilu,
         checkL2Norm,            checkGates,        checkDeltaRule,     checkSampleGreedy, checkSampleTopKTopP,
         checkSampleMinP,        checkSampleTopP,   checkSamplePlain,   checkSampleTopK1,  checkSampleLargeTopK,
         checkSampleTopKSkipped, checkSampleVocab,
@@ -364,171 +364,199 @@ fn sigmoid64(x: f64) f64 {
     return 1 / (1 + @exp(-x));
 }
 
-fn checkQkNormRope(c: *Ctx) !Result {
-    // Q layout: 3 heads of 32 interleaved with gates (head stride 64), 5 tokens,
-    // rotation over the first 16 dims, positions starting at 7.
+/// head ← rmsnorm(head) · w, then NeoX RoPE at `pos` over the first n_rot
+/// dims, in float64.
+fn normRope(head: []f64, w: []const f32, pos: usize, n_rot: u32, base: f64, eps: f64) void {
+    var ss: f64 = 0;
+    for (head) |v| ss += v * v;
+    const scale = 1 / @sqrt(ss / @as(f64, @floatFromInt(head.len)) + eps);
+    for (head, w) |*v, wi| v.* = v.* * scale * wi;
+    const half = n_rot / 2;
+    for (0..half) |i| {
+        const theta = @as(f64, @floatFromInt(pos)) * std.math.pow(f64, base, -2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n_rot)));
+        const x0 = head[i];
+        const x1 = head[i + half];
+        head[i] = x0 * @cos(theta) - x1 * @sin(theta);
+        head[i + half] = x0 * @sin(theta) + x1 * @cos(theta);
+    }
+}
+
+/// rope_append on 5 tokens at positions 7..11 of a fused Q|K|V projection:
+/// 3 query heads of 32 interleaved with gates, 2 KV heads, rotation over the
+/// first 16 dims, rows padded past V. Checks the whole projection (Q heads
+/// rotated in place, gates, K and V untouched) and the cache (K normalized
+/// and rotated, V copied, earlier positions untouched).
+fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool) !Result {
     const tokens = 5;
     const heads = 3;
+    const kv = 2;
     const hd = 32;
     const n_rot = 16;
     const pos0 = 7;
     const eps = 1e-6;
     const base = 1e7;
-    const row = heads * 2 * hd;
+    const width = kv * hd;
+    const k_off = heads * 2 * hd;
+    const v_off = k_off + width;
+    const row = v_off + width + 8;
     const x = try c.random(tokens * row, 2);
-    const w = try c.random(hd, 1);
+    const qw = try c.random(hd, 1);
+    const kw = try c.random(hd, 1);
     const table = try kernels.ropeTable(c.arena, pos0 + tokens, n_rot, base);
     const xa = try c.upload(x);
-    try c.launcher().launch(.qk_norm_rope, P.QkNormRope{
+    const words: u32 = if (half) width / 2 else width;
+    const kc = try c.output((pos0 + tokens) * words);
+    const vc = try c.output((pos0 + tokens) * words);
+    try c.launcher().launch(.rope_append, P.RopeAppend{
         .heads = heads,
+        .kv_heads = kv,
         .head_dim = hd,
         .n_rot = n_rot,
-        .row_stride = row,
-        .head_stride = 2 * hd,
+        .row = row,
+        .k_off = k_off,
+        .v_off = v_off,
+        .f16 = @intFromBool(half),
         .eps = eps,
-    }, &.{ xa, try c.upload(w), try c.upload(table), try c.step(tokens, pos0, 0) }, .{ heads, tokens, 1 });
-    const got = try c.read(xa);
+    }, &.{ xa, try c.upload(qw), try c.upload(kw), try c.upload(table), kc, vc, try c.step(tokens, pos0, 0) }, .{ heads + kv, tokens, 1 });
+    const ck = try decodeCache(c, try c.readWords(kc), half);
+    const cv = try decodeCache(c, try c.readWords(vc), half);
+    for (ck[0 .. pos0 * width], cv[0 .. pos0 * width]) |a, b| if (a != 0 or b != 0) return .{ .name = name, .err = 1, .tolerance = 0 };
+    const cached = tokens * width;
+    const got = try c.arena.alloc(f32, x.len + 2 * cached);
+    @memcpy(got[0..x.len], try c.read(xa));
+    @memcpy(got[x.len..][0..cached], ck[pos0 * width ..]);
+    @memcpy(got[x.len + cached ..], cv[pos0 * width ..]);
 
-    const want = try c.arena.alloc(f64, x.len);
-    for (want, x) |*o, v| o.* = v; // gates and other heads' halves pass through
-    for (0..tokens) |t| for (0..heads) |h| {
-        const head = want[t * row + h * 2 * hd ..][0..hd];
-        var ss: f64 = 0;
-        for (head) |v| ss += v * v;
-        const scale = 1 / @sqrt(ss / hd + eps);
-        for (head, w) |*v, wi| v.* = v.* * scale * wi;
-        const pos: f64 = @floatFromInt(pos0 + t);
-        for (0..n_rot / 2) |i| {
-            const theta = pos * std.math.pow(f64, base, -2.0 * @as(f64, @floatFromInt(i)) / n_rot);
-            const x0 = head[i];
-            const x1 = head[i + n_rot / 2];
-            head[i] = x0 * @cos(theta) - x1 * @sin(theta);
-            head[i + n_rot / 2] = x0 * @sin(theta) + x1 * @cos(theta);
+    const want = try c.arena.alloc(f64, got.len);
+    for (want[0..x.len], x) |*o, v| o.* = v;
+    for (0..tokens) |t| {
+        for (0..heads) |h| normRope(want[t * row + h * 2 * hd ..][0..hd], qw, pos0 + t, n_rot, base, eps);
+        const kd = want[x.len + t * width ..][0..width];
+        const vd = want[x.len + cached + t * width ..][0..width];
+        for (kd, vd, x[t * row + k_off ..][0..width], x[t * row + v_off ..][0..width]) |*a, *b, kv_, vv| {
+            a.* = kv_;
+            b.* = vv;
         }
-    };
-    // The table is f32 from the reference formula, so angles carry f32 error.
-    return .{ .name = "qk_norm_rope", .err = relErr(got, want), .tolerance = 1e-5 };
+        for (0..kv) |g| normRope(kd[g * hd ..][0..hd], kw, pos0 + t, n_rot, base, eps);
+    }
+    // The table is f32 from the reference formula, so angles carry f32
+    // error; the f16 cache rounds to 2^-11 relative.
+    return .{ .name = name, .err = relErr(got, want), .tolerance = if (half) 1e-3 else 1e-5 };
 }
 
-/// Two steps of kv_append, then attention for the second step's queries,
-/// checked against the values the cache actually holds.
+fn checkRopeAppendF32(c: *Ctx) !Result {
+    return ropeAppendCase(c, "rope_append (f32 cache)", false);
+}
+
+fn checkRopeAppendF16(c: *Ctx) !Result {
+    return ropeAppendCase(c, "rope_append (f16 cache)", true);
+}
+
+/// A cache of random values for `total` positions, as the kernels store it:
+/// f16 pairs or f32 bits. `values` are rounded to what the cache holds.
+fn cacheWords(c: *Ctx, values: []f32, half: bool) ![]u32 {
+    if (!half) return @constCast(std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(values)));
+    const words = try c.arena.alloc(u32, values.len / 2);
+    for (words, 0..) |*w, i| {
+        const lo: f16 = @floatCast(values[2 * i]);
+        const hi: f16 = @floatCast(values[2 * i + 1]);
+        values[2 * i] = lo;
+        values[2 * i + 1] = hi;
+        w.* = @as(u32, @as(u16, @bitCast(lo))) | (@as(u32, @as(u16, @bitCast(hi))) << 16);
+    }
+    return words;
+}
+
+/// The Qwen 3.5 attention shape: 8 query heads over 2 KV heads, head_dim
+/// 256, queries in rows padded past their gates (q_row).
+const AttnShape = struct {
+    const heads = 8;
+    const kv = 2;
+    const hd = 256;
+    const width = kv * hd;
+    const q_row = heads * 2 * hd + 96;
+    const scale: f32 = 1.0 / 16.0;
+};
+
+/// Gated attention of `second` queries at positions first.. over the cache,
+/// in float64.
+fn attnWant(c: *Ctx, qg: []const f32, k: []const f32, v: []const f32, first: u32, second: u32) ![]f64 {
+    const S = AttnShape;
+    const want = try c.arena.alloc(f64, second * S.heads * S.hd);
+    const s = try c.arena.alloc(f64, first + second);
+    for (0..second) |t| for (0..S.heads) |h| {
+        const kvh = h / (S.heads / S.kv);
+        const keys = first + t + 1;
+        const q = qg[t * S.q_row + h * 2 * S.hd ..][0..S.hd];
+        var max: f64 = -std.math.inf(f64);
+        for (0..keys) |j| {
+            var dot: f64 = 0;
+            for (q, k[j * S.width + kvh * S.hd ..][0..S.hd]) |a, b| dot += @as(f64, a) * b;
+            s[j] = dot * S.scale;
+            max = @max(max, s[j]);
+        }
+        var sum: f64 = 0;
+        for (s[0..keys]) |*e| {
+            e.* = @exp(e.* - max);
+            sum += e.*;
+        }
+        for (0..S.hd) |d| {
+            var o: f64 = 0;
+            for (0..keys) |j| o += s[j] * v[j * S.width + kvh * S.hd + d];
+            want[(t * S.heads + h) * S.hd + d] = o / sum * sigmoid64(qg[t * S.q_row + h * 2 * S.hd + S.hd + d]);
+        }
+    };
+    return want;
+}
+
+/// Prefill attention for 17 queries after 270 cached positions: 287 keys
+/// span two of the kernel's 256-key tiles.
 fn attentionCase(c: *Ctx, name: []const u8, half: bool) !Result {
-    // Qwen 3.5 shape: 8 query heads over 2 KV heads, head_dim 256. 287 keys
-    // span two of the kernel's 256-key tiles.
+    const S = AttnShape;
     const first = 270;
     const second = 17;
     const total = first + second;
-    const heads = 8;
-    const kv = 2;
-    const hd = 256;
-    const width = kv * hd;
-    const scale: f32 = 1.0 / 16.0;
-    const k = try c.random(total * width, 1);
-    const v = try c.random(total * width, 1);
-    const qg = try c.random(second * heads * 2 * hd, 1);
-    const words: u32 = if (half) width / 2 else width;
-    const kc = try c.output(total * words);
-    const vc = try c.output(total * words);
-    const out = try c.output(second * heads * hd);
-    const l = c.launcher();
-    const append: P.KvAppend = .{ .width = width, .f16 = @intFromBool(half) };
-    const step1 = try c.step(first, 0, 0);
-    try l.launch(.kv_append, append, &.{ try c.upload(k[0 .. first * width]), try c.upload(v[0 .. first * width]), kc, vc, step1 }, kernels.Launcher.elementwise(first * width / 2));
-    const step2 = try c.step(second, first, 0);
-    try l.launch(.kv_append, append, &.{ try c.upload(k[first * width ..]), try c.upload(v[first * width ..]), kc, vc, step2 }, kernels.Launcher.elementwise(second * width / 2));
-    try l.launch(.attention, P.Attention{ .heads = heads, .kv_heads = kv, .head_dim = hd, .f16 = @intFromBool(half), .scale = scale }, &.{
-        try c.upload(qg), kc, vc, out, step2,
-    }, .{ heads, second, 1 });
+    const k = try c.random(total * S.width, 1);
+    const v = try c.random(total * S.width, 1);
+    const qg = try c.random(second * S.q_row, 1);
+    const out = try c.output(second * S.heads * S.hd);
+    try c.launcher().launch(.attention, P.Attention{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = @intFromBool(half), .scale = S.scale, .q_row = S.q_row }, &.{
+        try c.upload(qg), try c.upload(try cacheWords(c, k, half)), try c.upload(try cacheWords(c, v, half)), out, try c.step(second, first, 0),
+    }, .{ S.heads, second, 1 });
     const got = try c.read(out);
-    const ck = try decodeCache(c, try c.readWords(kc), half);
-    const cv = try decodeCache(c, try c.readWords(vc), half);
-
-    const want = try c.arena.alloc(f64, second * heads * hd);
-    const s = try c.arena.alloc(f64, total);
-    for (0..second) |t| for (0..heads) |h| {
-        const kvh = h / (heads / kv);
-        const keys = first + t + 1;
-        const q = qg[t * heads * 2 * hd + h * 2 * hd ..][0..hd];
-        var max: f64 = -std.math.inf(f64);
-        for (0..keys) |j| {
-            var dot: f64 = 0;
-            for (q, ck[j * width + kvh * hd ..][0..hd]) |a, b| dot += @as(f64, a) * b;
-            s[j] = dot * scale;
-            max = @max(max, s[j]);
-        }
-        var sum: f64 = 0;
-        for (s[0..keys]) |*e| {
-            e.* = @exp(e.* - max);
-            sum += e.*;
-        }
-        for (0..hd) |d| {
-            var o: f64 = 0;
-            for (0..keys) |j| o += s[j] * cv[j * width + kvh * hd + d];
-            want[(t * heads + h) * hd + d] = o / sum * sigmoid64(qg[t * heads * 2 * hd + h * 2 * hd + hd + d]);
-        }
-    };
-    return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = name, .err = relErr(got, try attnWant(c, qg, k, v, first, second)), .tolerance = 1e-5 };
 }
 
-/// Decode attention: a cache of 150 positions, then 3 query tokens attending
-/// through attn_split (three 64-position blocks, the last partial) and
-/// attn_combine, checked against the values the cache holds.
+fn checkAttentionF32(c: *Ctx) !Result {
+    return attentionCase(c, "attention (f32 cache)", false);
+}
+
+fn checkAttentionF16(c: *Ctx) !Result {
+    return attentionCase(c, "attention (f16 cache)", true);
+}
+
+/// Decode attention: 3 queries after 150 cached positions, through
+/// attn_split (three 64-position blocks, the last partial) and attn_combine.
 fn checkAttnDecode(c: *Ctx) !Result {
+    const S = AttnShape;
     const first = 150;
     const second = 3;
     const total = first + second;
-    const heads = 8;
-    const kv = 2;
-    const hd = 256;
-    const width = kv * hd;
-    const scale: f32 = 1.0 / 16.0;
-    const k = try c.random(total * width, 1);
-    const v = try c.random(total * width, 1);
-    const qg = try c.random(second * heads * 2 * hd, 1);
-    const kc = try c.output(total * width / 2);
-    const vc = try c.output(total * width / 2);
-    const out = try c.output(second * heads * hd);
+    const k = try c.random(total * S.width, 1);
+    const v = try c.random(total * S.width, 1);
+    const qg = try c.random(second * S.q_row, 1);
+    const out = try c.output(second * S.heads * S.hd);
     const max_blocks = 4;
-    const part = try c.output(second * heads * max_blocks * (hd + 2));
+    const part = try c.output(second * S.heads * max_blocks * (S.hd + 2));
     const l = c.launcher();
-    const append: P.KvAppend = .{ .width = width, .f16 = 1 };
-    try l.launch(.kv_append, append, &.{ try c.upload(k[0 .. first * width]), try c.upload(v[0 .. first * width]), kc, vc, try c.step(first, 0, 0) }, kernels.Launcher.elementwise(first * width / 2));
-    const step2 = try c.step(second, first, 0);
-    try l.launch(.kv_append, append, &.{ try c.upload(k[first * width ..]), try c.upload(v[first * width ..]), kc, vc, step2 }, kernels.Launcher.elementwise(second * width / 2));
-    const params: P.AttnDecode = .{ .heads = heads, .kv_heads = kv, .head_dim = hd, .f16 = 1, .scale = scale, .max_blocks = max_blocks };
+    const step = try c.step(second, first, 0);
+    const params: P.AttnDecode = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row };
     const qa = try c.upload(qg);
-    const grid: kernels.Grid = .{ .key_blocks = .{ .x = kv, .block = kernels.attn_block } };
-    try l.launch(.attn_split, params, &.{ qa, kc, vc, part, step2 }, grid.resolve(.{ .rows = second, .keys = total }));
-    try l.launch(.attn_combine, params, &.{ qa, part, out, step2 }, .{ heads, second, 1 });
+    const grid: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block } };
+    try l.launch(.attn_split, params, &.{ qa, try c.upload(try cacheWords(c, k, true)), try c.upload(try cacheWords(c, v, true)), part, step }, grid.resolve(.{ .rows = second, .keys = total }));
+    try l.launch(.attn_combine, params, &.{ qa, part, out, step }, .{ S.heads, second, 1 });
     const got = try c.read(out);
-    const ck = try decodeCache(c, try c.readWords(kc), true);
-    const cv = try decodeCache(c, try c.readWords(vc), true);
-
-    const want = try c.arena.alloc(f64, second * heads * hd);
-    const s = try c.arena.alloc(f64, total);
-    for (0..second) |t| for (0..heads) |h| {
-        const kvh = h / (heads / kv);
-        const keys = first + t + 1;
-        const q = qg[t * heads * 2 * hd + h * 2 * hd ..][0..hd];
-        var max: f64 = -std.math.inf(f64);
-        for (0..keys) |j| {
-            var dot: f64 = 0;
-            for (q, ck[j * width + kvh * hd ..][0..hd]) |a, b| dot += @as(f64, a) * b;
-            s[j] = dot * scale;
-            max = @max(max, s[j]);
-        }
-        var sum: f64 = 0;
-        for (s[0..keys]) |*e| {
-            e.* = @exp(e.* - max);
-            sum += e.*;
-        }
-        for (0..hd) |d| {
-            var o: f64 = 0;
-            for (0..keys) |j| o += s[j] * cv[j * width + kvh * hd + d];
-            want[(t * heads + h) * hd + d] = o / sum * sigmoid64(qg[t * heads * 2 * hd + h * 2 * hd + hd + d]);
-        }
-    };
-    return .{ .name = "attn_split + combine", .err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = "attn_split + combine", .err = relErr(got, try attnWant(c, qg, k, v, first, second)), .tolerance = 1e-5 };
 }
 
 /// Cache words as f32 values.
@@ -540,39 +568,6 @@ fn decodeCache(c: *Ctx, words: []const u32, half: bool) ![]f32 {
         values[2 * i + 1] = @as(f16, @bitCast(@as(u16, @truncate(w >> 16))));
     }
     return values;
-}
-
-fn checkAttentionF32(c: *Ctx) !Result {
-    return attentionCase(c, "attention (f32 cache)", false);
-}
-
-fn checkAttentionF16(c: *Ctx) !Result {
-    return attentionCase(c, "attention (f16 cache)", true);
-}
-
-/// kv_append's f16 rounding: within one f16 step (2^-10 relative) of the input.
-fn checkKvAppendF16(c: *Ctx) !Result {
-    const tokens = 5;
-    const pos0 = 3;
-    const width = 64;
-    const k = try c.random(tokens * width, 1);
-    const v = try c.random(tokens * width, 1);
-    const kc = try c.output((pos0 + tokens) * width / 2);
-    const vc = try c.output((pos0 + tokens) * width / 2);
-    try c.launcher().launch(.kv_append, P.KvAppend{ .width = width, .f16 = 1 }, &.{
-        try c.upload(k), try c.upload(v), kc, vc, try c.step(tokens, pos0, 0),
-    }, kernels.Launcher.elementwise(tokens * width / 2));
-    const ck = try decodeCache(c, try c.readWords(kc), true);
-    const cv = try decodeCache(c, try c.readWords(vc), true);
-    const got = try c.arena.alloc(f32, 2 * tokens * width);
-    @memcpy(got[0 .. tokens * width], ck[pos0 * width ..]);
-    @memcpy(got[tokens * width ..], cv[pos0 * width ..]);
-    const want = try c.arena.alloc(f64, 2 * tokens * width);
-    for (want[0 .. tokens * width], k) |*o, x| o.* = x;
-    for (want[tokens * width ..], v) |*o, x| o.* = x;
-    // Positions before pos0 stay untouched (zero).
-    for (ck[0 .. pos0 * width]) |x| if (x != 0) return .{ .name = "kv_append (f16)", .err = 1, .tolerance = 1e-3 };
-    return .{ .name = "kv_append (f16)", .err = relErr(got, want), .tolerance = 1e-3 };
 }
 
 fn checkConvSilu(c: *Ctx) !Result {

@@ -18,7 +18,7 @@ struct Params {
     f16: u32,
     scale: f32,
     max_blocks: u32,
-    _pad0: u32,
+    q_row: u32,
     _pad1: u32,
 }
 
@@ -73,7 +73,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     let keys = step.pos0 + t + 1u;
     let k0 = b * BLOCK;
     let kv_stride = p.kv_heads * hd;
-    let q_stride = 2u * p.heads * hd;
+    let q_stride = p.q_row;
 
     for (var i = lid; i < group * hd; i += WG) {
         let h = g * group + i / hd;

@@ -39,9 +39,8 @@ pub const Matrix = struct {
 };
 
 const Attention = struct {
-    wq: Matrix,
-    wk: Matrix,
-    wv: Matrix,
+    /// Q (with the output gates) | K | V, stacked by rows.
+    wqkv: Matrix,
     wo: Matrix,
     q_norm: Arg,
     k_norm: Arg,
@@ -102,9 +101,11 @@ pub const Model = struct {
                     .attention => blk: {
                         const hd: u64 = hp.head_dim;
                         break :blk .{ .attention = .{
-                            .wq = try u.matrix("blk.{d}.attn_q.weight", i, e, 2 * hd * hp.n_head),
-                            .wk = try u.matrix("blk.{d}.attn_k.weight", i, e, hd * hp.n_head_kv),
-                            .wv = try u.matrix("blk.{d}.attn_v.weight", i, e, hd * hp.n_head_kv),
+                            .wqkv = try u.stacked(i, e, &.{
+                                .{ "blk.{d}.attn_q.weight", 2 * hd * hp.n_head },
+                                .{ "blk.{d}.attn_k.weight", hd * hp.n_head_kv },
+                                .{ "blk.{d}.attn_v.weight", hd * hp.n_head_kv },
+                            }),
                             .wo = try u.matrix("blk.{d}.attn_output.weight", i, hd * hp.n_head, e),
                             .q_norm = try u.vector("blk.{d}.attn_q_norm.weight", i, hd),
                             .k_norm = try u.vector("blk.{d}.attn_k_norm.weight", i, hd),
@@ -177,9 +178,21 @@ const Upload = struct {
 
     /// A bf16 GGML {k, n} weight, split into chunks of whole rows.
     fn matrix(u: *Upload, comptime fmt: []const u8, layer: ?usize, k: u64, n: u64) !Matrix {
-        const ti = try u.info(fmt, layer, &.{ k, n }, .bf16);
-        const data = u.file.tensorBytes(u.bytes, ti);
+        return u.stacked(layer, k, &.{.{ fmt, n }});
+    }
+
+    /// bf16 GGML {k, n_i} weights sharing an input, stacked by rows into one
+    /// matrix (part i's rows follow part i − 1's) and split into chunks of
+    /// whole rows. Each part's bytes are written at their place in the
+    /// chunks.
+    fn stacked(u: *Upload, layer: ?usize, k: u64, parts: anytype) !Matrix {
         const row_bytes = k * 2;
+        var datas: [parts.len][]const u8 = undefined;
+        var n: u64 = 0;
+        inline for (parts, &datas) |part, *data| {
+            data.* = u.file.tensorBytes(u.bytes, try u.info(part[0], layer, &.{ k, part[1] }, .bf16));
+            n += part[1];
+        }
         const rows_per_chunk = @min(n, u.limits.max_binding / row_bytes);
         if (rows_per_chunk == 0) return error.TensorTooLarge;
         const count = std.math.divCeil(u64, n, rows_per_chunk) catch unreachable;
@@ -187,11 +200,21 @@ const Upload = struct {
         for (chunks, 0..) |*ch, i| {
             const row0 = i * rows_per_chunk;
             const rows = @min(rows_per_chunk, n - row0);
-            ch.* = .{
-                .arg = try u.buffer(data[@intCast(row0 * row_bytes)..][0..@intCast(rows * row_bytes)]),
-                .row0 = @intCast(row0),
-                .rows = @intCast(rows),
-            };
+            const size = rows * row_bytes;
+            const buf = try u.rec.createBuffer(u.gpa, size, .{ .storage = true, .copy_dst = true });
+            // Copy the parts' rows that fall in [row0, row0 + rows).
+            var part_row0: u64 = 0;
+            for (datas) |data| {
+                const part_rows = data.len / row_bytes;
+                const lo = @max(row0, part_row0);
+                const hi = @min(row0 + rows, part_row0 + part_rows);
+                if (lo < hi) {
+                    const src = data[@intCast((lo - part_row0) * row_bytes)..][0..@intCast((hi - lo) * row_bytes)];
+                    try u.rec.writeBuffer(u.gpa, buf, (lo - row0) * row_bytes, src);
+                }
+                part_row0 += part_rows;
+            }
+            ch.* = .{ .arg = .{ .buffer = buf, .size = size }, .row0 = @intCast(row0), .rows = @intCast(rows) };
         }
         return .{ .n = @intCast(n), .k = @intCast(k), .chunks = chunks };
     }
@@ -326,11 +349,11 @@ pub const Program = struct {
         const mix = try a.storage(cap * e);
         const gate = try a.storage(cap * hp.n_ff);
         const up = try a.storage(cap * hp.n_ff);
-        const qg = try a.storage(cap * 2 * hp.head_dim * hp.n_head);
-        const k = try a.storage(cap * kv_dim);
-        const v = try a.storage(cap * kv_dim);
+        // Q (with the gates) | K | V for each token, as one projection.
+        const qkv_row: u64 = 2 * @as(u64, hp.head_dim) * hp.n_head + 2 * kv_dim;
+        const qkv = try a.storage(cap * qkv_row);
         const att = try a.storage(cap * hp.head_dim * hp.n_head);
-        const qkv = try a.storage(cap * conv_dim);
+        const proj = try a.storage(cap * conv_dim);
         const conv = try a.storage(cap * conv_dim);
         const z = try a.storage(cap * hp.gdn_inner);
         const beta = try a.storage(cap * hp.gdn_v_heads);
@@ -388,30 +411,23 @@ pub const Program = struct {
                 .attention => |*w| {
                     const kc = try a.buffer(kv_layer, .{ .storage = true });
                     const vc = try a.buffer(kv_layer, .{ .storage = true });
-                    try matmul(&b, arena, &body, qg, h, &w.wq, capn);
-                    try matmul(&b, arena, &body, k, h, &w.wk, capn);
-                    try matmul(&b, arena, &body, v, h, &w.wv, capn);
+                    try matmul(&b, arena, &body, qkv, h, &w.wqkv, capn);
                     const hd = hp.head_dim;
-                    try body.append(arena, .{ .launch = try b.add(.qk_norm_rope, P.QkNormRope{
-                        .heads = hp.n_head,
-                        .head_dim = hd,
-                        .n_rot = hp.n_rot,
-                        .row_stride = 2 * hd * hp.n_head,
-                        .head_stride = 2 * hd,
-                        .eps = hp.rms_eps,
-                    }, &.{ qg, w.q_norm, rope, step }, .{ .rows_y = hp.n_head }) });
-                    try body.append(arena, .{ .launch = try b.add(.qk_norm_rope, P.QkNormRope{
-                        .heads = hp.n_head_kv,
-                        .head_dim = hd,
-                        .n_rot = hp.n_rot,
-                        .row_stride = hd * hp.n_head_kv,
-                        .head_stride = hd,
-                        .eps = hp.rms_eps,
-                    }, &.{ k, w.k_norm, rope, step }, .{ .rows_y = hp.n_head_kv }) });
                     const half: u32 = @backingInt(cfg.kv);
-                    try body.append(arena, .{ .launch = try b.add(.kv_append, P.KvAppend{ .width = @intCast(kv_dim), .f16 = half }, &.{ k, v, kc, vc, step }, .{ .elems = @intCast(kv_dim / 2) }) });
+                    const q_row: u32 = @intCast(qkv_row);
+                    try body.append(arena, .{ .launch = try b.add(.rope_append, P.RopeAppend{
+                        .heads = hp.n_head,
+                        .kv_heads = hp.n_head_kv,
+                        .head_dim = hd,
+                        .n_rot = hp.n_rot,
+                        .row = q_row,
+                        .k_off = 2 * hd * hp.n_head,
+                        .v_off = @intCast(2 * hd * hp.n_head + kv_dim),
+                        .f16 = half,
+                        .eps = hp.rms_eps,
+                    }, &.{ qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    const decode: P.AttnDecode = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hd, .f16 = half, .scale = scale, .max_blocks = max_blocks };
+                    const decode: P.AttnDecode = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hd, .f16 = half, .scale = scale, .max_blocks = max_blocks, .q_row = q_row };
                     try body.append(arena, .{ .attention = .{
                         .full = try b.add(.attention, P.Attention{
                             .heads = hp.n_head,
@@ -419,9 +435,10 @@ pub const Program = struct {
                             .head_dim = hd,
                             .f16 = half,
                             .scale = scale,
-                        }, &.{ qg, kc, vc, att, step }, .{ .rows_y = hp.n_head }),
-                        .split = try b.add(.attn_split, decode, &.{ qg, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block } }),
-                        .combine = try b.add(.attn_combine, decode, &.{ qg, attn_part, att, step }, .{ .rows_y = hp.n_head }),
+                            .q_row = q_row,
+                        }, &.{ qkv, kc, vc, att, step }, .{ .rows_y = hp.n_head }),
+                        .split = try b.add(.attn_split, decode, &.{ qkv, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block } }),
+                        .combine = try b.add(.attn_combine, decode, &.{ qkv, attn_part, att, step }, .{ .rows_y = hp.n_head }),
                     } });
                     try matmul(&b, arena, &body, mix, att, &w.wo, capn);
                 },
@@ -431,12 +448,12 @@ pub const Program = struct {
                     const state: Arg = .{ .buffer = recurrent.buffer, .offset = base, .size = state_bytes };
                     const hist: Arg = .{ .buffer = recurrent.buffer, .offset = base + std.mem.alignForward(u64, state_bytes, al), .size = hist_bytes };
                     const d = hp.gdn_head_dim;
-                    try matmul(&b, arena, &body, qkv, h, &w.wqkv, capn);
+                    try matmul(&b, arena, &body, proj, h, &w.wqkv, capn);
                     try matmul(&b, arena, &body, z, h, &w.wgate, capn);
                     try matmul(&b, arena, &body, beta, h, &w.wbeta, capn);
                     try matmul(&b, arena, &body, g, h, &w.walpha, capn);
                     try body.append(arena, .{ .launch = try b.add(.gates, P.Gates{ .count = capn * hp.gdn_v_heads, .heads = hp.gdn_v_heads }, &.{ beta, g, w.dt_bias, w.a }, .{ .elems = hp.gdn_v_heads }) });
-                    try body.append(arena, .{ .launch = try b.add(.conv_silu, P.ConvSilu{ .channels = @intCast(conv_dim), .taps = hp.conv_kernel }, &.{ qkv, w.conv, hist, conv, step }, .{ .fixed = kernels.Launcher.elementwise(conv_dim) }) });
+                    try body.append(arena, .{ .launch = try b.add(.conv_silu, P.ConvSilu{ .channels = @intCast(conv_dim), .taps = hp.conv_kernel }, &.{ proj, w.conv, hist, conv, step }, .{ .fixed = kernels.Launcher.elementwise(conv_dim) }) });
                     try body.append(arena, .{ .launch = try b.add(.l2norm_heads, P.L2NormHeads{ .heads = 2 * hp.gdn_k_heads, .dim = d, .row_stride = @intCast(conv_dim), .eps = hp.rms_eps }, &.{conv}, .{ .rows_y = 2 * hp.gdn_k_heads }) });
                     try body.append(arena, .{ .launch = try b.add(.delta_rule, P.DeltaRule{
                         .k_heads = hp.gdn_k_heads,

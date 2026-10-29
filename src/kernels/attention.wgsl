@@ -1,6 +1,6 @@
 // Causal grouped-query attention against the KV cache, with a sigmoid output
 // gate. The step's m query tokens sit at positions pos0 .. pos0 + m − 1 and
-// their keys and values are already in the cache (kv_append). One workgroup
+// their keys and values are already in the cache (rope_append). One workgroup
 // per (query head h, query token t), attending to cache positions 0 ..= pos0 + t:
 //
 //   s_j = q · k_j · scale
@@ -13,7 +13,7 @@
 // into steps.
 //
 // q and its gate come from the joint projection: head h of token t has q at
-// t·2·heads·head_dim + 2h·head_dim and the gate right after it. Cache rows hold
+// t·q_row + 2h·head_dim and the gate right after it. Cache rows hold
 // kv_heads heads of head_dim; query head h reads kv head h / (heads / kv_heads).
 // The cache stores f16 pairs (pack2x16float) when f16 != 0, else f32 bits.
 // head_dim ≤ WG and even.
@@ -24,7 +24,7 @@ struct Params {
     head_dim: u32,
     f16: u32,
     scale: f32,
-    _pad0: u32,
+    q_row: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -101,7 +101,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     let t = wg.y;
     let hd = p.head_dim;
     let kvh = h / (p.heads / p.kv_heads);
-    let q_base = t * (2u * p.heads * hd) + 2u * h * hd;
+    let q_base = t * p.q_row + 2u * h * hd;
     let kv_stride = p.kv_heads * hd;
     let keys = step.pos0 + t + 1u;
 

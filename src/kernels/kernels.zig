@@ -23,8 +23,7 @@ pub const Kernel = enum {
     silu_mul,
     add,
     embed_bf16,
-    qk_norm_rope,
-    kv_append,
+    rope_append,
     attention,
     attn_split,
     attn_combine,
@@ -109,23 +108,26 @@ pub const params = struct {
     };
     pub const Count = extern struct { count: u32, _pad: [3]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
-    pub const QkNormRope = extern struct {
+    pub const RopeAppend = extern struct {
         heads: u32,
+        kv_heads: u32,
         head_dim: u32,
         n_rot: u32,
-        row_stride: u32,
-        head_stride: u32,
+        row: u32,
+        k_off: u32,
+        v_off: u32,
+        f16: u32,
         eps: f32,
-        _pad: [2]u32 = @splat(0),
+        _pad: [3]u32 = @splat(0),
     };
-    pub const KvAppend = extern struct { width: u32, f16: u32, _pad: [2]u32 = @splat(0) };
     pub const Attention = extern struct {
         heads: u32,
         kv_heads: u32,
         head_dim: u32,
         f16: u32,
         scale: f32,
-        _pad: [3]u32 = @splat(0),
+        q_row: u32,
+        _pad: [2]u32 = @splat(0),
     };
     /// `attn_split` and `attn_combine`.
     pub const AttnDecode = extern struct {
@@ -135,7 +137,8 @@ pub const params = struct {
         f16: u32,
         scale: f32,
         max_blocks: u32,
-        _pad: [2]u32 = @splat(0),
+        q_row: u32,
+        _pad: u32 = 0,
     };
     pub const ConvSilu = extern struct { channels: u32, taps: u32, _pad: [2]u32 = @splat(0) };
     pub const L2NormHeads = extern struct { heads: u32, dim: u32, row_stride: u32, eps: f32 };
@@ -244,7 +247,7 @@ pub fn sampleStateWords(vocab: u32) u32 {
 }
 
 /// RoPE (cos, sin) for positions [0, positions) and the n_rot/2 rotation
-/// pairs, as `qk_norm_rope` reads it. Same formula as the CPU reference.
+/// pairs, as `rope_append` reads it. Same formula as the CPU reference.
 pub fn ropeTable(gpa: Allocator, positions: usize, n_rot: usize, base: f32) Allocator.Error![]f32 {
     const half = n_rot / 2;
     const table = try gpa.alloc(f32, positions * half * 2);
