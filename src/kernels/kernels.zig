@@ -22,6 +22,8 @@ pub const Kernel = enum {
     l2norm_heads,
     gates,
     delta_rule,
+    mark_tokens,
+    sample,
 
     pub fn source(k: Kernel) []const u8 {
         return switch (k) {
@@ -39,8 +41,13 @@ pub const matmul_tile_k = 32;
 pub const attention_max_tokens = 4096;
 /// Widest head `attention` and `delta_rule` handle.
 pub const max_head_dim = 256;
+/// Sampler limits: logit-bias entries and stop tokens per request.
+pub const max_bias = 1024;
+pub const max_stops = 16;
 
 pub const params = struct {
+    /// Per-step values, shared by every launch of a step.
+    pub const Step = extern struct { m: u32, pos0: u32, u: f32, _pad: u32 = 0 };
     pub const RmsNorm = extern struct { rows: u32, dim: u32, eps: f32, _pad: u32 = 0 };
     pub const MatmulBf16 = extern struct {
         rows: u32,
@@ -82,6 +89,22 @@ pub const params = struct {
         eps: f32,
         _pad: [2]u32 = @splat(0),
     };
+    /// Per-request sampler parameters (`sample` and `mark_tokens`).
+    pub const Sample = extern struct {
+        vocab: u32,
+        n_bias: u32,
+        n_stop: u32,
+        greedy: u32,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        min_p: f32,
+        repetition: f32,
+        presence: f32,
+        frequency: f32,
+        n_prompt: u32,
+        stops: [max_stops]u32,
+    };
 };
 
 /// RoPE (cos, sin) for positions [0, positions) and the n_rot/2 rotation
@@ -118,6 +141,14 @@ pub const Arg = struct {
     size: u64,
 };
 
+/// Group 0 for a kernel: `uniform` at binding 0, then `args` at 1, 2, ...
+fn bindGroup(gpa: Allocator, rec: *cmd.Recorder, pipeline: cmd.Pipeline, uniform: Arg, args: []const Arg) Allocator.Error!cmd.BindGroup {
+    var entries: [16]cmd.Binding = undefined;
+    entries[0] = .{ .binding = 0, .buffer = uniform.buffer, .offset = uniform.offset, .size = uniform.size };
+    for (args, 1..) |a, i| entries[i] = .{ .binding = @intCast(i), .buffer = a.buffer, .offset = a.offset, .size = a.size };
+    return rec.createBindGroup(gpa, pipeline, 0, entries[0 .. args.len + 1]);
+}
+
 /// Records kernel launches. Parameter blocks are copied into `arena`, which
 /// must outlive execution of the recorded batch.
 pub const Launcher = struct {
@@ -132,12 +163,13 @@ pub const Launcher = struct {
         const bytes = try l.arena.dupe(u8, std.mem.asBytes(&p));
         const ub = try l.rec.createBuffer(l.gpa, @sizeOf(P), .{ .uniform = true, .copy_dst = true });
         try l.rec.writeBuffer(l.gpa, ub, 0, bytes);
+        try l.launchWith(kernel, .{ .buffer = ub, .size = @sizeOf(P) }, args, groups);
+    }
 
-        var entries: [16]cmd.Binding = undefined;
-        entries[0] = .{ .binding = 0, .buffer = ub, .size = @sizeOf(P) };
-        for (args, 1..) |a, i| entries[i] = .{ .binding = @intCast(i), .buffer = a.buffer, .offset = a.offset, .size = a.size };
+    /// A launch whose binding 0 is the caller's `uniform`.
+    pub fn launchWith(l: Launcher, kernel: Kernel, uniform: Arg, args: []const Arg, groups: [3]u32) Allocator.Error!void {
         const pipeline = l.set.pipelines.get(kernel);
-        const bg = try l.rec.createBindGroup(l.gpa, pipeline, 0, entries[0 .. args.len + 1]);
+        const bg = try bindGroup(l.gpa, l.rec, pipeline, uniform, args);
         try l.rec.dispatch(l.gpa, pipeline, groups, &.{bg});
     }
 

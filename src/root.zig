@@ -8,6 +8,7 @@ pub const gpu = @import("gpu/gpu.zig");
 pub const kernels = @import("kernels/kernels.zig");
 pub const kernel_check = @import("kernels/check.zig");
 pub const plan = @import("plan/plan.zig");
+pub const sampler = @import("sampler/sampler.zig");
 
 test {
     const std = @import("std");

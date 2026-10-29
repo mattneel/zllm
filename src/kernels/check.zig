@@ -1,15 +1,24 @@
 //! GPU kernel checks: each kernel on seeded random inputs against a float64
-//! CPU computation of the same formula. Shapes are chosen to hit tile and
-//! chunk remainders. Run with `zllm gpu-check` on any Dawn host.
+//! CPU computation of the same formula (the sampler against its CPU
+//! reference). Shapes are chosen to hit tile and chunk remainders. Run with
+//! `zllm gpu-check` on any Dawn host.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
 const Host = @import("../gpu/host.zig").Host;
 const kernels = @import("kernels.zig");
+const sampler = @import("../sampler/sampler.zig");
 const P = kernels.params;
 
-pub const Result = struct { name: []const u8, max_rel_err: f64, tolerance: f64 };
+pub const Result = struct {
+    name: []const u8,
+    err: f64,
+    tolerance: f64,
+    /// Sampler checks: draws made, and how many picked the reference's token.
+    trials: u32 = 0,
+    exact: u32 = 0,
+};
 
 /// Runs every check, reporting one line per check to `out`. Returns whether
 /// all passed.
@@ -27,13 +36,20 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,    checkMatmul,    checkMatmulChunked, checkSiluMul, checkAdd,   checkEmbed,
-        checkQkNormRope, checkAttention, checkConvSilu,      checkL2Norm,  checkGates, checkDeltaRule,
+        checkRmsNorm,    checkMatmul,      checkMatmulChunked, checkSiluMul,        checkAdd,
+        checkEmbed,      checkQkNormRope,  checkAttention,     checkConvSilu,       checkL2Norm,
+        checkGates,      checkDeltaRule,   checkSampleGreedy,  checkSampleTopKTopP, checkSampleMinP,
+        checkSampleTopP, checkSamplePlain, checkSampleTopK1,   checkSampleVocab,
     }) |f| {
         const r = try f(&ctx);
-        const pass = r.max_rel_err <= r.tolerance;
+        const pass = r.err <= r.tolerance;
         ok = ok and pass;
-        try out.print("{s} {s:<24} max rel err {e:.2} (tolerance {e:.0})\n", .{ if (pass) "PASS" else "FAIL", r.name, r.max_rel_err, r.tolerance });
+        const verdict = if (pass) "PASS" else "FAIL";
+        if (r.trials > 0) {
+            try out.print("{s} {s:<24} max draw deviation {e:.2} (tolerance {e:.0}); {d}/{d} draws exact\n", .{ verdict, r.name, r.err, r.tolerance, r.exact, r.trials });
+        } else {
+            try out.print("{s} {s:<24} max rel err {e:.2} (tolerance {e:.0})\n", .{ verdict, r.name, r.err, r.tolerance });
+        }
         _ = arena_state.reset(.retain_capacity);
     }
     return ok;
@@ -94,15 +110,34 @@ const Ctx = struct {
 
     fn output(c: *Ctx, n: usize) !kernels.Arg {
         const size = n * 4;
-        const buf = try c.rec.createBuffer(c.gpa, size, .{ .storage = true, .copy_src = true });
+        const buf = try c.rec.createBuffer(c.gpa, size, .{ .storage = true, .copy_src = true, .copy_dst = true });
         return .{ .buffer = buf, .size = size };
+    }
+
+    fn uniform(c: *Ctx, value: anytype) !kernels.Arg {
+        const bytes = try c.arena.dupe(u8, std.mem.asBytes(&value));
+        const buf = try c.rec.createBuffer(c.gpa, bytes.len, .{ .uniform = true, .copy_dst = true });
+        try c.rec.writeBuffer(c.gpa, buf, 0, bytes);
+        return .{ .buffer = buf, .size = bytes.len };
+    }
+
+    fn step(c: *Ctx, m: u32, pos0: u32, u: f32) !kernels.Arg {
+        return c.uniform(P.Step{ .m = m, .pos0 = pos0, .u = u });
     }
 
     /// Reads `arg` back as f32 after running everything recorded so far.
     fn read(c: *Ctx, arg: kernels.Arg) ![]f32 {
-        const dst = try c.arena.alloc(f32, @intCast(arg.size / 4));
+        return std.mem.bytesAsSlice(f32, try c.readBytes(arg));
+    }
+
+    fn readWords(c: *Ctx, arg: kernels.Arg) ![]u32 {
+        return std.mem.bytesAsSlice(u32, try c.readBytes(arg));
+    }
+
+    fn readBytes(c: *Ctx, arg: kernels.Arg) ![]align(4) u8 {
+        const dst = try c.arena.alignedAlloc(u8, .@"4", @intCast(arg.size));
         c.token += 1;
-        try c.rec.readBuffer(c.gpa, c.token, arg.buffer, 0, std.mem.sliceAsBytes(dst));
+        try c.rec.readBuffer(c.gpa, c.token, arg.buffer, arg.offset, dst);
         try c.flush();
         return dst;
     }
@@ -137,7 +172,7 @@ fn checkRmsNorm(c: *Ctx) !Result {
         const scale = 1 / @sqrt(ss / dim + eps);
         for (0..dim) |i| want[r * dim + i] = x[r * dim + i] * scale * w[i];
     }
-    return .{ .name = "rmsnorm", .max_rel_err = relErr(got, want), .tolerance = 1e-6 };
+    return .{ .name = "rmsnorm", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32) !Result {
@@ -166,7 +201,7 @@ fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32)
         for (0..k) |i| s += @as(f64, x[t * k + i]) * w.values[j * k + i];
         want[t * n + j] = s;
     };
-    return .{ .name = name, .max_rel_err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 fn checkMatmul(c: *Ctx) !Result {
@@ -187,7 +222,7 @@ fn checkSiluMul(c: *Ctx) !Result {
     const got = try c.read(ga);
     const want = try c.arena.alloc(f64, n);
     for (want, gate, up) |*o, g, u| o.* = @as(f64, g) / (1 + @exp(-@as(f64, g))) * u;
-    return .{ .name = "silu_mul", .max_rel_err = relErr(got, want), .tolerance = 1e-6 };
+    return .{ .name = "silu_mul", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 fn checkAdd(c: *Ctx) !Result {
@@ -199,7 +234,7 @@ fn checkAdd(c: *Ctx) !Result {
     const got = try c.read(xa);
     const want = try c.arena.alloc(f64, n);
     for (want, x, y) |*o, a, b| o.* = @as(f32, a + b);
-    return .{ .name = "add", .max_rel_err = relErr(got, want), .tolerance = 0 };
+    return .{ .name = "add", .err = relErr(got, want), .tolerance = 0 };
 }
 
 fn checkEmbed(c: *Ctx) !Result {
@@ -220,7 +255,7 @@ fn checkEmbed(c: *Ctx) !Result {
     for (tokens, 0..) |tok, t| for (0..dim) |i| {
         want[t * dim + i] = table.values[tok * dim + i];
     };
-    return .{ .name = "embed_bf16 (2 chunks)", .max_rel_err = relErr(got, want), .tolerance = 0 };
+    return .{ .name = "embed_bf16 (2 chunks)", .err = relErr(got, want), .tolerance = 0 };
 }
 
 fn sigmoid64(x: f64) f64 {
@@ -271,7 +306,7 @@ fn checkQkNormRope(c: *Ctx) !Result {
         }
     };
     // The table is f32 from the reference formula, so angles carry f32 error.
-    return .{ .name = "qk_norm_rope", .max_rel_err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = "qk_norm_rope", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 fn checkAttention(c: *Ctx) !Result {
@@ -313,7 +348,7 @@ fn checkAttention(c: *Ctx) !Result {
             want[(t * heads + h) * hd + d] = o / sum * sigmoid64(qg[t * heads * 2 * hd + h * 2 * hd + hd + d]);
         }
     };
-    return .{ .name = "attention", .max_rel_err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = "attention", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 fn checkConvSilu(c: *Ctx) !Result {
@@ -337,7 +372,7 @@ fn checkConvSilu(c: *Ctx) !Result {
         }
         want[t * channels + ch] = sum * sigmoid64(sum);
     };
-    return .{ .name = "conv_silu", .max_rel_err = relErr(got, want), .tolerance = 1e-6 };
+    return .{ .name = "conv_silu", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 fn checkL2Norm(c: *Ctx) !Result {
@@ -361,7 +396,7 @@ fn checkL2Norm(c: *Ctx) !Result {
         for (head) |v| ss += v * v;
         for (head) |*v| v.* /= @sqrt(ss + eps);
     };
-    return .{ .name = "l2norm_heads", .max_rel_err = relErr(got, want), .tolerance = 1e-6 };
+    return .{ .name = "l2norm_heads", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 fn checkGates(c: *Ctx) !Result {
@@ -389,7 +424,7 @@ fn checkGates(c: *Ctx) !Result {
     }
     @memcpy(got[0..n], got_beta);
     @memcpy(got[n..], got_g);
-    return .{ .name = "gates", .max_rel_err = relErr(got, want), .tolerance = 1e-6 };
+    return .{ .name = "gates", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 fn checkDeltaRule(c: *Ctx) !Result {
@@ -461,5 +496,117 @@ fn checkDeltaRule(c: *Ctx) !Result {
             }
         }
     }
-    return .{ .name = "delta_rule", .max_rel_err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = "delta_rule", .err = relErr(got, want), .tolerance = 1e-5 };
+}
+
+/// Gaussian logits (σ = 2): every threshold (top-k, top-p, min-p) cuts
+/// through a dense band of tokens, so moving it changes the draws.
+fn sampleLogits(c: *Ctx, vocab: u32) ![]f32 {
+    const logits = try c.arena.alloc(f32, vocab);
+    for (logits) |*l| l.* = c.rand.floatNorm(f32) * 2;
+    return logits;
+}
+
+/// Runs the GPU sampler `trials` times at seeded draws. Each token must be
+/// the CPU reference's draw up to f32 rounding: `sampler.deviation`, the
+/// distance from the draw to the token's CDF interval with the min-p and
+/// top-p cuts allowed to move by the same relative amount, at most
+/// `draw_tolerance`. Also checks the stop flag, the next-step token and the
+/// count bump on every trial.
+fn sampleCase(c: *Ctx, name: []const u8, vocab: u32, p: sampler.Params, trials: u32) !Result {
+    const logits = try sampleLogits(c, vocab);
+    const prompt = try c.arena.alloc(bool, vocab);
+    const prompt_words = try c.arena.alloc(u32, vocab);
+    const counts = try c.arena.alloc(u32, vocab);
+    for (prompt, prompt_words, counts) |*in, *word, *n| {
+        in.* = c.rand.uintLessThan(u32, 20) == 0;
+        word.* = @intFromBool(in.*);
+        n.* = if (c.rand.uintLessThan(u32, 30) == 0) 1 + c.rand.uintLessThan(u32, 3) else 0;
+    }
+    var stops: [3]u32 = undefined;
+    for (&stops) |*s| s.* = c.rand.uintLessThan(u32, vocab);
+    // Make greedy and top-1 runs stop: the greedy token is a stop token.
+    stops[2] = try sampler.reference(c.arena, logits, .{ .temperature = 0, .repetition_penalty = p.repetition_penalty, .presence_penalty = p.presence_penalty, .frequency_penalty = p.frequency_penalty, .logit_bias = p.logit_bias }, .{ .prompt = prompt, .counts = counts }, 0);
+
+    var bias_words: [kernels.max_bias][2]u32 = undefined;
+    const biases = p.biasWords(&bias_words);
+    const params = try c.uniform(p.gpu(vocab, 0, &stops));
+    const la = try c.upload(logits);
+    const ba = try c.upload(if (biases.len > 0) biases else &[_][2]u32{.{ 0, 0 }});
+    const pa = try c.upload(prompt_words);
+    const ca = try c.output(vocab);
+    const work = try c.output(vocab);
+    const out = try c.output(4);
+    const next = try c.output(4);
+
+    var draws: sampler.Draws = .init(p.seed);
+    var worst: f64 = 0;
+    var exact: u32 = 0;
+    for (0..trials) |_| {
+        const u = draws.next();
+        try c.rec.writeBuffer(c.gpa, ca.buffer, 0, std.mem.sliceAsBytes(counts));
+        try c.launcher().launchWith(.sample, params, &.{ la, ba, pa, ca, work, out, next, try c.step(1, 0, u) }, .{ 1, 1, 1 });
+        const got = try c.readWords(out);
+        const got_next = try c.readWords(next);
+        const got_counts = try c.readWords(ca);
+        const want = try sampler.reference(c.arena, logits, p, .{ .prompt = prompt, .counts = counts }, u);
+        const token = got[0];
+        const stop = std.mem.indexOfScalar(u32, &stops, token) != null;
+        const consistent = token < vocab and got[1] == @intFromBool(stop) and got_next[0] == token and
+            got_counts[token] == counts[token] + 1;
+        if (!consistent) return .{ .name = name, .err = 1, .tolerance = draw_tolerance, .trials = trials };
+        if (token == want) exact += 1;
+        worst = @max(worst, try sampler.deviation(c.arena, logits, p, .{ .prompt = prompt, .counts = counts }, u, token, draw_tolerance));
+    }
+    return .{ .name = name, .err = worst, .tolerance = draw_tolerance, .trials = trials, .exact = exact };
+}
+
+/// f32 accumulation over the vocabulary moves CDF positions by a few 1e-8
+/// of the mass (4.4e-8 is the largest seen), enough to cross into a
+/// neighbouring token's interval, which average 3e-5 of the mass at 32k
+/// tokens.
+const draw_tolerance = 1e-6;
+
+const test_bias = [_]sampler.Bias{ .{ .token = 3, .bias = 9 }, .{ .token = 17, .bias = -50 }, .{ .token = 900, .bias = 4.5 } };
+
+fn checkSampleGreedy(c: *Ctx) !Result {
+    return sampleCase(c, "sample greedy+penalties", 32000, .{
+        .temperature = 0,
+        .repetition_penalty = 1.3,
+        .presence_penalty = 0.5,
+        .frequency_penalty = 0.2,
+        .logit_bias = &test_bias,
+    }, 4);
+}
+
+fn checkSampleTopKTopP(c: *Ctx) !Result {
+    return sampleCase(c, "sample k=40 p=0.9", 32000, .{ .temperature = 0.7, .top_k = 40, .top_p = 0.9, .seed = 1 }, 16);
+}
+
+fn checkSampleMinP(c: *Ctx) !Result {
+    return sampleCase(c, "sample min-p 0.05", 32000, .{ .min_p = 0.05, .seed = 2 }, 16);
+}
+
+fn checkSampleTopP(c: *Ctx) !Result {
+    return sampleCase(c, "sample top-p 0.5", 32000, .{ .temperature = 1.3, .top_p = 0.5, .seed = 3 }, 16);
+}
+
+fn checkSamplePlain(c: *Ctx) !Result {
+    return sampleCase(c, "sample T=1", 32000, .{ .seed = 4, .logit_bias = &test_bias, .repetition_penalty = 1.1 }, 16);
+}
+
+fn checkSampleTopK1(c: *Ctx) !Result {
+    return sampleCase(c, "sample top-k 1", 32000, .{ .top_k = 1, .seed = 5 }, 4);
+}
+
+fn checkSampleVocab(c: *Ctx) !Result {
+    return sampleCase(c, "sample Qwen vocab", 248320, .{
+        .temperature = 0.8,
+        .top_k = 20,
+        .top_p = 0.95,
+        .min_p = 0.01,
+        .repetition_penalty = 1.05,
+        .presence_penalty = 0.3,
+        .seed = 6,
+    }, 3);
 }
