@@ -40,16 +40,16 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,         checkMatmul,            checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair,  checkMatmulF16,         checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,         checkEmbed,             checkRopeAppendF32,  checkRopeAppendF16,     checkAttentionF32,
-        checkAttentionF16,    checkAttnDecode,        checkDeltaPrep,      checkDeltaRule,         checkSampleGreedy,
-        checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,     checkSamplePlain,       checkSampleTopK1,
-        checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec,    Quant(.q8_0).matmul,
-        Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,     Quant(.q4_k).matvec,
-        Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul,    Quant(.q5_k).embed,
-        Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantTiles,        checkQuantSiluPair,
-        checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,   checkQuantizeSilu,
+        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair, checkMatmulF16,       checkMatvecNormF16,     checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,        checkEmbed,           checkRopeAppendF32,     checkRopeAppendF16,     checkAttentionF32,
+        checkAttentionF16,   checkAttnDecode,      checkDeltaPrep,         checkDeltaKeep,         checkDeltaRule,
+        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,        checkSamplePlain,
+        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,       Quant(.q8_0).matvec,
+        Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,    Quant(.q3_k).embed,
+        Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,    Quant(.q5_k).matmul,
+        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,     checkQuantTiles,
+        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,      checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -923,7 +923,7 @@ fn checkDeltaPrep(c: *Ctx) !Result {
             .eps = eps,
         }, &.{ pa, wa, hist, conv, dta, aa, g, beta }, .{ channels / d + 1, m, 1 });
         try l.launch(.delta_rule, P.DeltaRule{ .k_heads = hk, .v_heads = hv, .dim = d, .conv_stride = channels, .taps = taps, .row = row }, &.{
-            conv, g, beta, state, try c.output(m * inner), step, pa, hist,
+            conv, g, beta, state, try c.output(m * inner), step, pa, hist, try c.output(1),
         }, .{ hv, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 });
         const cv = try c.read(conv);
         const gv = try c.read(g);
@@ -961,6 +961,71 @@ fn checkDeltaPrep(c: *Ctx) !Result {
         }
     }
     return .{ .name = "delta_prep (4 steps)", .err = relErr(got, want), .tolerance = 1e-5 };
+}
+
+/// delta_rule's kept state and conv history: a step of 4 tokens keeping
+/// row 1 must leave in `kept` exactly (bitwise) the state and history that a
+/// step of the first 2 of those tokens leaves, after the same first step of
+/// 5 tokens. The history (3 slots) then mixes slots from before the step with
+/// the step's own inputs.
+fn checkDeltaKeep(c: *Ctx) !Result {
+    const hk = 2;
+    const hv = 4;
+    const d = 128;
+    const taps = 4;
+    const key_dim = hk * d;
+    const channels = 2 * key_dim + hv * d;
+    const row = channels + 8;
+    const first = 5;
+    const tokens = first + 4;
+    const conv = try c.random(tokens * channels, 1);
+    for (0..tokens) |t| for (0..2 * hk) |h| {
+        const head = conv[t * channels + h * d ..][0..d];
+        var ss: f32 = 0;
+        for (head) |v| ss += v * v;
+        for (head) |*v| v.* /= @sqrt(ss);
+    };
+    const g = try c.random(tokens * hv, 1);
+    for (g) |*v| v.* = -@abs(v.*);
+    const beta = try c.random(tokens * hv, 1);
+    for (beta) |*v| v.* = @abs(v.*);
+    const proj = try c.random(tokens * row, 1);
+    const state_floats = hv * d * d;
+    const hist_floats = (taps - 1) * channels;
+    const grid: [3]u32 = .{ hv, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 };
+
+    // Runs the first step, then `m` tokens keeping `keep`; returns the state
+    // and history buffers and the kept buffer.
+    const Run = struct { state: kernels.Arg, hist: kernels.Arg, kept: kernels.Arg };
+    var runs: [2]Run = undefined;
+    for (&runs, [_]u32{ 4, 2 }, [_]u32{ 2, 0 }) |*r, m, keep| {
+        r.* = .{ .state = try c.output(state_floats), .hist = try c.output(hist_floats), .kept = try c.output(state_floats + hist_floats) };
+        var t0: u32 = 0;
+        for ([_]u32{ first, m }, [_]u32{ 0, keep }) |n, k| {
+            const l = c.launcher();
+            try l.launch(.delta_rule, P.DeltaRule{
+                .k_heads = hk,
+                .v_heads = hv,
+                .dim = d,
+                .conv_stride = channels,
+                .taps = taps,
+                .row = row,
+                .kept_hist = state_floats,
+            }, &.{
+                try c.upload(conv[t0 * channels ..][0 .. n * channels]), try c.upload(g[t0 * hv ..][0 .. n * hv]),
+                try c.upload(beta[t0 * hv ..][0 .. n * hv]),             r.state,
+                try c.output(n * hv * d),                                try c.uniform(P.Step{ .m = n, .pos0 = t0, .u = 0, .keep = k }),
+                try c.upload(proj[t0 * row ..][0 .. n * row]),           r.hist,
+                r.kept,
+            }, grid);
+            t0 += n;
+        }
+    }
+    const kept = try c.readWords(runs[0].kept);
+    const want_state = try c.readWords(runs[1].state);
+    const want_hist = try c.readWords(runs[1].hist);
+    const same = std.mem.eql(u32, kept[0..state_floats], want_state) and std.mem.eql(u32, kept[state_floats..], want_hist);
+    return .{ .name = "delta_rule kept row (bitwise)", .err = if (same) 0 else 1, .tolerance = 0 };
 }
 
 fn checkDeltaRule(c: *Ctx) !Result {
@@ -1013,6 +1078,7 @@ fn checkDeltaRule(c: *Ctx) !Result {
             try c.upload(beta[t0 * hv ..][0 .. m * hv]),         state,
             out,                                                 try c.step(m, t0, 0),
             za,                                                  hist,
+            try c.output(1),
         }, .{ hv, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 });
         try l.launch(.gated_norm, P.GatedNorm{ .v_heads = hv, .dim = d, .eps = eps, .z_row = z_row, .z_off = z_off }, &.{ out, za, wn }, .{ hv, m, 1 });
         @memcpy(got[t0 * inner ..][0 .. m * inner], try c.read(out));

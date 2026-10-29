@@ -418,6 +418,8 @@ pub const Program = struct {
     logits: Arg,
     /// Every DeltaNet layer's recurrent state and conv history, back to back.
     recurrent: Arg,
+    /// `recurrent` as after the kept row of the last step that kept one.
+    kept: Arg,
     checkpoints: []const cmd.Buffer,
     sample_params: Arg,
     bias: Arg,
@@ -499,6 +501,10 @@ pub const Program = struct {
         const recurrent = try a.buffer(@max(per_layer * n_delta, 4), .{ .storage = true, .copy_src = true, .copy_dst = true });
         const checkpoints = try arena.alloc(cmd.Buffer, cfg.checkpoints);
         for (checkpoints) |*cp| cp.* = (try a.buffer(recurrent.size, .{ .copy_src = true, .copy_dst = true })).buffer;
+        // The recurrent state as after a step's kept row (Step.keep), laid
+        // out as `recurrent`; without MTP no step keeps a row, and every
+        // layer binds the same unwritten stand-in.
+        const kept = try a.buffer(if (cfg.mtp) recurrent.size else 16, .{ .storage = true, .copy_src = true });
 
         const kv_bytes: u64 = if (cfg.kv == .f16) 2 else 4;
         const kv_layer = @as(u64, cfg.context) * kv_dim * kv_bytes;
@@ -556,7 +562,9 @@ pub const Program = struct {
                     const base = delta_i * per_layer;
                     delta_i += 1;
                     const state: Arg = .{ .buffer = recurrent.buffer, .offset = base, .size = state_bytes };
-                    const hist: Arg = .{ .buffer = recurrent.buffer, .offset = base + std.mem.alignForward(u64, state_bytes, al), .size = hist_bytes };
+                    const hist_at = std.mem.alignForward(u64, state_bytes, al);
+                    const hist: Arg = .{ .buffer = recurrent.buffer, .offset = base + hist_at, .size = hist_bytes };
+                    const kept_layer: Arg = if (cfg.mtp) .{ .buffer = kept.buffer, .offset = base, .size = hist_at + hist_bytes } else kept;
                     const d = hp.gdn_head_dim;
                     try body.append(arena, .{ .fork = .{
                         .prefill = try mm.tiled(proj, .{ .rmsnorm = .{ .x = x, .w = layer.attn_norm, .out = h } }, &w.wproj, false),
@@ -580,7 +588,8 @@ pub const Program = struct {
                         .conv_stride = @intCast(conv_dim),
                         .taps = hp.conv_kernel,
                         .row = @intCast(proj_row),
-                    }, &.{ conv, g, beta, state, o, step, proj, hist }, .{ .fixed = .{ hp.gdn_v_heads, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 } }) });
+                        .kept_hist = @intCast(hist_at / 4),
+                    }, &.{ conv, g, beta, state, o, step, proj, hist, kept_layer }, .{ .fixed = .{ hp.gdn_v_heads, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 } }) });
                     try body.append(arena, .{ .launch = try b.add(.gated_norm, P.GatedNorm{
                         .v_heads = hp.gdn_v_heads,
                         .dim = d,
@@ -672,6 +681,7 @@ pub const Program = struct {
             .lm_in = lm_in,
             .logits = logits,
             .recurrent = recurrent,
+            .kept = kept,
             .checkpoints = checkpoints,
             .sample_params = sample_params,
             .bias = bias,
@@ -701,6 +711,14 @@ pub const Program = struct {
 
     pub fn recordRestore(p: *const Program, gpa: Allocator, rec: *cmd.Recorder, slot: u32) Allocator.Error!void {
         try rec.copyBuffer(gpa, p.checkpoints[slot], 0, p.recurrent.buffer, 0, p.recurrent.size);
+    }
+
+    /// Rolls the DeltaNet state back to the kept row of the last step that
+    /// kept one (Step.keep): the positions after it are dropped. Attention
+    /// needs nothing: the next step overwrites their cache rows.
+    pub fn recordRollback(p: *const Program, gpa: Allocator, rec: *cmd.Recorder) Allocator.Error!void {
+        std.debug.assert(p.cfg.mtp);
+        try rec.copyBuffer(gpa, p.kept.buffer, 0, p.recurrent.buffer, 0, p.recurrent.size);
     }
 
     /// Sets up the sampler for a request: its parameters, the prompt's token
@@ -737,6 +755,9 @@ pub const Program = struct {
         path: ?Path = null,
         /// Leave every row's final hidden state in `h` for recordMtp.
         hidden: bool = false,
+        /// Keep the DeltaNet state as after this row, for recordRollback
+        /// (needs cfg.mtp).
+        keep: ?u32 = null,
     };
 
     /// Where a step's readbacks land, row-major [rows][dim]: `layer_out[i]`
@@ -756,7 +777,8 @@ pub const Program = struct {
         std.debug.assert(m > 0 and m <= p.cfg.max_tokens and s.pos0 + m <= p.cfg.context);
         std.debug.assert(s.logit_rows <= m and (s.draw == null or s.logit_rows == 1));
 
-        p.step_value = .{ .m = m, .pos0 = s.pos0, .u = s.draw orelse 0 };
+        std.debug.assert(s.keep == null or (p.cfg.mtp and s.keep.? < m));
+        p.step_value = .{ .m = m, .pos0 = s.pos0, .u = s.draw orelse 0, .keep = if (s.keep) |r| r + 1 else 0 };
         try rec.writeBuffer(gpa, p.step.buffer, 0, std.mem.asBytes(&p.step_value));
         if (s.tokens) |t| {
             @memcpy(p.token_stage[0..t.len], t);

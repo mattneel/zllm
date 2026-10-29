@@ -207,7 +207,9 @@ pub const sample_cap = 1024;
 
 pub const params = struct {
     /// Per-step values, shared by every launch of a step.
-    pub const Step = extern struct { m: u32, pos0: u32, u: f32, _pad: u32 = 0 };
+    /// `keep`: 0, or 1 + the row after which delta_rule saves the DeltaNet
+    /// state and conv history to its kept binding (for a rollback to it).
+    pub const Step = extern struct { m: u32, pos0: u32, u: f32, keep: u32 = 0 };
     pub const RmsNorm = extern struct { rows: u32, dim: u32, eps: f32, _pad: u32 = 0 };
     pub const MatmulBf16 = extern struct {
         rows: u32,
@@ -316,7 +318,10 @@ pub const params = struct {
         conv_stride: u32,
         taps: u32,
         row: u32,
-        _pad: [2]u32 = @splat(0),
+        /// Where the kept conv history starts in the kept binding, in floats
+        /// (the kept state starts at 0).
+        kept_hist: u32 = 0,
+        _pad: u32 = 0,
     };
     /// Which phase of `sample` a launch runs.
     pub const SamplePhase = extern struct { phase: u32, round: u32 = 0, _pad: [2]u32 = @splat(0) };

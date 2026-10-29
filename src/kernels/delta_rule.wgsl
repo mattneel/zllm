@@ -14,6 +14,10 @@
 // last K − 1 raw inputs (rows of the fused projection `proj`) of the
 // sequence including this step.
 //
+// With step.keep = r + 1, the state and the conv history as they stand after
+// row r also go to `kept` (the state at 0, the history at p.kept_hist): a
+// rejected speculative token after row r rolls back by copying them over.
+//
 // Column b of S depends only on column b, so a head's columns split across
 // workgroups: workgroup (j, c) owns columns [c·COLS, (c+1)·COLS), and thread
 // (row group r, column) keeps rows [r·dim/R, (r+1)·dim/R) of its column in
@@ -27,15 +31,15 @@ struct Params {
     conv_stride: u32,
     taps: u32,
     row: u32,
-    _pad0: u32,
-    _pad1: u32,
+    kept_hist: u32,
+    _pad: u32,
 }
 
 struct Step {
     m: u32,
     pos0: u32,
     u: f32,
-    _pad: u32,
+    keep: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -47,6 +51,7 @@ struct Step {
 @group(0) @binding(6) var<uniform> step: Step;
 @group(0) @binding(7) var<storage, read> proj: array<f32>;
 @group(0) @binding(8) var<storage, read_write> hist: array<f32>;
+@group(0) @binding(9) var<storage, read_write> kept: array<f32>;
 
 const WG: u32 = 256u;
 const COLS: u32 = 32u;
@@ -61,10 +66,23 @@ var<workgroup> delta: array<f32, COLS>;
 
 // hist[i] ← the input K − 1 − i positions before the step's end, for
 // every channel: one thread per channel, oldest slot first, so slots still
-// to be read are not yet overwritten.
+// to be read are not yet overwritten. The kept history (as after row
+// keep − 1) is taken first, from the history before any slot moves.
 fn advance_history(id: u32, threads: u32) {
     let back = p.taps - 1u;
     for (var c = id; c < p.conv_stride; c += threads) {
+        if (step.keep != 0u) {
+            for (var i = 0u; i < back; i++) {
+                let j = step.keep + i;
+                var v = 0.0;
+                if (j < back) {
+                    v = hist[j * p.conv_stride + c];
+                } else {
+                    v = proj[(j - back) * p.row + c];
+                }
+                kept[p.kept_hist + i * p.conv_stride + c] = v;
+            }
+        }
         for (var i = 0u; i < back; i++) {
             let j = step.m + i;
             if (j < back) {
@@ -138,6 +156,11 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
                 total += red[q * COLS + col];
             }
             out[t * p.v_heads * d + j * d + b] = total * scale;
+        }
+        if (t + 1u == step.keep && in_head) {
+            for (var i = 0u; i < rows; i++) {
+                kept[s0 + (a0 + i) * d + b] = s[i];
+            }
         }
         workgroupBarrier();
     }

@@ -101,7 +101,7 @@ unit decodes from one load (128 bytes per block).
 | `rope_append` | Q/K RMSNorm, partial NeoX RoPE at positions pos0 + t, and the K/V cache write | One workgroup per (head, token) of the stacked Q, K, V projection. Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π]. The cache holds f16 pairs (`pack2x16float`) or f32 |
 | `attn_split`, `attn_combine` | Causal GQA over the cache, with the sigmoid output gate (flash-decoding) | One workgroup per (KV head, 64 cache positions, token) scores the block for the whole GQA group and takes a local softmax; the combine merges the blocks. Prefill steps run them in chunks of 32 tokens, so the partials hold one chunk; a token's result depends only on its position. The 27B's prefill attention at position 5,000 dropped from 96 to 61 ms a step when this replaced a kernel with one workgroup per (head, query) |
 | `delta_prep` | DeltaNet front end: causal conv and SiLU, L2 norm of q and k, β and decay gates | One workgroup per (head of channels, token); inputs before the step come from the conv history |
-| `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups. Also advances the conv history |
+| `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups. Also advances the conv history, and can keep the state and history as after one row of the step (for rolling back a rejected speculative token) |
 | `gated_norm` | The SiLU(z)-gated RMSNorm after it | One workgroup per (head, token); z read from the stacked projection |
 | `matvec_<q>`, `matmul_<q>`, `embed_<q>` | The multiplies and embedding gather on quantized weights: `q8_0`, `q3_k`, `q4_k`, `q5_k`, `q6_k` | `matvec_quant.wgsl`, `matmul_quant.wgsl` and `embed_quant.wgsl`, composed at compile time with `quant/<q>.wgsl`. That file decodes a row's 32-weight units as ggml's `dequantize_row_*` does, value for value, 16 weights from 16-byte loads at a time. The decode multiply keeps `matvec_bf16`'s fusions, stages x in 2,048-float tiles, and splits each block among 4–8 lanes (`quant/<q>_dot.wgsl`), consecutive lanes on consecutive vectors. The prefill multiply takes x rounded to 8-bit blocks and sums each weight sub-block's products exactly in integers (`dot4I8Packed`), then scales them, as llama.cpp's `vec_dot` does: 32 tokens × 128 outputs per workgroup, 4 × 8 per thread, the next unit fetched and decoded while the current one computes |
 | `quantize_q8` | Rounds a quantized prefill multiply's input to 8-bit blocks, computing it first where it is an RMSNorm or the SiLU pair, so those kernels don't run | As llama.cpp's CPU backend does for the weight type: Q8_K blocks of 256 for the K-quants, Q8_0 blocks of 32 for Q8_0. Bitwise as the reference's `--llama-activations` mode |
@@ -122,13 +122,16 @@ execution plan asks:
 - **Buffers:** activations sized for the largest step (512 tokens), a KV
   cache per attention layer sized for the context, every DeltaNet layer's
   recurrent state and conv history in one buffer, checkpoint copies of that
-  buffer, and the sampler's buffers.
+  buffer, and the sampler's buffers. With MTP, also the MTP block's own KV
+  cache, and a second copy of the recurrent buffer that `delta_rule` fills
+  with the state as after a step's kept row (`Step.keep`): rolling back to
+  that row is one buffer copy.
 - **Launches:** every dispatch with its bind group and parameters, which are
   packed into shared 64 KiB uniform buffers.
 
 A step is then one `write_buffer` of a 16-byte `Step` uniform
-(`m` tokens, first position `pos0`, the sampler's draw `u`), the token ids
-for prefill, and a replay of the launch list:
+(`m` tokens, first position `pos0`, the sampler's draw `u`, the row to keep),
+the token ids for prefill, and a replay of the launch list:
 
 - **Step-dependent kernels:** kernels that mix tokens across the step or
   use positions (RoPE and the cache write, attention, the delta rule and the
