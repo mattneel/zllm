@@ -136,6 +136,8 @@ pub const Runtime = struct {
     completions: std.ArrayList(zllm.gpu.cmd.Completion) = .empty,
     /// <|im_end|> and the end-of-sequence token.
     stop_tokens: std.ArrayList(u32) = .empty,
+    /// "<device> (<backend>)".
+    adapter: []const u8 = "",
 
     pub fn create(gpa: Allocator, io: Io, host: *zllm.gpu.Host, file: zllm.gguf.File, bytes: []const u8, o: Options) !*Runtime {
         const rt = try gpa.create(Runtime);
@@ -153,6 +155,10 @@ pub const Runtime = struct {
         };
         const arena = rt.arena_state.allocator();
         const d = host.d;
+        var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
+        const info = d.info(&raw);
+        rt.adapter = try std.fmt.allocPrint(arena, "{s} ({s})", .{ info.device, info.backend });
+        d.freeInfo(raw);
         const limits: plan.Limits = .{
             .max_binding = d.limits.maxStorageBufferBindingSize,
             .offset_align = d.limits.minStorageBufferOffsetAlignment,
@@ -190,7 +196,7 @@ pub const Runtime = struct {
         gpa.destroy(rt);
     }
 
-    fn execute(rt: *Runtime, words: []const u32) !void {
+    pub fn execute(rt: *Runtime, words: []const u32) !void {
         rt.completions.clearRetainingCapacity();
         rt.host.execute(words, &rt.completions) catch |err| {
             if (err == error.GpuError or err == error.DeviceLost) std.log.err("{s}", .{rt.host.d.errorMessage()});

@@ -214,7 +214,7 @@ pub const Config = struct {
 
 /// One entry of the step body: a launch, or the end of a layer (where a
 /// check may read the residual stream back).
-const Item = union(enum) {
+pub const Item = union(enum) {
     launch: kernels.Launch,
     matmul: Matmul,
     attention: Attend,

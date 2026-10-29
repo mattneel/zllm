@@ -327,6 +327,7 @@ pub const Grid = union(enum) {
 /// A launch whose bind group (parameters and buffers) is built once; each
 /// step only dispatches it.
 pub const Launch = struct {
+    kernel: Kernel,
     pipeline: cmd.Pipeline,
     bind_group: cmd.BindGroup,
     grid: Grid,
@@ -375,7 +376,7 @@ pub const Builder = struct {
     /// A launch whose binding 0 is `uniform`, a buffer the caller rewrites.
     pub fn addWith(b: *Builder, kernel: Kernel, uniform: Arg, args: []const Arg, grid: Grid) Allocator.Error!Launch {
         const pipeline = b.set.pipelines.get(kernel);
-        return .{ .pipeline = pipeline, .bind_group = try bindGroup(b.gpa, b.rec, pipeline, uniform, args), .grid = grid };
+        return .{ .kernel = kernel, .pipeline = pipeline, .bind_group = try bindGroup(b.gpa, b.rec, pipeline, uniform, args), .grid = grid };
     }
 
     /// Records the upload of every parameter page.

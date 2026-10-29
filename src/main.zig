@@ -7,6 +7,7 @@ const Io = std.Io;
 const zllm = @import("zllm");
 const gen = @import("generate.zig");
 const engine_check = @import("engine_check.zig");
+const bench = @import("bench.zig");
 
 const usage =
     \\usage: zllm <command> [args]
@@ -24,6 +25,8 @@ const usage =
     \\                                       chat template
     \\  gpu-info                            open Dawn and print the adapter and limits as JSON
     \\  gpu-check                           check every GPU kernel against a CPU computation
+    \\  bench <model.gguf> [tokens]          time decode steps after a context of `tokens` (default
+    \\                                       1024), and each kernel's share of a step
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
@@ -72,10 +75,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "forward")) {
         if (args.len != 5) return fail(usage);
         try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4]);
-    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check")) {
+    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check") or std.mem.eql(u8, cmd, "bench")) {
         const is_chat = std.mem.eql(u8, cmd, "chat");
         const is_check = std.mem.eql(u8, cmd, "engine-check");
-        const fixed: usize = if (is_chat or is_check) 3 else 4;
+        const is_bench = std.mem.eql(u8, cmd, "bench");
+        const fixed: usize = if (is_chat or is_check or (is_bench and args.len == 3)) 3 else 4;
         if (args.len < fixed) return fail(usage);
         var opts = gen.Options.parse(arena, args[fixed..]) catch |err| switch (err) {
             error.InvalidUsage => return fail(usage),
@@ -93,11 +97,12 @@ pub fn main(init: std.process.Init) !void {
         const t0 = Io.Timestamp.now(io, .awake);
         const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
         defer rt.destroy();
-        var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
-        const info = d.info(&raw);
-        std.debug.print("[{s} ({s}); loaded in {d} ms; context {d}, {t} KV]\n", .{ info.device, info.backend, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
-        d.freeInfo(raw);
-        if (is_check) {
+        std.debug.print("[{s}; loaded in {d} ms; context {d}, {t} KV]\n", .{ rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
+        if (is_bench) {
+            const fill = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 1024;
+            if (fill == 0 or fill >= opts.context) return fail(usage);
+            try bench.run(rt, fill, out);
+        } else if (is_check) {
             if (!try engine_check.run(rt, out)) return error.EngineCheckFailed;
         } else if (is_chat) {
             var in_buf: [64 * 1024]u8 = undefined;
