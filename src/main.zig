@@ -12,6 +12,10 @@ const usage =
     \\  gguf-index <model.gguf>             print header, metadata and tensor index as JSON
     \\  tokenize <model.gguf> <texts.jsonl>  for each {"text": ...} line, print
     \\                                       {"ids": [...], "decoded": ...} as one JSON line
+    \\  forward <model.gguf> <tokens.i32> <out.bin>
+    \\                                       run the CPU f32 reference on little-endian int32
+    \\                                       token ids; write activation records (format in
+    \\                                       tools/llama-dump/dump.cpp)
     \\
 ;
 
@@ -46,6 +50,9 @@ pub fn main(init: std.process.Init) !void {
         const texts = try Io.Dir.cwd().readFileAlloc(io, args[3], gpa, .unlimited);
         defer gpa.free(texts);
         try tokenizeLines(gpa, &tok, texts, out);
+    } else if (std.mem.eql(u8, cmd, "forward")) {
+        if (args.len != 5) return fail(usage);
+        try forward(gpa, io, args[2], args[3], args[4]);
     } else {
         return fail(usage);
     }
@@ -79,6 +86,48 @@ fn tokenizeLines(gpa: std.mem.Allocator, tok: *const zllm.tokenizer.Tokenizer, t
         try out.writeByte('\n');
     }
 }
+
+fn forward(gpa: std.mem.Allocator, io: Io, model_path: []const u8, tokens_path: []const u8, out_path: []const u8) !void {
+    const mapped = try mapFile(io, model_path);
+    defer std.posix.munmap(mapped);
+    var file = try zllm.gguf.parse(gpa, mapped, true);
+    defer file.deinit(gpa);
+    var model = try zllm.ref.qwen35.Model.load(gpa, file, mapped);
+    defer model.deinit();
+
+    const raw = try Io.Dir.cwd().readFileAlloc(io, tokens_path, gpa, .unlimited);
+    defer gpa.free(raw);
+    if (raw.len == 0 or raw.len % 4 != 0) return error.BadTokenFile;
+    const tokens = try gpa.alloc(u32, raw.len / 4);
+    defer gpa.free(tokens);
+    for (tokens, 0..) |*t, i| t.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+
+    const out_file = try Io.Dir.cwd().createFile(io, out_path, .{});
+    defer out_file.close(io);
+    var buf: [1 << 16]u8 = undefined;
+    var fw: Io.File.Writer = .init(out_file, io, &buf);
+    var rec: RecordWriter = .{ .w = &fw.interface };
+
+    const threads = std.Thread.getCpuCount() catch 1;
+    try model.forward(gpa, tokens, threads, .{ .ctx = &rec, .emit = RecordWriter.emit });
+    try fw.interface.flush();
+}
+
+/// Activation records shared with tools/llama-dump: u32 name length, name,
+/// u32 n_dims (2), i64 ne[2] = {dim, n_tokens}, then f32 data.
+const RecordWriter = struct {
+    w: *Io.Writer,
+
+    fn emit(ctx: *anyopaque, name: []const u8, data: []const f32, dim: usize, n_tokens: usize) anyerror!void {
+        const self: *RecordWriter = @ptrCast(@alignCast(ctx));
+        try self.w.writeInt(u32, @intCast(name.len), .little);
+        try self.w.writeAll(name);
+        try self.w.writeInt(u32, 2, .little);
+        try self.w.writeInt(i64, @intCast(dim), .little);
+        try self.w.writeInt(i64, @intCast(n_tokens), .little);
+        try self.w.writeAll(std.mem.sliceAsBytes(data));
+    }
+};
 
 fn fail(msg: []const u8) error{InvalidUsage} {
     std.debug.print("{s}", .{msg});
