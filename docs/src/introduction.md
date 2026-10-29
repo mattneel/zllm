@@ -45,8 +45,8 @@ M6 is under way. Qwen 3.8 27B at Q3_K_M loads and runs: quantized kernels
 decode Q3_K to Q8_0 weights as ggml does. On the GPU it matches the CPU
 reference on every eval position, and the reference matches llama.cpp up to
 llama.cpp's own activation rounding ([Validation](validation.md#the-27b)).
-Decode runs at 26–27 tok/s, past the spec's bar of 20; prefill at 154
-tok/s, against a bar of 300 ([Generation](generation.md#the-27b)). In
+Decode runs at 26–27 tok/s, past the spec's bar of 20; prefill at about
+250 tok/s, against a bar of 300 ([Generation](generation.md#the-27b)). In
 Chrome it decodes at 27.3 tok/s and loads in 25.8 s over localhost
 ([Browser](browser.md#the-27b)).
 

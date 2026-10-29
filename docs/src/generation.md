@@ -76,9 +76,9 @@ budget:
   a whole one. So the per-token rate counts a step's tokens in whole tiles,
   and chunks are whole tiles. Where not even one tile fits the target, the
   chunk is one tile as long as its prediction stays under 90% of the
-  spec's 250 ms hard cap. The 27B's 32-token steps take about 190 ms: with
-  smaller chunks, each 8-token step cost as much and prefill ran at 25
-  tok/s.
+  spec's 250 ms hard cap. The 27B's 32-token steps take about 116 ms; with
+  8-token chunks, each step cost as much as a whole tile and prefill ran
+  at 25 tok/s.
 - **Checkpoint boundaries:** chunks also end at multiples of 512 and just
   before the prompt's last token. That token then runs as its own step, which
   measures the fixed cost and produces the logits to sample.
@@ -252,7 +252,7 @@ Qwen 3.8 27B at Q3_K_M (13.75 GB) on the same GPU, `zllm generate`, greedy:
 
 | Phase | First run | Now | Spec bar |
 |---|---|---|---|
-| Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 154 tok/s, in 31 steps | 300 tok/s |
+| Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 247–250 tok/s, in 31 steps | 300 tok/s |
 | Decode | 6 tok/s | 26–27 tok/s | 20 tok/s |
 
 The quantized kernels made the difference ([GPU backend](gpu.md#kernels)).
@@ -269,8 +269,23 @@ A decode step reads about 12.2 GB of weights, 13.7 ms at this GPU's
 bandwidth. The Q3_K multiplies, 6.6 GB, take about 19 ms: 11 ms of loads,
 4 ms of decoding and 3.5 ms reading x from workgroup memory.
 
-Prefill is bound by f32 multiply-adds. A 32-token step does 1.7 TFLOP of
-them; at 26 TFLOP/s that takes 66 ms, and decoding the weights and staging
-the tiles about as long again. 300 tok/s within the budget would take
-integer dot products (`dot4I8Packed`) over activations rounded to 8 bits,
-as llama.cpp does, which changes the numerics.
+Prefill steps of the 27B are 32 tokens, about 116 ms each:
+
+| Prefill multiply | tok/s, end to end |
+|---|---|
+| f32, register tiles, split over k; tile-sized chunks | 154 |
+| Input rounded to 8 bits, integer dot products (`dot4I8Packed`) | 227 |
+| The next unit fetched while the current one computes | 247–250 |
+
+In f32 the multiply-adds alone took about 66 ms of a step. Rounding the
+input to 8-bit blocks, as llama.cpp's CPU backend does, makes each weight
+sub-block's dot product exact in integers, at four products per
+instruction. The GPU is then checked against the reference that rounds
+the same way ([Validation](validation.md#the-27b)). Decode keeps f32
+inputs: it is bound by reading weights, not by arithmetic.
+
+The multiply now takes about 98 ms of a step. It issues about three
+instructions per four products: the integer dot product, a separate add
+(WGSL's `dot4I8Packed` has no accumulator operand) and the sub-block
+scaling. That is near this GPU's issue rate. Rounding the input costs 7 ms
+more, and the rest of the step about 36 ms.

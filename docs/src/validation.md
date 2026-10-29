@@ -229,11 +229,16 @@ up to it:
   norm prologue and accumulate epilogue, the prefill multiply accumulating
   (70 tokens × 150 outputs, whole and split over k through
   `matmul_reduce`), and the embedding gather against float64 over those
-  decoders. Weights go through `repad` as the loader's do. Further checks
-  run x over two staged tiles (k = 4,096) and the SiLU pair on Q3_K, the
-  27B's gate and up type. All 17 pass on llvmpipe and the RTX 5090:
-  embeddings exactly, decode multiplies within 2.3e-7, prefill multiplies
-  within 1.4e-6.
+  decoders. Weights go through `repad` as the loader's do. The prefill
+  multiply's input is rounded by `quantize_q8`, and the float64 sum runs
+  over the reference's rounding of it. Further checks run x over two
+  staged tiles (k = 4,096) and the SiLU pair on Q3_K, the 27B's gate and
+  up type, and `quantize_q8` against the reference's rounding, value for
+  value, in both block formats. The rows include a negative largest
+  value, a tie between +max and −max, and a zero block. All 19 pass on
+  llvmpipe and the RTX 5090: embeddings and rounding exactly, multiplies
+  within 5.6e-7. The rounding needed exact division: WGSL's may be off by
+  2.5 ULP, and on D3D12 that moved values across rounding boundaries.
 - **The model:** `check-quant`, below.
 
 The CPU reference cannot hold the 27B in f32 (108 GB). Quantized matrices
@@ -248,13 +253,12 @@ reference, through the reference with llama.cpp's activation rounding
 emulated, through pinned llama.cpp, and through the GPU on both kernel
 paths.
 
-**GPU against the reference.** Both use the same decoded weights and f32
-activations:
+**GPU against the reference, decode kernels.** Both use the same decoded
+weights and f32 activations:
 
 | Kernel path | Top-1 | First layer, max rel L2 | Everything, max rel L2 |
 |---|---|---|---|
-| Prefill (8-token steps) | 818/818 | 2.9e-6 | 4.5e-4 |
-| Decode (1-token steps, first 40 positions) | 200/200 | 2.8e-6 | 2.1e-5 |
+| Decode (1-token steps, first 40 positions) | 200/200 | 2.9e-6 | 2.1e-5 |
 
 The bounds are 1e-5 for the first layer (exact up to f32 summation order)
 and 1e-3 everywhere, with cosine ≥ 0.99999. The second bound is looser than
@@ -262,6 +266,25 @@ the 0.8B's 1e-4 because the 27B amplifies small differences. At position 61
 of the math sequence, the GPU–reference gap is 2e-7 through layer 15 like
 every other position, then grows smoothly to 4.3e-4 by layer 63. A kernel
 bug would instead show a step at the layer that uses the kernel.
+
+**GPU against the reference, prefill kernels.** The quantized prefill
+multiplies round their input to 8-bit blocks as llama.cpp does, so they
+are compared with the reference that rounds the same way
+(`--llama-activations`, below), by the bounds used for llama.cpp itself.
+Rounding is discontinuous: the GPU's activations differ from the
+reference's by f32 summation order, about 1e-7, and a value that close to a
+rounding boundary rounds the other way, which moves a multiply's output by
+about 5e-4. So a per-position bound can't hold, and the bounds take
+medians over positions:
+
+| 32-token steps, 818 positions | GPU | llama.cpp | Bound |
+|---|---|---|---|
+| First layer against the rounded reference, worst median rel L2 | 1.4e-5 | 3.4e-5 | 1e-4 |
+| Gap to the f32 reference over its own gap to the rounded one, worst layer | 1.09 | 1.08 | 1.5 |
+| Top-1 against the rounded reference (reported) | 801/818 | | |
+
+Each kernel on that path, the rounding included, is checked exactly by
+`gpu-check`.
 
 **Reference against llama.cpp.** llama.cpp rounds each quantized
 multiply's input to 8-bit blocks (Q8_K for the K-quants, Q8_0 for Q8_0);
