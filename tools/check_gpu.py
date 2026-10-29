@@ -11,13 +11,17 @@ Pass criteria (docs/src/validation.md):
     transcendental-function rounding. Top-1 agreement 100%; every layer
     output, the final hidden state and the logits: cosine >= 0.999999 and
     relative L2 error <= 1e-4 at every position.
-  * 7-token steps, and 1-token steps (as decoding runs) over the first 40
-    tokens: bitwise identical to the 512-token run. Every row's arithmetic is
-    independent of how the sequence is split into steps.
+  * The prefill kernels in 7-token steps: bitwise identical to the 512-token
+    run. Every row's arithmetic is independent of how a sequence is split.
+  * The decode kernels (matrix-vector multiplies, split attention) in
+    1-token steps, as decoding runs, over the first DECODE_TOKENS positions:
+    the same bounds and top-1 agreement as the 512-token run; and in 3-token
+    steps, bitwise identical to the 1-token run.
   * f16 KV cache (the default): top-1 agreement >= F16_TOP1_MIN, and cosine
     >= F16_COSINE_MIN at every position.
   * `zllm engine-check`: requests that reuse the resident sequence or a
-    checkpoint give logits bitwise identical to fresh runs.
+    checkpoint give the logits of fresh runs (bitwise where both runs use the
+    same kernels for each position).
 
 Hosts: `native` runs the Linux build on the Vulkan adapter Dawn finds
 (llvmpipe in CI); `d3d12` runs the Windows build through scripts/d3d12.sh.
@@ -46,7 +50,8 @@ REL_L2_MAX = 1e-4
 F16_TOP1_MIN = 0.99
 F16_COSINE_MIN = 0.99998
 # (tokens per step, token limit) for the runs that must match bitwise.
-SPLITS = [(7, None), (1, 40)]
+# Positions checked through the decode kernels (one step per token).
+DECODE_TOKENS = 40
 
 
 def win(path: Path) -> str:
@@ -81,8 +86,32 @@ def main() -> int:
     evals = [json.loads(line) for line in EVAL.read_text(encoding="utf-8").split("\n") if line]
 
     fail = Failures()
-    total = agree = agree16 = 0
-    worst_cos, worst_rel, worst_cos16 = 1.0, 0.0, 1.0
+    total = agree = agree16 = decode_total = decode_agree = 0
+    worst = {"prefill": [1.0, 0.0], "decode": [1.0, 0.0]}
+    worst_cos16 = 1.0
+
+    def compare(label: str, path: str, gpu: dict, ref: dict, rows: int) -> int:
+        """Bounds against the reference for the first `rows` positions; returns top-1 agreement."""
+        print(f"  {'tensor':<14} {'min cos':>10} {'max rel L2':>11}   [{path} kernels]")
+        names = sorted((n for n in ref if n.startswith("l_out-")), key=lambda n: int(n.split("-")[1]))
+        for name in [*names, "result_norm", "result_output"]:
+            if name not in gpu:
+                continue
+            cos, rel, _ = row_stats(gpu[name], ref[name][:rows])
+            print(f"  {name:<14} {cos.min():>10.7f} {rel.max():>11.2e}")
+            worst[path][0] = min(worst[path][0], float(cos.min()))
+            worst[path][1] = max(worst[path][1], float(rel.max()))
+            for p in np.flatnonzero(cos < COSINE_MIN):
+                fail.expect(f"{label}: {name} cosine at {p}", False, f"{cos[p]:.7f} < {COSINE_MIN}")
+            for p in np.flatnonzero(rel > REL_L2_MAX):
+                fail.expect(f"{label}: {name} rel L2 at {p}", False, f"{rel[p]:.2e} > {REL_L2_MAX}")
+        top = int((gpu["result_output"].argmax(axis=1) == ref["result_output"][:rows].argmax(axis=1)).sum())
+        print(f"  top-1 agreement {top}/{rows}")
+        return top
+
+    def bitwise(a: dict, b: dict, rows: int) -> bool:
+        return all(np.array_equal(a[n].view(np.uint32), b[n][:rows].view(np.uint32)) for n in b)
+
     with tempfile.TemporaryDirectory() as tmp:
         for ev in evals:
             ids = hf.encode(ev["text"]).ids
@@ -90,54 +119,45 @@ def main() -> int:
             tok.write_bytes(np.asarray(ids, dtype="<i4").tobytes())
             ref_path, gpu_path = Path(tmp) / "ref.bin", Path(tmp) / "gpu.bin"
             subprocess.run([args.zllm, "forward", str(paths.gguf), str(tok), str(ref_path)], check=True)
-            timing = run_gpu(args, paths, paths.gguf, tok, gpu_path, "--chunk", "512", "--kv", "f32")
-
+            timing = run_gpu(args, paths, paths.gguf, tok, gpu_path, "--chunk", "512", "--kv", "f32", "--path", "prefill")
             ref, gpu = read_records(ref_path), read_records(gpu_path)
             fail.expect_eq(f"{ev['name']}: tensor names", sorted(gpu), sorted(ref))
             print(f"\n{ev['name']}: {len(ids)} tokens  [{timing}]")
-            print(f"  {'tensor':<14} {'min cos':>10} {'max rel L2':>11}")
-            names = sorted((n for n in ref if n.startswith("l_out-")), key=lambda n: int(n.split("-")[1]))
-            for name in [*names, "result_norm", "result_output"]:
-                if name not in gpu:
-                    continue
-                cos, rel, _ = row_stats(gpu[name], ref[name])
-                print(f"  {name:<14} {cos.min():>10.7f} {rel.max():>11.2e}")
-                worst_cos = min(worst_cos, float(cos.min()))
-                worst_rel = max(worst_rel, float(rel.max()))
-                for p in np.flatnonzero(cos < COSINE_MIN):
-                    fail.expect(f"{ev['name']}: {name} cosine at {p}", False, f"{cos[p]:.7f} < {COSINE_MIN}")
-                for p in np.flatnonzero(rel > REL_L2_MAX):
-                    fail.expect(f"{ev['name']}: {name} rel L2 at {p}", False, f"{rel[p]:.2e} > {REL_L2_MAX}")
-            ref_top = ref["result_output"].argmax(axis=1)
-            top = int((gpu["result_output"].argmax(axis=1) == ref_top).sum())
-            agree += top
+            agree += compare(ev["name"], "prefill", gpu, ref, len(ids))
             total += len(ids)
-            print(f"  top-1 agreement {top}/{len(ids)}")
 
-            for chunk, limit in SPLITS:
-                part = tok
-                if limit is not None:
-                    part = Path(tmp) / "part.i32"
-                    part.write_bytes(np.asarray(ids[:limit], dtype="<i4").tobytes())
-                split_path = Path(tmp) / "split.bin"
-                timing = run_gpu(args, paths, paths.gguf, part, split_path, "--chunk", str(chunk), "--kv", "f32")
-                split = read_records(split_path)
-                rows = len(ids) if limit is None else limit
-                same = all(np.array_equal(split[n].view(np.uint32), gpu[n][:rows].view(np.uint32)) for n in gpu)
-                print(f"  steps of {chunk}, {rows} tokens: {'bitwise identical' if same else 'DIFFERENT'}  [{timing}]")
-                fail.expect(f"{ev['name']}: steps of {chunk} bitwise", same, "outputs differ from 512-token steps")
+            split_path = Path(tmp) / "split.bin"
+            timing = run_gpu(args, paths, paths.gguf, tok, split_path, "--chunk", "7", "--kv", "f32", "--path", "prefill")
+            same = bitwise(read_records(split_path), gpu, len(ids))
+            print(f"  prefill kernels, steps of 7: {'bitwise identical' if same else 'DIFFERENT'}  [{timing}]")
+            fail.expect(f"{ev['name']}: prefill steps of 7 bitwise", same, "outputs differ from 512-token steps")
+
+            part = Path(tmp) / "part.i32"
+            part.write_bytes(np.asarray(ids[:DECODE_TOKENS], dtype="<i4").tobytes())
+            one_path, three_path = Path(tmp) / "one.bin", Path(tmp) / "three.bin"
+            timing = run_gpu(args, paths, paths.gguf, part, one_path, "--chunk", "1", "--kv", "f32", "--path", "decode")
+            one = read_records(one_path)
+            print(f"  decode kernels, steps of 1, first {DECODE_TOKENS} tokens  [{timing}]")
+            decode_agree += compare(f"{ev['name']} (decode)", "decode", one, ref, DECODE_TOKENS)
+            decode_total += DECODE_TOKENS
+            timing = run_gpu(args, paths, paths.gguf, part, three_path, "--chunk", "3", "--kv", "f32", "--path", "decode")
+            same = bitwise(read_records(three_path), one, DECODE_TOKENS)
+            print(f"  decode kernels, steps of 3: {'bitwise identical' if same else 'DIFFERENT'}  [{timing}]")
+            fail.expect(f"{ev['name']}: decode steps of 3 bitwise", same, "outputs differ from 1-token steps")
 
             f16_path = Path(tmp) / "f16.bin"
-            timing = run_gpu(args, paths, paths.gguf, tok, f16_path, "--chunk", "512", "--kv", "f16")
+            timing = run_gpu(args, paths, paths.gguf, tok, f16_path, "--chunk", "512", "--kv", "f16", "--path", "prefill")
             f16 = read_records(f16_path)
             cos16 = min(float(row_stats(f16[n], ref[n])[0].min()) for n in ref)
-            top16 = int((f16["result_output"].argmax(axis=1) == ref_top).sum())
+            top16 = int((f16["result_output"].argmax(axis=1) == ref["result_output"].argmax(axis=1)).sum())
             agree16 += top16
             worst_cos16 = min(worst_cos16, cos16)
             print(f"  f16 KV: top-1 agreement {top16}/{len(ids)}, min cosine {cos16:.7f}  [{timing}]")
             fail.expect(f"{ev['name']}: f16 KV cosine", cos16 >= F16_COSINE_MIN, f"{cos16:.7f} < {F16_COSINE_MIN}")
 
-    print(f"\n{args.host}, f32 KV: top-1 agreement {agree}/{total}; min cosine {worst_cos:.7f} (min {COSINE_MIN}); max rel L2 {worst_rel:.2e} (max {REL_L2_MAX})")
+    for path, n, a in (("prefill", total, agree), ("decode", decode_total, decode_agree)):
+        print(f"\n{args.host}, f32 KV, {path} kernels: top-1 agreement {a}/{n}; min cosine {worst[path][0]:.7f} (min {COSINE_MIN}); max rel L2 {worst[path][1]:.2e} (max {REL_L2_MAX})", end="")
+    print()
     print(f"{args.host}, f16 KV: top-1 agreement {agree16}/{total} (min {F16_TOP1_MIN:.0%}); min cosine {worst_cos16:.7f} (min {F16_COSINE_MIN})")
     proc = zllm_on_host(args, paths, "engine-check", paths.gguf)
     print(f"\n{args.host}, engine-check:")
@@ -146,6 +166,7 @@ def main() -> int:
         sys.stderr.write(proc.stderr)
     fail.expect("engine-check", proc.returncode == 0, f"exit code {proc.returncode}")
     fail.expect("top-1 agreement", agree == total, f"{agree}/{total}")
+    fail.expect("decode top-1 agreement", decode_agree == decode_total, f"{decode_agree}/{decode_total}")
     fail.expect("f16 KV top-1 agreement", agree16 >= F16_TOP1_MIN * total, f"{agree16}/{total}")
     return fail.report()
 

@@ -216,7 +216,32 @@ pub const Config = struct {
 /// check may read the residual stream back).
 const Item = union(enum) {
     launch: kernels.Launch,
+    matmul: Matmul,
     layer_end: u32,
+};
+
+/// Which kernels a step runs: the tiled prefill kernels, or the decode
+/// kernels (matrix-vector multiplies) for steps of at most
+/// `kernels.decode_max_rows` tokens. Each is bitwise independent of how a
+/// sequence is split into steps, but the two round differently.
+pub const Path = enum {
+    prefill,
+    decode,
+
+    pub fn of(rows: u32) Path {
+        return if (rows <= kernels.decode_max_rows) .decode else .prefill;
+    }
+};
+
+/// One weight chunk's multiply, prebuilt both ways: tiled for prefill,
+/// matrix-vector for decode.
+pub const Matmul = struct {
+    tiled: kernels.Launch,
+    vector: kernels.Launch,
+
+    pub fn pick(mm: Matmul, path: Path) kernels.Launch {
+        return if (path == .decode) mm.vector else mm.tiled;
+    }
 };
 
 /// Everything a step needs, built once: activation buffers sized for
@@ -248,7 +273,7 @@ pub const Program = struct {
     sample_state: Arg,
 
     body: []const Item,
-    head: []const kernels.Launch,
+    head: []const Matmul,
     mark: kernels.Launch,
     /// One launch per sampler phase and round.
     sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch),
@@ -408,8 +433,8 @@ pub const Program = struct {
 
         var head: std.ArrayList(Item) = .empty;
         try matmul(&b, arena, &head, logits, lm_in, if (m.output) |*out| out else &m.tok_embd, cfg.logit_rows);
-        const head_launches = try arena.alloc(kernels.Launch, head.items.len);
-        for (head.items, head_launches) |item, *l| l.* = item.launch;
+        const head_launches = try arena.alloc(Matmul, head.items.len);
+        for (head.items, head_launches) |item, *l| l.* = item.matmul;
 
         const mark = try b.addWith(.mark_tokens, sample_params, &.{ prompt_ids, prompt_mask }, .{ .elems = 1 });
         var sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch) = undefined;
@@ -499,6 +524,9 @@ pub const Program = struct {
         sampled: ?*[2]u32 = null,
         /// Activation readbacks for checks.
         readback: ?Readback = null,
+        /// The kernels to use; by default the decode kernels for steps of at
+        /// most `kernels.decode_max_rows` tokens, else the prefill kernels.
+        path: ?Path = null,
     };
 
     /// Where a step's readbacks land, row-major [rows][dim]: `layer_out[i]`
@@ -512,6 +540,8 @@ pub const Program = struct {
 
     pub fn recordStep(p: *Program, gpa: Allocator, rec: *cmd.Recorder, s: Step) Allocator.Error!void {
         const m: u32 = if (s.tokens) |t| @intCast(t.len) else 1;
+        const path = s.path orelse Path.of(m);
+        std.debug.assert(path == .prefill or m <= kernels.decode_max_rows);
         const e: u64 = p.hp.n_embd;
         std.debug.assert(m > 0 and m <= p.cfg.max_tokens and s.pos0 + m <= p.cfg.context);
         std.debug.assert(s.logit_rows <= m and (s.draw == null or s.logit_rows == 1));
@@ -525,6 +555,7 @@ pub const Program = struct {
 
         for (p.body) |item| switch (item) {
             .launch => |l| try l.record(gpa, rec, m),
+            .matmul => |mm| try mm.pick(path).record(gpa, rec, m),
             .layer_end => |il| if (s.readback) |r| if (r.layer_out.len > 0) {
                 try rec.readBuffer(gpa, read_token, p.x.buffer, 0, std.mem.sliceAsBytes(r.layer_out[il][0 .. m * e]));
             },
@@ -537,7 +568,7 @@ pub const Program = struct {
         while (r0 < m) {
             const n = @min(p.cfg.logit_rows, m - r0);
             try rec.copyBuffer(gpa, p.h.buffer, r0 * e * 4, p.lm_in.buffer, 0, n * e * 4);
-            for (p.head) |l| try l.record(gpa, rec, n);
+            for (p.head) |mm| try mm.pick(if (path == .decode and n <= kernels.decode_max_rows) .decode else .prefill).record(gpa, rec, n);
             if (s.readback) |r| if (r.logits) |dst| {
                 const at = (r0 - (m - s.logit_rows)) * vocab;
                 try rec.readBuffer(gpa, read_token, p.logits.buffer, 0, std.mem.sliceAsBytes(dst[at..][0 .. n * vocab]));
@@ -577,10 +608,13 @@ const Alloc = struct {
 fn matmul(b: *kernels.Builder, arena: Allocator, list: *std.ArrayList(Item), out: Arg, x: Arg, w: *const Matrix, cap: u32) Allocator.Error!void {
     std.debug.assert(w.k % kernels.matmul_tile_k == 0);
     for (w.chunks) |ch| {
-        const l = try b.add(.matmul_bf16, P.MatmulBf16{ .rows = cap, .n = ch.rows, .k = w.k, .col0 = ch.row0, .out_stride = w.n }, &.{ x, ch.arg, out }, .{ .tiles_y = .{
+        const tiled = try b.add(.matmul_bf16, P.MatmulBf16{ .rows = cap, .n = ch.rows, .k = w.k, .col0 = ch.row0, .out_stride = w.n }, &.{ x, ch.arg, out }, .{ .tiles_y = .{
             .x = std.math.divCeil(u32, ch.rows, kernels.matmul_tile_n) catch unreachable,
             .tile = kernels.matmul_tile_t,
         } });
-        try list.append(arena, .{ .launch = l });
+        const vector = try b.add(.matvec_bf16, P.MatvecBf16{ .n = ch.rows, .k = w.k, .col0 = ch.row0, .out_stride = w.n }, &.{ x, ch.arg, out }, .{
+            .rows_y = std.math.divCeil(u32, ch.rows, kernels.matvec_rows) catch unreachable,
+        });
+        try list.append(arena, .{ .matmul = .{ .tiled = tiled, .vector = vector } });
     }
 }

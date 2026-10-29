@@ -37,11 +37,11 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,         checkMatmul,            checkMatmulChunked, checkSiluMul,      checkAdd,
-        checkEmbed,           checkQkNormRope,        checkKvAppendF16,   checkAttentionF32, checkAttentionF16,
-        checkConvSilu,        checkL2Norm,            checkGates,         checkDeltaRule,    checkSampleGreedy,
-        checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,    checkSamplePlain,  checkSampleTopK1,
-        checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
+        checkRmsNorm,      checkMatmul,          checkMatmulChunked,     checkMatvec,      checkSiluMul,
+        checkAdd,          checkEmbed,           checkQkNormRope,        checkKvAppendF16, checkAttentionF32,
+        checkAttentionF16, checkConvSilu,        checkL2Norm,            checkGates,       checkDeltaRule,
+        checkSampleGreedy, checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,  checkSamplePlain,
+        checkSampleTopK1,  checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -213,6 +213,35 @@ fn checkMatmul(c: *Ctx) !Result {
 
 fn checkMatmulChunked(c: *Ctx) !Result {
     return matmulCase(c, "matmul_bf16 (2 chunks)", 33, 150, 96, 70);
+}
+
+fn checkMatvec(c: *Ctx) !Result {
+    // 3 tokens, 100 outputs (a partial workgroup of rows), split into two
+    // chunks; k = 1000 leaves a partial pass over the 32 lanes.
+    const rows = 3;
+    const n = 100;
+    const k = 1000;
+    const split = 37;
+    const x = try c.random(rows * k, 1);
+    const w = try c.randomBf16(n * k, 1);
+    const out = try c.output(rows * n);
+    const xa = try c.upload(x);
+    var col0: u32 = 0;
+    for ([_]u32{ split, n - split }) |cols| {
+        const wa = try c.upload(w.words[col0 * k / 2 ..][0 .. cols * k / 2]);
+        try c.launcher().launch(.matvec_bf16, P.MatvecBf16{ .n = cols, .k = k, .col0 = col0, .out_stride = n }, &.{ xa, wa, out }, .{
+            std.math.divCeil(u32, cols, kernels.matvec_rows) catch unreachable, rows, 1,
+        });
+        col0 += cols;
+    }
+    const got = try c.read(out);
+    const want = try c.arena.alloc(f64, rows * n);
+    for (0..rows) |t| for (0..n) |j| {
+        var s: f64 = 0;
+        for (0..k) |i| s += @as(f64, x[t * k + i]) * w.values[j * k + i];
+        want[t * n + j] = s;
+    };
+    return .{ .name = "matvec_bf16 (2 chunks)", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 fn checkSiluMul(c: *Ctx) !Result {

@@ -25,10 +25,11 @@ const usage =
     \\  gpu-info                            open Dawn and print the adapter and limits as JSON
     \\  gpu-check                           check every GPU kernel against a CPU computation
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
-    \\                                       logits bitwise identical to a fresh run
+    \\                                       the logits of a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
-    \\                                       as `forward`, on the GPU through Dawn, in
-    \\                                       steps of N tokens (default 512; f32 KV)
+    \\              [--path prefill|decode]   as `forward`, on the GPU through Dawn, in
+    \\                                       steps of N tokens (default 512; f32 KV;
+    \\                                       the decode kernels for steps of up to 4)
     \\
 ++ gen.usage ++
     \\environment:
@@ -288,6 +289,8 @@ const ForwardOptions = struct {
     /// Tokens per step; 1 runs the sequence the way decoding does.
     chunk: u32 = 512,
     kv: zllm.plan.qwen35.KvFormat = .f32,
+    /// Force the prefill or decode kernels (decode: steps of at most 4).
+    path: ?zllm.plan.qwen35.Path = null,
 
     fn parse(args: []const []const u8) !ForwardOptions {
         var o: ForwardOptions = .{};
@@ -299,8 +302,11 @@ const ForwardOptions = struct {
                 if (o.chunk == 0) return fail(usage);
             } else if (std.mem.eql(u8, args[i], "--kv")) {
                 o.kv = std.meta.stringToEnum(zllm.plan.qwen35.KvFormat, args[i + 1]) orelse return fail(usage);
+            } else if (std.mem.eql(u8, args[i], "--path")) {
+                o.path = std.meta.stringToEnum(zllm.plan.qwen35.Path, args[i + 1]) orelse return fail(usage);
             } else return fail(usage);
         }
+        if (o.path == .decode and o.chunk > zllm.kernels.decode_max_rows) return fail(usage);
         return o;
     }
 };
@@ -367,6 +373,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
             .pos0 = pos0,
             .tokens = tokens[pos0..][0..m],
             .logit_rows = m,
+            .path = opts.path,
             .readback = .{
                 .layer_out = step_layers,
                 .result_norm = result_norm[pos0 * e ..][0 .. m * e],

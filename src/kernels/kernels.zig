@@ -19,6 +19,7 @@ const ops = @import("../ref/ops.zig");
 pub const Kernel = enum {
     rmsnorm,
     matmul_bf16,
+    matvec_bf16,
     silu_mul,
     add,
     embed_bf16,
@@ -44,6 +45,11 @@ pub const Kernel = enum {
 pub const matmul_tile_n = 64;
 pub const matmul_tile_t = 16;
 pub const matmul_tile_k = 32;
+/// Steps of at most this many tokens (decoding) use the decode kernels:
+/// `matvec_bf16`.
+pub const decode_max_rows = 4;
+/// Rows per `matvec_bf16` workgroup.
+pub const matvec_rows = 8;
 /// Widest head `attention` and `delta_rule` handle.
 pub const max_head_dim = 256;
 /// State columns per `delta_rule` workgroup.
@@ -70,6 +76,7 @@ pub const params = struct {
         out_stride: u32,
         _pad: [3]u32 = @splat(0),
     };
+    pub const MatvecBf16 = extern struct { n: u32, k: u32, col0: u32, out_stride: u32 };
     pub const Count = extern struct { count: u32, _pad: [3]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
     pub const QkNormRope = extern struct {

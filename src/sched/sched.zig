@@ -35,6 +35,12 @@ const Stream = @import("../tokenizer/stream.zig").Stream;
 pub const budget_ns = 150 * std.time.ns_per_ms;
 /// Prefill chunk once the fixed cost is known but the per-token cost is not.
 pub const first_chunk = 64;
+/// Prefill chunks end at multiples of this (or at the prompt's last two
+/// positions). Steps of a few tokens run the decode kernels, which round
+/// differently from the prefill kernels, so aligned boundaries make the
+/// kernels each prompt position goes through depend on the prompt alone,
+/// not on step timings.
+pub const chunk_align = 64;
 
 pub const Request = struct {
     prompt: []const u32,
@@ -263,8 +269,15 @@ pub const Engine = struct {
         m = @min(m, e.program.cfg.max_tokens, left);
         const boundary = (pos / state.checkpoint_interval + 1) * state.checkpoint_interval;
         m = @min(m, boundary - pos);
-        const before_last: u32 = @intCast(e.req.prompt.len - 1);
-        return if (pos < before_last) @min(m, before_last - pos) else m;
+        const len: u32 = @intCast(e.req.prompt.len);
+        const before_last = len - 1;
+        var end = pos + m;
+        if (pos < before_last) end = @min(end, before_last);
+        if (end != before_last and end != len) {
+            const aligned = end / chunk_align * chunk_align;
+            end = if (aligned > pos) aligned else @min((pos / chunk_align + 1) * chunk_align, before_last);
+        }
+        return end - pos;
     }
 
     fn recordPrefill(e: *Engine) Error!void {
