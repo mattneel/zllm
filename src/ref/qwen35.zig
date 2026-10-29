@@ -1,9 +1,10 @@
 //! CPU f32 reference forward pass for the Qwen 3.5 hybrid model.
 //!
 //! Teacher-forced: one call processes a whole token sequence from an empty
-//! state and reports activations for every position. All weights are
-//! dequantized to f32 at load, with matrices repacked for `matmul`; every
-//! operation accumulates in f32.
+//! state and reports activations for every position. Weights are decoded to
+//! f32 (f32, f16 and bf16 matrices repacked for `matmul` at load, quantized
+//! ones panel by panel as they are used); every operation accumulates in
+//! f32.
 //! See docs/src/qwen35.md for the tensor semantics this code assumes.
 
 const std = @import("std");
@@ -155,7 +156,7 @@ pub const Model = struct {
     /// Runs `tokens` from an empty state. Reports `l_out-<i>` after each
     /// layer, then `result_norm` and `result_output` (logits), matching the
     /// llama.cpp tensor names.
-    pub fn forward(m: *const Model, gpa: Allocator, tokens: []const u32, pool: *Pool, obs: Observer) !void {
+    pub fn forward(m: *const Model, gpa: Allocator, tokens: []const u32, pool: *Pool, obs: Observer, act: mm.Activations) !void {
         const hp = m.hp;
         const n = tokens.len;
         const e: usize = hp.n_embd;
@@ -183,13 +184,13 @@ pub const Model = struct {
             _ = scratch_arena.reset(.retain_capacity);
             normRows(h, x, layer.attn_norm, hp.rms_eps);
             switch (layer.mixer) {
-                .attention => |*att| try attention(scratch, hp, att, h, mix, n, pool),
-                .delta_net => |*dn| try deltaNet(scratch, hp, dn, h, mix, n, pool),
+                .attention => |*att| try attention(scratch, hp, att, h, mix, n, pool, act),
+                .delta_net => |*dn| try deltaNet(scratch, hp, dn, h, mix, n, pool, act),
             }
             for (x, mix) |*a, b| a.* += b;
 
             normRows(h, x, layer.post_norm, hp.rms_eps);
-            try ffn(scratch, hp, layer, h, mix, n, pool);
+            try ffn(scratch, hp, layer, h, mix, n, pool, act);
             for (x, mix) |*a, b| a.* += b;
 
             const name = std.fmt.bufPrint(&name_buf, "l_out-{d}", .{il}) catch unreachable;
@@ -202,7 +203,7 @@ pub const Model = struct {
         const vocab: usize = hp.vocab;
         const logits = try gpa.alloc(f32, n * vocab);
         defer gpa.free(logits);
-        mm.matmul(pool, logits, h, if (m.output) |*o| o else &m.tok_embd, n);
+        mm.matmul(pool, logits, h, if (m.output) |*o| o else &m.tok_embd, n, act);
         try obs.emit(obs.ctx, "result_output", logits, vocab, n);
     }
 };
@@ -246,12 +247,12 @@ fn normRows(out: []f32, in: []const f32, weight: []const f32, eps: f32) void {
     while (t * d < out.len) : (t += 1) ops.rmsNorm(out[t * d ..][0..d], weight, eps);
 }
 
-fn ffn(gpa: Allocator, hp: Hparams, layer: *const Layer, h: []const f32, out: []f32, n: usize, pool: *Pool) !void {
+fn ffn(gpa: Allocator, hp: Hparams, layer: *const Layer, h: []const f32, out: []f32, n: usize, pool: *Pool, act: mm.Activations) !void {
     const ff: usize = hp.n_ff;
     const gate = try gpa.alloc(f32, n * ff);
     const up = try gpa.alloc(f32, n * ff);
-    mm.matmul(pool, gate, h, &layer.ffn_gate, n);
-    mm.matmul(pool, up, h, &layer.ffn_up, n);
+    mm.matmul(pool, gate, h, &layer.ffn_gate, n, act);
+    mm.matmul(pool, up, h, &layer.ffn_up, n, act);
     const Act = struct {
         gate: []f32,
         up: []const f32,
@@ -263,12 +264,12 @@ fn ffn(gpa: Allocator, hp: Hparams, layer: *const Layer, h: []const f32, out: []
         }
     };
     pool.parallelFor(n, 1, 1, &Act{ .gate = gate, .up = up, .ff = ff }, Act.run);
-    mm.matmul(pool, out, gate, &layer.ffn_down, n);
+    mm.matmul(pool, out, gate, &layer.ffn_down, n, act);
 }
 
 /// Gated full attention: joint Q+gate projection, per-head Q/K RMSNorm,
 /// partial NeoX RoPE, causal GQA softmax attention, sigmoid output gate.
-fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, out: []f32, n: usize, pool: *Pool) !void {
+fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, out: []f32, n: usize, pool: *Pool, act: mm.Activations) !void {
     const hd: usize = hp.head_dim;
     const n_head: usize = hp.n_head;
     const n_kv: usize = hp.n_head_kv;
@@ -277,9 +278,9 @@ fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, o
     const k = try gpa.alloc(f32, n * hd * n_kv);
     const v = try gpa.alloc(f32, n * hd * n_kv);
     const attn = try gpa.alloc(f32, n * hd * n_head);
-    mm.matmul(pool, qg, h, &w.wq, n);
-    mm.matmul(pool, k, h, &w.wk, n);
-    mm.matmul(pool, v, h, &w.wv, n);
+    mm.matmul(pool, qg, h, &w.wq, n, act);
+    mm.matmul(pool, k, h, &w.wk, n, act);
+    mm.matmul(pool, v, h, &w.wv, n, act);
 
     const Ctx = struct {
         hp: Hparams,
@@ -351,13 +352,13 @@ fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, o
     const ctx: Ctx = .{ .hp = hp, .w = w, .qg = qg, .k = k, .v = v, .attn = attn, .n = n };
     pool.parallelFor(n, 1, 1, &ctx, Ctx.normRope);
     pool.parallelFor(n_head * n, 1, 1, &ctx, Ctx.attend);
-    mm.matmul(pool, out, attn, &w.wo, n);
+    mm.matmul(pool, out, attn, &w.wo, n, act);
 }
 
 /// Gated DeltaNet: causal depthwise conv + SiLU over the fused q/k/v
 /// projection, L2-normalized q and k, the gated delta rule recurrence, then
 /// per-head RMSNorm gated by SiLU(z).
-fn deltaNet(gpa: Allocator, hp: Hparams, w: *const DeltaNet, h: []const f32, out: []f32, n: usize, pool: *Pool) !void {
+fn deltaNet(gpa: Allocator, hp: Hparams, w: *const DeltaNet, h: []const f32, out: []f32, n: usize, pool: *Pool, act: mm.Activations) !void {
     const d: usize = hp.gdn_head_dim;
     const hv: usize = hp.gdn_v_heads;
     const inner: usize = hp.gdn_inner;
@@ -367,10 +368,10 @@ fn deltaNet(gpa: Allocator, hp: Hparams, w: *const DeltaNet, h: []const f32, out
     const z = try gpa.alloc(f32, n * inner);
     const beta = try gpa.alloc(f32, n * hv);
     const g = try gpa.alloc(f32, n * hv);
-    mm.matmul(pool, qkv, h, &w.wqkv, n);
-    mm.matmul(pool, z, h, &w.wgate, n);
-    mm.matmul(pool, beta, h, &w.wbeta, n);
-    mm.matmul(pool, g, h, &w.walpha, n);
+    mm.matmul(pool, qkv, h, &w.wqkv, n, act);
+    mm.matmul(pool, z, h, &w.wgate, n, act);
+    mm.matmul(pool, beta, h, &w.wbeta, n, act);
+    mm.matmul(pool, g, h, &w.walpha, n, act);
     for (beta) |*b| b.* = ops.sigmoid(b.*);
     for (0..n) |t| for (0..hv) |j| {
         const gi = &g[t * hv + j];
@@ -494,5 +495,5 @@ fn deltaNet(gpa: Allocator, hp: Hparams, w: *const DeltaNet, h: []const f32, out
     };
     pool.parallelFor(n, 1, 1, &ctx, Ctx.convNorm);
     pool.parallelFor(hv, 1, 1, &ctx, Ctx.recur);
-    mm.matmul(pool, out, o_all, &w.wout, n);
+    mm.matmul(pool, out, o_all, &w.wout, n, act);
 }
