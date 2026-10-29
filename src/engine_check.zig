@@ -11,6 +11,13 @@
 //! Two scenarios cancel a request first, in decode and in prefill. The
 //! cancelled request must finish with `abort`, and the next prompt must
 //! reuse exactly the tokens its completed steps processed.
+//!
+//! One runs a request pipelined, as the browser does: each batch executes
+//! at once but completes only when the engine asks (`.wait`), so every
+//! decode step is recorded before the previous token is known. Stopped by a
+//! stop token, it must sample the same tokens with bitwise identical logits
+//! as an unpipelined run, keep the stop token resident (the step after it
+//! processed it), and the next prompt must reuse exactly that.
 
 const std = @import("std");
 const Io = std.Io;
@@ -45,6 +52,49 @@ const Check = struct {
         return .{ .tokens = try c.arena.dupe(u32, ids.items), .logits = logits, .cached = t.usage.cached_tokens };
     }
 
+    /// Runs `prompt` with batches completed only on `.wait`, stopping at
+    /// `stop`. Returns the sampled tokens and logits, and the resident
+    /// sequence length.
+    fn pipelined(c: *Check, prompt: []const u32, stop: u32) !struct { run: Run, finish: zllm.sched.Finish, resident: u32 } {
+        const e = &c.rt.engine;
+        const vocab = c.rt.program.hp.vocab;
+        const logits = try c.arena.alloc(f32, n_gen * vocab);
+        var ids: std.ArrayList(u32) = .empty;
+        try e.start(.{
+            .prompt = prompt,
+            .max_tokens = n_gen,
+            .sampling = .{ .temperature = 1.0, .top_k = 50, .seed = 7 },
+            .stop_tokens = &.{stop},
+            .logits = logits,
+        });
+        // GPU times of executed batches not yet completed, oldest first.
+        var times: [zllm.sched.max_in_flight]u64 = undefined;
+        var outstanding: usize = 0;
+        var most: usize = 0;
+        const d = while (true) switch (try e.next()) {
+            .submit => |words| {
+                const t0 = Io.Timestamp.now(c.rt.io, .awake);
+                try c.rt.execute(words);
+                times[outstanding] = @intCast(t0.durationTo(Io.Timestamp.now(c.rt.io, .awake)).toNanoseconds());
+                outstanding += 1;
+                most = @max(most, outstanding);
+            },
+            .wait => {
+                try e.complete(times[0]);
+                std.mem.copyForwards(u64, times[0 .. outstanding - 1], times[1..outstanding]);
+                outstanding -= 1;
+            },
+            .token => |t| try ids.append(c.arena, t.id),
+            .done => |d| break d,
+        };
+        if (most != zllm.sched.max_in_flight) return error.NotPipelined;
+        return .{
+            .run = .{ .tokens = ids.items, .logits = logits, .cached = d.usage.cached_tokens },
+            .finish = d.finish,
+            .resident = @intCast(e.resident().len),
+        };
+    }
+
     /// Runs `prompt` and cancels it after `tokens` sampled tokens, or with
     /// null after its first prefill step. Returns the sampled tokens and
     /// the resident sequence length, or null (reported) if the request did
@@ -66,6 +116,7 @@ const Check = struct {
                 try ids.append(c.arena, t.id);
                 if (tokens) |n| if (ids.items.len == n) e.cancel();
             },
+            .wait => unreachable,
             .done => |d| break d,
         };
         const want: u32 = tokens orelse 0;
@@ -159,6 +210,28 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
     _ = try c.scenario("same prompt again", diverged, @intCast(diverged.len - 1), true);
     _ = try c.run(other);
     _ = try c.scenario("unrelated prompt after another", p1, 0, true);
+
+    // Pipelined, stopped by the 6th sampled token of an unpipelined run (or
+    // an earlier occurrence of it).
+    {
+        const name = "pipelined decode, stopped";
+        rt.engine.forget();
+        const plain = try c.run(p1);
+        const stop = plain.tokens[5];
+        const at = std.mem.indexOfScalar(u32, plain.tokens, stop).?;
+        rt.engine.forget();
+        const piped = try c.pipelined(p1, stop);
+        const n = at + 1;
+        const same = piped.finish == .stop and std.mem.eql(u32, piped.run.tokens, plain.tokens[0..n]) and
+            std.mem.eql(u32, @ptrCast(piped.run.logits[0 .. n * vocab]), @ptrCast(plain.logits[0 .. n * vocab]));
+        const resident_ok = piped.resident == p1.len + n;
+        c.ok = c.ok and same and resident_ok;
+        try out.print("{s} {s:<34} {d} tokens and logits {s} an unpipelined run; {d} resident (want {d}: the stop token too)\n", .{
+            if (same and resident_ok) "PASS" else "FAIL", name, n, if (same) "bitwise identical to" else "DIFFER from", piped.resident, p1.len + n,
+        });
+        const next = try std.mem.concat(arena, u32, &.{ p1, plain.tokens[0..n], other[0..30] });
+        _ = try c.scenario("prompt after a pipelined stop", next, @intCast(p1.len + n), false);
+    }
 
     // Cancelled in decode after 3 tokens: the prompt and the first 2 sampled
     // tokens are resident (the third was never processed).

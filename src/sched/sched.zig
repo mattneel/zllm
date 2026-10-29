@@ -7,8 +7,19 @@
 //!     while (true) switch (try engine.next()) {
 //!         .submit => |words| { execute words; try engine.complete(elapsed_ns); },
 //!         .token => |t| show t.text,
+//!         .wait => unreachable, // only when batches are still outstanding
 //!         .done => |d| break,
 //!     }
+//!
+//! A host that executes asynchronously can keep two batches in flight: on
+//! `.submit` it starts the batch and calls `next` again without completing
+//! it; on `.wait` it completes the oldest outstanding batch. Decoding then
+//! records the next step before the previous step's token is read back:
+//! the sampler feeds each token to the next step on the GPU, so only the
+//! host-side bookkeeping waits. This hides readback latency, which is about
+//! 3 ms in Chrome. When a step finishes the request (a stop or max_tokens),
+//! the step recorded after it has already processed its token; that token
+//! stays resident, and the later step's sample is discarded.
 //!
 //! `cancel` ends a request between batches: the batch in flight completes
 //! (and a token it sampled is still emitted), then `.done` reports `abort`.
@@ -81,12 +92,19 @@ pub const Usage = struct {
 };
 
 pub const Event = union(enum) {
-    /// Execute this batch, then call `complete`. Valid until then.
+    /// Execute this batch, then call `complete`; or, executing
+    /// asynchronously, call `next` again. The words are valid until the
+    /// next call.
     submit: []const u32,
     /// A sampled token and the text it released (valid until the next call).
     token: struct { id: u32, text: []const u8 },
+    /// Complete the oldest outstanding batch before anything else can happen.
+    wait,
     done: struct { finish: Finish, usage: Usage },
 };
+
+/// Batches outstanding at once.
+pub const max_in_flight = 2;
 
 pub const Error = Allocator.Error || Tokenizer.DecodeError || sampler.Params.Error || error{ Busy, EmptyPrompt, PromptTooLong, TooManyStops, NotSubmitted };
 
@@ -114,14 +132,32 @@ pub const Engine = struct {
     usage: Usage = .{},
     /// Prompt position of the next prefill chunk.
     prefill_pos: u32 = 0,
-    /// Readback of the last sampling step: (token, is_stop).
-    sampled: [2]u32 = .{ 0, 0 },
-    pending: ?Pending = null,
+    /// Readbacks of sampling steps in flight, (token, is_stop), one per
+    /// queue slot.
+    sampled: [max_in_flight][2]u32 = @splat(.{ 0, 0 }),
+    /// Outstanding batches, oldest first.
+    queue: [max_in_flight]Pending = undefined,
+    queued: u32 = 0,
+    /// The readback slot the next sampling step uses.
+    next_slot: u32 = 0,
+    /// Sampling steps recorded for this request.
+    samples_recorded: u32 = 0,
+    /// The latest sampled token the host knows, which the next decode step
+    /// processes.
+    last_token: u32 = 0,
+    /// A resident position whose token is the sample of a step still in
+    /// flight, filled when it completes.
+    placeholder: ?u32 = null,
+    /// The token to emit (phase .emit).
+    emit_token: u32 = 0,
     finish: ?Finish = null,
     cancelled: bool = false,
+    /// `rec` holds a batch already handed to the host: the next recording
+    /// starts a fresh one. (`start` leaves commands for the first batch.)
+    handed: bool = false,
 
-    const Phase = enum { idle, prefill, decode, emit, done };
-    const Pending = struct { tokens: u32, samples: bool, prefill: bool };
+    const Phase = enum { idle, prefill, decode, emit };
+    const Pending = struct { tokens: u32, prefill: bool, slot: ?u32 };
 
     /// The engine keeps pointers to itself in recorded batches: it must not
     /// move while a batch is pending.
@@ -149,7 +185,7 @@ pub const Engine = struct {
     /// second measures the fixed cost of a step, which the prefill cost
     /// model needs from the start. The batch is valid until `calibrated`.
     pub fn calibration(e: *Engine) Error![]const u32 {
-        if (e.pending != null or (e.phase != .idle and e.phase != .done)) return error.Busy;
+        if (e.queued != 0 or e.phase != .idle) return error.Busy;
         e.forget();
         e.rec.clear();
         try e.program.recordReset(e.gpa, &e.rec);
@@ -169,7 +205,7 @@ pub const Engine = struct {
 
     /// `req` and the memory it points to must stay valid until `.done`.
     pub fn start(e: *Engine, req: Request) Error!void {
-        if (e.phase != .idle and e.phase != .done) return error.Busy;
+        if (e.phase != .idle) return error.Busy;
         const cfg = e.program.cfg;
         if (req.prompt.len == 0) return error.EmptyPrompt;
         if (req.prompt.len > cfg.context) return error.PromptTooLong;
@@ -177,6 +213,7 @@ pub const Engine = struct {
         try req.sampling.validate(e.program.hp.vocab);
 
         e.rec.clear();
+        e.handed = false;
         const r = e.seq.plan(req.prompt);
         switch (r.from) {
             .current => {},
@@ -192,7 +229,9 @@ pub const Engine = struct {
         e.stream = .{ .stops = req.stop };
         e.usage = .{ .prompt_tokens = @intCast(req.prompt.len), .cached_tokens = r.start };
         e.prefill_pos = r.start;
-        e.pending = null;
+        e.queued = 0;
+        e.samples_recorded = 0;
+        e.placeholder = null;
         e.finish = null;
         e.cancelled = false;
         e.phase = .prefill;
@@ -200,46 +239,56 @@ pub const Engine = struct {
 
     /// Ends the running request after the batch in flight (see above).
     pub fn cancel(e: *Engine) void {
-        switch (e.phase) {
-            .prefill, .decode, .emit => e.cancelled = true,
-            .idle, .done => {},
-        }
+        if (e.phase != .idle) e.cancelled = true;
     }
 
     pub fn next(e: *Engine) Error!Event {
-        if (e.pending != null) return error.NotSubmitted;
-        if (e.cancelled and e.finish == null and (e.phase == .prefill or e.phase == .decode)) {
-            e.finish = .abort;
-            e.phase = .done;
-        }
         switch (e.phase) {
             .idle => return error.NotSubmitted,
-            .prefill => {
-                try e.recordPrefill();
-                return .{ .submit = e.rec.batch() };
-            },
-            .decode => {
-                try e.recordDecode();
-                return .{ .submit = e.rec.batch() };
-            },
             .emit => {
-                if (e.cancelled and e.finish == null) e.finish = .abort;
-                e.phase = if (e.finish == null) .decode else .done;
-                return .{ .token = .{ .id = e.sampled[0], .text = e.text.items } };
+                e.phase = .decode;
+                return .{ .token = .{ .id = e.emit_token, .text = e.text.items } };
             },
-            .done => {
-                e.phase = .idle;
-                return .{ .done = .{ .finish = e.finish.?, .usage = e.usage } };
-            },
+            .prefill, .decode => {},
         }
+        if (e.cancelled and e.finish == null) e.finish = .abort;
+        if (e.finish) |f| {
+            if (e.queued > 0) return .wait;
+            e.phase = .idle;
+            return .{ .done = .{ .finish = f, .usage = e.usage } };
+        }
+        if (e.phase == .prefill) {
+            // Prefill steps run one at a time: each chunk's size follows the
+            // previous one's measured cost.
+            if (e.queued > 0) return .wait;
+            try e.recordPrefill();
+        } else {
+            if (e.queued == max_in_flight or !e.canDecode()) return .wait;
+            try e.recordDecode();
+        }
+        e.handed = true;
+        return .{ .submit = e.rec.batch() };
     }
 
-    /// Reports that the last submitted batch finished, `elapsed_ns` after it
-    /// was submitted.
+    /// Starts a new batch unless `rec` holds commands for it already.
+    fn freshBatch(e: *Engine) void {
+        if (e.handed) e.rec.clear();
+        e.handed = false;
+    }
+
+    /// Whether another decode step may be recorded: its sample stays within
+    /// max_tokens and the token it processes within the context.
+    fn canDecode(e: *const Engine) bool {
+        return e.samples_recorded < e.req.max_tokens and e.seq.len() < e.program.cfg.context;
+    }
+
+    /// Reports that the oldest outstanding batch finished, `elapsed_ns` of
+    /// GPU time after it started.
     pub fn complete(e: *Engine, elapsed_ns: u64) Error!void {
-        const p = e.pending orelse return error.NotSubmitted;
-        e.pending = null;
-        e.rec.clear();
+        if (e.queued == 0 or e.phase == .emit) return error.NotSubmitted;
+        const p = e.queue[0];
+        std.mem.copyForwards(Pending, e.queue[0 .. e.queued - 1], e.queue[1..e.queued]);
+        e.queued -= 1;
         if (p.prefill) {
             e.usage.prefill_ns += elapsed_ns;
             e.usage.prefill_steps += 1;
@@ -253,20 +302,30 @@ pub const Engine = struct {
             e.token_ns = (elapsed_ns - e.step_ns) / p.tokens;
             e.rate_tokens = p.tokens;
         }
-        if (!p.samples) return;
+        const slot = p.slot orelse return;
 
-        const token = e.sampled[0];
+        const token = e.sampled[slot][0];
+        e.last_token = token;
+        if (e.placeholder) |i| {
+            // A later step already processes this token.
+            _ = i;
+            e.placeholder = null;
+        }
+        // Recorded before the request finished: the step processed its
+        // token, but its sample is not part of the reply.
+        if (e.finish != null) return;
         e.usage.completion_tokens += 1;
         e.text.clearRetainingCapacity();
-        if (e.sampled[1] != 0) {
+        if (e.sampled[slot][1] != 0) {
             try e.stream.flush(e.gpa, &e.text);
             e.finish = .stop;
         } else if (try e.stream.push(e.gpa, e.tok, token, &e.text)) {
             e.finish = .stop;
-        } else if (e.usage.completion_tokens == e.req.max_tokens or e.seq.len() == e.program.cfg.context) {
+        } else if (e.usage.completion_tokens == e.req.max_tokens or (e.queued == 0 and e.seq.len() == e.program.cfg.context)) {
             try e.stream.flush(e.gpa, &e.text);
             e.finish = .length;
         }
+        e.emit_token = token;
         e.phase = .emit;
     }
 
@@ -304,45 +363,63 @@ pub const Engine = struct {
     }
 
     fn recordPrefill(e: *Engine) Error!void {
+        e.freshBatch();
         const pos0 = e.prefill_pos;
         const m = e.chunkSize();
         const tokens = e.req.prompt[pos0..][0..m];
         const last = pos0 + m == e.req.prompt.len;
+        const slot = if (last) e.takeSlot() else null;
         try e.program.recordStep(e.gpa, &e.rec, .{
             .pos0 = pos0,
             .tokens = tokens,
             .logit_rows = @intFromBool(last),
             .draw = if (last) e.draws.next() else null,
-            .sampled = if (last) &e.sampled else null,
+            .sampled = if (slot) |s| &e.sampled[s] else null,
             .readback = if (last) e.logitsReadback() else null,
         });
         try e.seq.append(e.gpa, tokens);
         e.prefill_pos += m;
         if (e.seq.len() + 1 == e.req.prompt.len or e.seq.len() % state.checkpoint_interval == 0) try e.save();
-        try e.submitBatch(.{ .tokens = m, .samples = last, .prefill = true });
+        try e.submitBatch(.{ .tokens = m, .prefill = true, .slot = slot });
         if (last) e.phase = .decode;
     }
 
-    /// Processes the token just sampled and samples the next.
+    /// Processes the latest sampled token, or a placeholder for the sample
+    /// of the step still in flight, and samples the next.
     fn recordDecode(e: *Engine) Error!void {
+        e.freshBatch();
         const pos0 = e.seq.len();
+        const slot = e.takeSlot();
         try e.program.recordStep(e.gpa, &e.rec, .{
             .pos0 = pos0,
             .tokens = null,
             .logit_rows = 1,
             .draw = e.draws.next(),
-            .sampled = &e.sampled,
+            .sampled = &e.sampled[slot],
             .readback = e.logitsReadback(),
         });
-        try e.seq.append(e.gpa, &.{e.sampled[0]});
+        const unknown = for (e.queue[0..e.queued]) |q| {
+            if (q.slot != null) break true;
+        } else false;
+        if (unknown) e.placeholder = pos0;
+        try e.seq.append(e.gpa, &.{if (unknown) 0 else e.last_token});
         if (e.seq.len() % state.checkpoint_interval == 0) try e.save();
-        try e.submitBatch(.{ .tokens = 1, .samples = true, .prefill = false });
+        try e.submitBatch(.{ .tokens = 1, .prefill = false, .slot = slot });
     }
 
+    /// The readback slot for a new sampling step.
+    fn takeSlot(e: *Engine) u32 {
+        const slot = e.next_slot;
+        e.next_slot = (slot + 1) % max_in_flight;
+        e.samples_recorded += 1;
+        return slot;
+    }
+
+    /// Where the logits of the sampling step being recorded go, for checks.
     fn logitsReadback(e: *const Engine) ?plan.Program.Readback {
         const all = e.req.logits orelse return null;
         const vocab = e.program.hp.vocab;
-        return .{ .logits = all[e.usage.completion_tokens * vocab ..][0..vocab] };
+        return .{ .logits = all[(e.samples_recorded - 1) * vocab ..][0..vocab] };
     }
 
     /// Drops the resident sequence and its checkpoints: the next request
@@ -363,6 +440,7 @@ pub const Engine = struct {
     fn submitBatch(e: *Engine, p: Pending) Allocator.Error!void {
         e.submits += 1;
         try e.rec.submit(e.gpa, e.submits);
-        e.pending = p;
+        e.queue[e.queued] = p;
+        e.queued += 1;
     }
 };

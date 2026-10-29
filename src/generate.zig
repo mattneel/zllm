@@ -224,6 +224,8 @@ pub const Runtime = struct {
                 try text.appendSlice(rt.gpa, t.text);
                 if (ids) |list| try list.append(rt.gpa, t.id);
             },
+            // Each batch completes before the next call.
+            .wait => unreachable,
             .done => |d| return .{ .finish = d.finish, .usage = d.usage },
         };
     }

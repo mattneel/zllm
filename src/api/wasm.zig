@@ -4,12 +4,15 @@
 //!
 //!     zllm_open(header)      parse the header (asks for a longer prefix)
 //!     zllm_load(options)     build the model, the step program, the engine
-//!     zllm_next()            submit | token | done | idle; after a submit,
-//!     zllm_complete(ms)      once the shim has executed the batch
+//!     zllm_next()            submit | token | done | idle | wait
+//!     zllm_complete(ms)      the oldest batch the shim has executed
 //!     zllm_start(request)    a generation request (raw text, ids or chat)
 //!
 //! Loading runs through `zllm_next` too: the setup batch (buffers, weights,
-//! pipelines), then the engine's two calibration steps, then idle. Results
+//! pipelines), then the engine's two calibration steps, then idle; each is
+//! completed before the next. During a request the shim may keep up to two
+//! batches in flight: after `submit` it calls `zllm_next` again, and on
+//! `wait` it completes its oldest batch (see sched.zig). Results
 //! land in one block (`Out`, at `zllm_out()`); any negative return leaves
 //! an error message at `Out.ptr`/`Out.len`. Every export runs to completion:
 //! there is no blocking and no Asyncify.
@@ -57,7 +60,7 @@ const Out = extern struct {
     decode_ms: f64 = 0,
 };
 
-const Event = enum(i32) { submit = 0, token = 1, done = 2, idle = 3 };
+const Event = enum(i32) { submit = 0, token = 1, done = 2, idle = 3, wait = 4 };
 
 var out: Out = .{};
 var message: std.ArrayList(u8) = .empty;
@@ -231,7 +234,7 @@ const Runtime = struct {
     engine: sched.Engine,
     setup: zllm.gpu.cmd.Recorder = .{},
     phase: Phase = .setup,
-    /// A batch is out for execution.
+    /// A setup or calibration batch is out for execution.
     pending: bool = false,
     /// A request is running.
     running: bool = false,
@@ -285,14 +288,14 @@ const Runtime = struct {
     }
 
     fn submit(rt: *Runtime, words: []const u32) Event {
-        rt.pending = true;
+        if (rt.phase != .ready) rt.pending = true;
         out.ptr = @intFromPtr(words.ptr);
         out.count = @intCast(words.len);
         return .submit;
     }
 
     fn next(rt: *Runtime) !Event {
-        if (rt.pending) return error.NotCompleted;
+        if (rt.phase != .ready and rt.pending) return .wait;
         switch (rt.phase) {
             .setup => return rt.submit(rt.setup.batch()),
             .cold, .warm => return rt.submit(try rt.engine.calibration()),
@@ -301,6 +304,7 @@ const Runtime = struct {
         if (!rt.running) return .idle;
         switch (try rt.engine.next()) {
             .submit => |words| return rt.submit(words),
+            .wait => return .wait,
             .token => |t| {
                 out.token = t.id;
                 setText(t.text);
@@ -321,6 +325,7 @@ const Runtime = struct {
     }
 
     fn complete(rt: *Runtime, elapsed_ns: u64) !void {
+        if (rt.phase == .ready) return rt.engine.complete(elapsed_ns);
         if (!rt.pending) return error.NotSubmitted;
         rt.pending = false;
         switch (rt.phase) {
@@ -337,7 +342,7 @@ const Runtime = struct {
                 rt.engine.calibrated(elapsed_ns, true);
                 rt.phase = .ready;
             },
-            .ready => try rt.engine.complete(elapsed_ns),
+            .ready => unreachable,
         }
     }
 
