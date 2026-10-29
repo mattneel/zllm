@@ -46,6 +46,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
 const plan = @import("../plan/qwen35.zig");
+const kernels = @import("../kernels/kernels.zig");
 const sampler = @import("../sampler/sampler.zig");
 const state = @import("../state/state.zig");
 const Tokenizer = @import("../tokenizer/tokenizer.zig").Tokenizer;
@@ -72,7 +73,7 @@ pub const first_chunk = 64;
 pub const chunk_align = 8;
 
 comptime {
-    std.debug.assert(chunk_align > @import("../kernels/kernels.zig").decode_max_rows);
+    std.debug.assert(chunk_align > kernels.decode_max_rows);
 }
 
 pub const Request = struct {
@@ -314,8 +315,10 @@ pub const Engine = struct {
         }
         if (p.tokens == 1) {
             e.step_ns = ema(e.step_ns, elapsed_ns);
-        } else if (e.step_ns != 0 and elapsed_ns > e.step_ns) {
+        } else if (e.step_ns != 0 and elapsed_ns > e.step_ns and p.tokens > kernels.decode_max_rows) {
             // A step faster than the fixed estimate is noise, not a rate.
+            // Steps of a few tokens run the decode kernels, whose cost says
+            // nothing about a prefill tile's.
             e.token_ns = (elapsed_ns - e.step_ns) / std.mem.alignForward(u64, p.tokens, e.program.prefill_tile);
             e.rate_tokens = p.tokens;
         }
