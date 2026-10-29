@@ -308,7 +308,7 @@ pub const Engine = struct {
         e.last_token = token;
         if (e.placeholder) |i| {
             // A later step already processes this token.
-            _ = i;
+            e.seq.tokens.items[i] = token;
             e.placeholder = null;
         }
         // Recorded before the request finished: the step processed its
