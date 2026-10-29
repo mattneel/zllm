@@ -63,18 +63,13 @@ pub const hard_cap_ns = 250 * std.time.ns_per_ms;
 /// watchdogs).
 pub const first_chunk = 64;
 /// Prefill chunks end at multiples of this (or at the prompt's last two
-/// positions). Steps of a few tokens run the decode kernels, which round
-/// differently from the prefill kernels, so aligned boundaries make the
-/// kernels each prompt position goes through depend on the prompt alone,
-/// not on step timings: an aligned step has more tokens than the decode
-/// kernels take, so it runs the prefill kernels, which give the same result
-/// however a prompt is split. Small, so that a large model's steps can stay
-/// short.
+/// positions). Small, so that a large model's steps can stay short. Every
+/// chunk but the prompt's last token runs the prefill kernels, however few
+/// tokens it has (the chunk before the last token can be a short tail), so
+/// the kernels each prompt position goes through depend on the prompt
+/// alone, not on step timings: the prefill kernels give the same result
+/// however a prompt is split.
 pub const chunk_align = 8;
-
-comptime {
-    std.debug.assert(chunk_align > kernels.decode_max_rows);
-}
 
 pub const Request = struct {
     prompt: []const u32,
@@ -437,6 +432,7 @@ pub const Engine = struct {
             .draw = if (last) e.draws.next() else null,
             .sampled = if (slot) |s| &e.sampled[s] else null,
             .readback = if (slot) |s| e.logitsReadback(s) else null,
+            .path = if (last) null else .prefill,
         });
         try e.seq.append(e.gpa, tokens);
         e.prefill_pos += m;

@@ -381,8 +381,8 @@ real engine after earlier requests left state behind. Then it repeats each
 one after dropping all state. Each sampled step's logits must match, and the
 reused prompt length must be what the reuse rules say. Logits must be
 bitwise identical wherever both runs put each position through the same
-kernels. Prefill chunks end at multiples of 8, so that holds for every
-scenario but one: a prompt that extends a turn reuses the reply's tokens,
+kernels. Prefill chunks always run the prefill kernels, so that holds for
+every scenario but one: a prompt that extends a turn reuses the reply's tokens,
 which went through the decode kernels. That one must agree within 1e-4
 relative L2.
 
@@ -406,10 +406,16 @@ decode's follow-up sits closest to the cross-path bound, at 8.8e-5 of 1e-4:
 two of its reused positions went through the decode kernels.
 
 These are RTX 5090 results; at M2 the first five also passed bitwise on
-llvmpipe. They no longer do: on llvmpipe the fresh prompt now differs from
-its fresh rerun, the extended turn lands at 1.4e-4, and the diverging prompt
-fails on some runs and passes on others. The cause is not yet known. Skipping the checkpoint restore fails both checkpoint scenarios,
-and an earlier bug that left the state dirty after dropping the sequence
+llvmpipe. Later, on llvmpipe, the fresh prompt differed from its fresh rerun
+and the diverging prompt failed on some runs: the chunk just before a
+prompt's last token can be a tail of fewer than 8 tokens, and whether it ran
+alone (through the decode kernels) or inside a longer chunk depended on step
+timings, which are noisy on a software renderer. Prefill chunks now always
+run the prefill kernels. On llvmpipe the extended turn still lands at
+1.4e-4, past the 1e-4 bound (4.5e-5 on the RTX 5090).
+
+Skipping the checkpoint restore fails both checkpoint scenarios, and an
+earlier bug that left the state dirty after dropping the sequence
 failed all five. Leaving the pipelined placeholder unfilled fails the
 scenario after the pipelined stop (699 of 736 reused, want 706).
 
