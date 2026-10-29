@@ -288,7 +288,7 @@ const Upload = struct {
                 try launcher.launch(.repad, P.Repad{ .blocks = @intCast(blocks), .src_bytes = l.block_bytes, .dst_bytes = @intCast(stride) }, &.{
                     .{ .buffer = raw, .size = raw_size },
                     .{ .buffer = buf, .size = size },
-                }, kernels.Launcher.elementwise(blocks * stride / 4));
+                }, kernels.Launcher.elementwise(@intCast(blocks * stride / 4)));
                 try u.rec.submit(u.gpa, 0);
                 try u.rec.destroy(u.gpa, .buffer, @backingInt(raw));
             }
