@@ -361,9 +361,9 @@ RTX 5090 (D3D12):
 |---|---|---|---|
 | Prefill | 818/818 | 1.2e-5 | bitwise identical |
 | Decode | 200/200 | 1.1e-5 | bitwise identical |
+| Prefill, f16 cache | 818/818 | min cosine 0.9999939 | |
 
 Each fusion commit passed this check on its own.
-| Prefill, f16 cache | 818/818 | min cosine 0.9999939 | |
 
 At M2, before the decode kernels, llvmpipe gave the same results (818/818,
 1.0e-5). `check-gpu` now runs on real GPUs only: on llvmpipe it takes about
