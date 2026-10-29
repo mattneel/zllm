@@ -19,6 +19,8 @@ const usage =
     \\                                       tools/llama-dump/dump.cpp)
     \\  gpu-info                            open Dawn and print the adapter and limits as JSON
     \\  gpu-check                           check every GPU kernel against a CPU computation
+    \\  gpu-forward <model.gguf> <tokens.i32> <out.bin>
+    \\                                       as `forward`, on the GPU through Dawn
     \\
     \\environment:
     \\  ZLLM_THREADS   worker threads for `forward` (default: one per physical core)
@@ -66,6 +68,9 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "gpu-check")) {
         if (args.len != 2) return fail(usage);
         try gpuCheck(gpa, init.environ_map, out);
+    } else if (std.mem.eql(u8, cmd, "gpu-forward")) {
+        if (args.len != 5) return fail(usage);
+        try gpuForward(gpa, io, init.environ_map, args[2], args[3], args[4]);
     } else {
         return fail(usage);
     }
@@ -110,12 +115,8 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
     var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped.bytes);
     defer model.deinit();
 
-    const raw = try Io.Dir.cwd().readFileAlloc(io, tokens_path, gpa, .unlimited);
-    defer gpa.free(raw);
-    if (raw.len == 0 or raw.len % 4 != 0) return error.BadTokenFile;
-    const tokens = try gpa.alloc(u32, raw.len / 4);
+    const tokens = try readTokens(gpa, io, tokens_path);
     defer gpa.free(tokens);
-    for (tokens, 0..) |*t, i| t.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
 
     const out_file = try Io.Dir.cwd().createFile(io, out_path, .{});
     defer out_file.close(io);
@@ -125,6 +126,16 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
 
     try model.forward(gpa, tokens, pool, .{ .ctx = &rec, .emit = RecordWriter.emit });
     try fw.interface.flush();
+}
+
+/// Little-endian int32 token ids.
+fn readTokens(gpa: std.mem.Allocator, io: Io, path: []const u8) ![]u32 {
+    const raw = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+    defer gpa.free(raw);
+    if (raw.len == 0 or raw.len % 4 != 0) return error.BadTokenFile;
+    const tokens = try gpa.alloc(u32, raw.len / 4);
+    for (tokens, 0..) |*t, i| t.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+    return tokens;
 }
 
 /// Activation records shared with tools/llama-dump: u32 name length, name,
@@ -202,6 +213,85 @@ fn gpuCheck(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *I
     const ok = try zllm.kernel_check.run(gpa, &host, out);
     try out.flush();
     if (!ok) return error.KernelCheckFailed;
+}
+
+/// The GPU forward pass, with the same arguments and activation records as
+/// `forward`. Load and forward timings go to stderr.
+fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, model_path: []const u8, tokens_path: []const u8, out_path: []const u8) !void {
+    const plan = zllm.plan.qwen35;
+    const t_start = Io.Timestamp.now(io, .awake);
+    const mapped = try FileBytes.open(gpa, io, model_path);
+    defer mapped.close(gpa);
+    var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
+    defer file.deinit(gpa);
+    const tokens = try readTokens(gpa, io, tokens_path);
+    defer gpa.free(tokens);
+
+    const d = try openDawn(gpa, env);
+    defer d.deinit(gpa);
+    var host = zllm.gpu.Host.init(gpa, d);
+    defer host.deinit();
+    const limits: plan.Limits = .{
+        .max_binding = d.limits.maxStorageBufferBindingSize,
+        .offset_align = d.limits.minStorageBufferOffsetAlignment,
+    };
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var rec: zllm.gpu.cmd.Recorder = .{};
+    defer rec.deinit(gpa);
+    var completions: std.ArrayList(zllm.gpu.cmd.Completion) = .empty;
+    defer completions.deinit(gpa);
+
+    const set = try zllm.kernels.Set.create(gpa, &rec);
+    const model = try plan.Model.upload(arena, gpa, &rec, file, mapped.bytes, limits);
+    const n: u32 = @intCast(tokens.len);
+    const hp = model.hp;
+    const rope = try zllm.kernels.ropeTable(arena, n, hp.n_rot, hp.rope_base);
+    const acts = try plan.Activations.create(arena, gpa, &rec, hp, n, rope);
+    try rec.submit(gpa, 0);
+    try runBatch(&host, &rec, &completions);
+    const t_loaded = Io.Timestamp.now(io, .awake);
+
+    const layer_out = try arena.alloc([]f32, hp.n_layer);
+    for (layer_out) |*o| o.* = try arena.alloc(f32, tokens.len * hp.n_embd);
+    const readback: plan.Readback = .{
+        .layer_out = layer_out,
+        .result_norm = try arena.alloc(f32, tokens.len * hp.n_embd),
+        .logits = try arena.alloc(f32, tokens.len * hp.vocab),
+    };
+    const l: zllm.kernels.Launcher = .{ .gpa = gpa, .arena = arena, .rec = &rec, .set = &set };
+    try plan.recordForward(l, limits, &model, &acts, tokens, readback);
+    try rec.submit(gpa, std.math.maxInt(u32));
+    try runBatch(&host, &rec, &completions);
+    const t_done = Io.Timestamp.now(io, .awake);
+    std.debug.print("gpu-forward: {d} tokens; load {d} ms, forward {d} ms\n", .{
+        n,
+        t_start.durationTo(t_loaded).toMilliseconds(),
+        t_loaded.durationTo(t_done).toMilliseconds(),
+    });
+
+    const out_file = try Io.Dir.cwd().createFile(io, out_path, .{});
+    defer out_file.close(io);
+    var buf: [1 << 16]u8 = undefined;
+    var fw: Io.File.Writer = .init(out_file, io, &buf);
+    var rw: RecordWriter = .{ .w = &fw.interface };
+    var name_buf: [32]u8 = undefined;
+    for (layer_out, 0..) |o, il| {
+        try RecordWriter.emit(&rw, std.fmt.bufPrint(&name_buf, "l_out-{d}", .{il}) catch unreachable, o, hp.n_embd, tokens.len);
+    }
+    try RecordWriter.emit(&rw, "result_norm", readback.result_norm, hp.n_embd, tokens.len);
+    try RecordWriter.emit(&rw, "result_output", readback.logits, hp.vocab, tokens.len);
+    try fw.interface.flush();
+}
+
+fn runBatch(host: *zllm.gpu.Host, rec: *zllm.gpu.cmd.Recorder, completions: *std.ArrayList(zllm.gpu.cmd.Completion)) !void {
+    host.execute(rec.batch(), completions) catch |err| {
+        if (err == error.GpuError or err == error.DeviceLost) std.log.err("{s}", .{host.d.errorMessage()});
+        return err;
+    };
+    rec.clear();
 }
 
 fn gpuInfo(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *Io.Writer) !void {

@@ -1,7 +1,9 @@
 # gpu
 
-Not started; planned for M1.
+The command stream the core emits (`cmd.zig`) and the native host that runs it
+(`dawn.zig`, `host.zig`). The core never calls WebGPU: it records commands,
+a host executes them and reports completions. The browser host, a TypeScript
+shim interpreting the same words, arrives in M3.
 
-Backend interface consumed by the core state machine, with `web` (JS imports) and `dawn` (webgpu.h) implementations.
-
-See the [spec](../../docs/src/spec.md) and [architecture](../../docs/src/architecture.md).
+Dawn is loaded at run time (`dynlib.zig`) through the C API of the vendored
+`third_party/dawn` header; see the [GPU backend](../../docs/src/gpu.md) page.
