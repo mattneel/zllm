@@ -1,6 +1,7 @@
 {
   "name": "@zllm/web",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Browser-side TypeScript for zllm: the book's scripts now, the JS shim and facade from M3",
   "scripts": {

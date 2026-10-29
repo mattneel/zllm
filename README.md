@@ -64,3 +64,7 @@ See [Contributing](https://mattneel.github.io/zllm/contributing.html) for the to
 ## Funding
 
 If zllm is useful to you, consider [sponsoring @mattneel](https://github.com/sponsors/mattneel).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
