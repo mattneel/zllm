@@ -130,11 +130,19 @@ attention output gate scores 2.4% top-1 and fails every position.
 each against a float64 CPU computation of the same formula, with shapes that
 hit every tile and chunk remainder:
 
-- **Stateful kernels** (the cache append and attention, the convolution, the
-  delta rule) run as two steps that carry state between them.
-- **Attention** spans two of its 256-key tiles and is checked against the
-  values the cache actually holds. Decode attention spans three of its
-  64-position blocks, for three query tokens.
+- **Stateful kernels** run as steps that carry state between them. The
+  DeltaNet front end runs in steps of 5, 2, 1 and 4 tokens, with the delta
+  rule advancing the conv history between them; steps shorter than the
+  history shift it. The delta rule runs as two steps.
+- **Attention** spans two of its 256-key tiles, over a cache filled from the
+  host, with query rows padded past their gates as in the fused Q, K, V
+  projection. Decode attention spans three of its 64-position blocks, for
+  three query tokens.
+- **`rope_append`** is checked over the whole projection, including the
+  gates, K and V it must leave untouched, and over the cache, including the
+  positions before the step, which must stay zero.
+- **Fused multiplies** start from a random output, so an accumulate that
+  overwrites fails.
 
 The rows below are the RTX 5090 (D3D12) results. llvmpipe gives the same
 errors to within a factor of 2.
@@ -142,20 +150,31 @@ errors to within a factor of 2.
 | Kernel | Max relative error | Tolerance |
 |---|---|---|
 | rmsnorm | 1.6e-7 | 1e-6 |
-| matmul_bf16 (single and 2-chunk) | 1.3e-6 | 1e-5 |
-| matvec_bf16 (2-chunk, 3 tokens) | 1.2e-7 | 1e-5 |
+| matmul_bf16 (single; 2-chunk accumulating) | 1.3e-6 | 1e-5 |
+| matvec_bf16 (2-chunk; 2-chunk with norm and accumulate; norm and SiLU pair), 3 tokens | 1.9e-7 | 1e-5 |
 | silu_mul | 1.4e-7 | 1e-6 |
-| add, embed_bf16 | 0 | 0 |
-| qk_norm_rope | 1.4e-7 | 1e-5 |
-| kv_append, f16 | 4.8e-4 | 1e-3 (one f16 step) |
+| embed_bf16 | 0 | 0 |
+| rope_append, f32 cache | 9.3e-8 | 1e-5 |
+| rope_append, f16 cache | 5.6e-4 | 1e-3 (one f16 step) |
 | attention, f32 and f16 cache | 6.0e-7 | 1e-5 |
-| attn_split + attn_combine | 3.1e-7 | 1e-5 |
-| conv_silu (2 steps), l2norm_heads, gates | ≤ 1.4e-7 | 1e-6 |
-| delta_rule + gated_norm (2 steps) | 2.4e-7 | 1e-5 |
+| attn_split + attn_combine | 2.8e-7 | 1e-5 |
+| delta_prep (4 steps) | 4.0e-8 | 1e-5 |
+| delta_rule + gated_norm (2 steps) | 2.5e-7 | 1e-5 |
 
-D3D12 rounds `pack2x16float` toward zero and llvmpipe to nearest (2.4e-4),
+D3D12 rounds `pack2x16float` toward zero and llvmpipe to nearest (3.7e-4),
 so the f16 bound is one step, not half. Dropping the attention output gate
-makes `gpu-check` fail with error 1.0.
+makes `gpu-check` fail with error 1.0. Mutations of the fused kernels each
+fail their check:
+
+- **Conv history:** shifting it one slot too far, or reading the wrong slot
+  (errors 0.08 and 0.13).
+- **Fused projections:** reading z or α at the wrong offset, or queries at the
+  unfused row stride.
+- **The SiLU pair's up row:** off by one.
+- **The norm prologue:** a wrong mean divisor (k + 8; errors 4e-3 and 8e-3)
+  or one weight for every element.
+- **Accumulate:** overwriting instead of adding.
+- **The V cache:** taking the rotated K.
 
 The sampler runs on seeded Gaussian logits (σ = 2), so every threshold cuts
 through a dense band of tokens:
@@ -218,6 +237,8 @@ RTX 5090 (D3D12):
 |---|---|---|---|
 | Prefill | 818/818 | 1.2e-5 | bitwise identical |
 | Decode | 200/200 | 1.1e-5 | bitwise identical |
+
+Each fusion commit passed this check on its own.
 | Prefill, f16 cache | 818/818 | min cosine 0.9999939 | |
 
 At M2, before the decode kernels, llvmpipe gave the same results (818/818,
@@ -244,7 +265,7 @@ relative L2.
 | Scenario | Reused | Logits |
 |---|---|---|
 | A fresh 700-token prompt | 0 | bitwise identical |
-| The prompt, its reply, and 40 more tokens | 711: the whole resident sequence | relative L2 3.0e-5 |
+| The prompt, its reply, and 40 more tokens | 711: the whole resident sequence | relative L2 4.5e-5 |
 | A prompt sharing the first 600 tokens | 512: the checkpoint at 512 | bitwise identical |
 | The same prompt again | 649: the checkpoint before its last token | bitwise identical |
 | The first prompt after an unrelated one | 0: the state is zeroed | bitwise identical |

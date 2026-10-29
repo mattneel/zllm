@@ -31,6 +31,11 @@ attention, a register-resident DeltaNet state and a sampler spread across
 the GPU. They take decoding on an RTX 5090 Laptop from 25–34 tok/s to about
 215 tok/s ([Generation](generation.md#performance)).
 
+M5 has started too. The spec's fusion rules are applied by hand in the Qwen
+3.5 step program ([GPU backend](gpu.md#fusion)). This cuts a decode step
+from 441 dispatches to 182, and decoding to about 285 tok/s. The fusion
+pass itself, which needs M4's templates, is still to come.
+
 See [Validation](validation.md), [GPU backend](gpu.md) and
 [Generation](generation.md). Next is M3: the wasm build, the JavaScript shim
 and streaming in the browser.

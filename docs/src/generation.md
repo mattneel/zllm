@@ -188,14 +188,14 @@ Measured with `zllm generate` on an RTX 5090 Laptop (D3D12), f16 KV:
 
 | Phase | M2 | Now |
 |---|---|---|
-| Prefill, a 2,457-token prompt | 1,562–1,567 tok/s | 2,848–2,854 tok/s, in 12 steps |
-| Decode, greedy, short context | 34 tok/s | 220 tok/s |
-| Decode, greedy, after the 2,457-token prompt | 27 tok/s | 221 tok/s |
-| Decode, top-k 20 + top-p 0.95 | 25 tok/s | 212–215 tok/s |
+| Prefill, a 2,457-token prompt | 1,562–1,567 tok/s | 2,882–2,896 tok/s, in 12 steps |
+| Decode, greedy, short context | 34 tok/s | 285–295 tok/s |
+| Decode, greedy, after the 2,457-token prompt | 27 tok/s | 270 tok/s |
+| Decode, top-k 20 + top-p 0.95 | 25 tok/s | 268 tok/s |
 
 `zllm bench` attributes a decode step to kernel classes by ablation: the
-step replayed without each class. It drove the decode kernels, step by step,
-at position 1,056:
+step replayed without each class. It drove the decode kernels and their
+fusion, step by step, at position 1,056:
 
 | Change | ms per decode step |
 |---|---|
@@ -206,17 +206,16 @@ at position 1,056:
 | DeltaNet state in registers (1.2 → 0.35 ms) | 5.0 |
 | Matrix-vector activations in workgroup memory | 4.8–4.9 |
 | Decode attention reads V once per GQA group (0.66 → 0.34–0.40 ms) | 4.7 |
+| Fusion: 441 → 182 dispatches per step ([GPU backend](gpu.md#fusion)) | 3.9 |
 
-What remains, of about 4.5 ms per step:
+What remains, of about 3.9 ms per step:
 
-- **Dispatches:** each step issues about 440 dispatches. A dependent dispatch
-  costs at least 2.4 µs on this GPU through D3D12, so about 1 ms goes to the
-  floor alone. Many of them are tiny: β and α are 16-row projections, and
-  every residual add and RMSNorm is its own dispatch. Fusion (M5), with
-  projections that share an input merged and adds folded into norms, is the
-  next lever.
 - **Weights:** a decode step streams 1.5 GB of BF16 weights, about 1.7 ms
-  at this GPU's bandwidth. The vocabulary projection runs at that floor; the
-  body's projections average about 70% of it.
+  at this GPU's bandwidth. The vocabulary projection runs at that floor
+  (0.5 GB in 0.54 ms). The body's projections reach about 60% of it (1.0 GB
+  in 1.7 ms), so they are the next lever.
+- **Dispatches:** each dependent dispatch costs 2.4–3.8 µs on this GPU
+  through D3D12, depending on its work, so the 182 cost 0.4–0.7 ms.
+- **Attention and the sampler:** about 0.3 and 0.2 ms.
 
 Synchronizing a submission costs 0.1–0.2 ms.

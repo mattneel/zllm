@@ -76,17 +76,15 @@ and widened in the shader; activations and accumulation are f32.
 |---|---|---|
 | `embed_bf16` | Token embedding gather | Per table chunk |
 | `rmsnorm` | Row RMSNorm | One workgroup per row |
-| `matmul_bf16` | x · Wᵀ, prefill | 16 tokens × 64 outputs per workgroup; tiles staged in workgroup memory |
-| `matvec_bf16` | x · Wᵀ, decode | 8 rows per workgroup, each row's dot product over 32 lanes reading 16-byte weight vectors, then a fixed tree |
-| `silu_mul`, `add` | SwiGLU, residual | Elementwise |
-| `qk_norm_rope` | Per-head Q/K RMSNorm, then partial NeoX RoPE at positions pos0 + t | Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π] |
-| `kv_append` | K and V rows into the cache at pos0 + t | f16 pairs (`pack2x16float`) or f32 |
+| `matmul_bf16` | x · Wᵀ, prefill | 16 tokens × 64 outputs per workgroup; tiles staged in workgroup memory. Optionally adds into the output (the residual) |
+| `matvec_bf16` | x · Wᵀ, decode | 8 rows per workgroup, each row's dot product over 32 lanes reading 16-byte weight vectors, then a fixed tree. Optionally RMSNorms the staged input first, adds into the output, or computes SiLU(gate) · up over stacked gate and up rows |
+| `silu_mul` | SwiGLU over the stacked gate and up projection, prefill | Elementwise |
+| `rope_append` | Q/K RMSNorm, partial NeoX RoPE at positions pos0 + t, and the K/V cache write | One workgroup per (head, token) of the stacked Q, K, V projection. Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π]. The cache holds f16 pairs (`pack2x16float`) or f32 |
 | `attention` | Causal GQA over the cache, with the sigmoid output gate, prefill | One workgroup per (head, query); online softmax over 256-key tiles; no length limit |
 | `attn_split`, `attn_combine` | The same, decode (flash-decoding) | One workgroup per (KV head, 64 cache positions, token) scores the block for the whole GQA group and takes a local softmax; the combine merges the blocks |
-| `conv_silu` | DeltaNet causal conv | One thread per channel; reads and advances the last 3 inputs |
-| `l2norm_heads`, `gates` | DeltaNet front end | |
-| `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups |
-| `gated_norm` | The SiLU(z)-gated RMSNorm after it | One workgroup per (head, token) |
+| `delta_prep` | DeltaNet front end: causal conv and SiLU, L2 norm of q and k, β and decay gates | One workgroup per (head of channels, token); inputs before the step come from the conv history |
+| `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups. Also advances the conv history |
+| `gated_norm` | The SiLU(z)-gated RMSNorm after it | One workgroup per (head, token); z read from the stacked projection |
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling) |
 
@@ -110,13 +108,15 @@ A step is then one `write_buffer` of a 16-byte `Step` uniform
 (`m` tokens, first position `pos0`, the sampler's draw `u`), the token ids
 for prefill, and a replay of the launch list:
 
-- **Step-dependent kernels:** kernels that mix tokens or use positions
-  (RoPE, the cache append, attention, the convolution, the delta rule, the
-  sampler) read the `Step` uniform.
+- **Step-dependent kernels:** kernels that mix tokens across the step or
+  use positions (RoPE and the cache write, attention, the delta rule and the
+  conv history it advances, the sampler) read the `Step` uniform.
 - **Row-local kernels:** the rest take capacity-sized parameters, and their
   grid covers only the step's `m` rows.
-- **Logits:** the final norm's last rows are copied into the vocabulary
-  projection's input, so decoding projects one row, not 512.
+- **Logits:** decoding projects the residual stream directly, with the
+  final norm in the multiply's prologue. Otherwise the final norm's last rows
+  are copied into the projection's input, so a step projects only the rows
+  it needs, not 512.
 
 One `submit` per step keeps the step uniform unambiguous: queued writes land
 before the submission they precede.
@@ -124,9 +124,10 @@ before the submission they precede.
 ### Two kernel paths
 
 Steps of at most 4 tokens, decoding, run the **decode kernels**:
-`matvec_bf16` for every multiply, and split attention. Longer steps run the
-**prefill kernels**. The plan prebuilds every multiply and attention both
-ways, and a step picks one (`plan.Path`).
+`matvec_bf16` for every multiply, fused with what surrounds it, and split
+attention. Longer steps run the **prefill kernels**. The plan prebuilds the
+launches that differ both ways (`plan.Fork`), and a step picks one
+(`plan.Path`).
 
 Within a path, every row's arithmetic is the same whatever the step's size.
 A query walks the same key tiles from position 0, and each multiply output
@@ -146,3 +147,35 @@ Every storage binding must fit `maxStorageBufferBindingSize`, which is
   them in passes.
 - **Recurrent state** is bound per layer at offsets aligned to
   `minStorageBufferOffsetAlignment`.
+- **The stacked gate and up matrix** must fit one binding, so the decode
+  multiply can read both rows of a pair. The plan fails to build otherwise.
+
+### Fusion
+
+The plan applies the spec's fusion rules by hand. Weights that share an
+input are stacked by rows when uploaded, so each set runs as one multiply,
+and later kernels read their part of the output at a row stride:
+
+- Q (with its output gates), K and V
+- the DeltaNet projections: qkv, z, β and α
+- the FFN's gate and up
+
+| Rule | Decode kernels | Prefill kernels |
+|---|---|---|
+| RMSNorm into the next multiply | In `matvec_bf16`'s prologue: each workgroup reduces the row's sum of squares itself | A separate `rmsnorm`, which every tile reads |
+| Gate, up and SiLU-multiply | One `matvec_bf16` over row pairs | One multiply, then `silu_mul` |
+| Residual add into the output and down projections | The multiply adds into the residual stream | The same |
+| RoPE and the cache write after QKV | `rope_append` | The same |
+| DeltaNet conv, gates and L2 norm before the scan | `delta_prep` | The same |
+| Final norm and the vocabulary projection | Norm in the projection's prologue | A separate `rmsnorm` |
+
+A fusion that needs workgroups to synchronize is not legal, which rules out
+three more:
+
+- **RoPE inside the QKV multiply:** a head's norm spans the output rows of
+  32 workgroups.
+- **The gated norm inside the scan:** a head's state spans 4 workgroups.
+- **Top-k inside the vocabulary projection:** the sampler's selection runs
+  over the whole vocabulary.
+
+A decode layer is 7 dispatches. A decode step is 182, down from 441.
