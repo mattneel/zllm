@@ -75,8 +75,9 @@ range reads of a URL or a local file. The core needs only the GGUF header.
 ## Kernels
 
 Kernels live in `src/kernels/*.wgsl`, each with a uniform `Params` struct
-mirrored in `kernels.zig`. Weights stay BF16 on the GPU, packed two per `u32`
-and widened in the shader; activations and accumulation are f32.
+mirrored in `kernels.zig`. Weights stay in their GGUF format on the GPU,
+BF16 or quantized, and are decoded in the shader; activations and
+accumulation are f32.
 
 | Kernel | Work | Notes |
 |---|---|---|
@@ -91,6 +92,7 @@ and widened in the shader; activations and accumulation are f32.
 | `delta_prep` | DeltaNet front end: causal conv and SiLU, L2 norm of q and k, β and decay gates | One workgroup per (head of channels, token); inputs before the step come from the conv history |
 | `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups. Also advances the conv history |
 | `gated_norm` | The SiLU(z)-gated RMSNorm after it | One workgroup per (head, token); z read from the stacked projection |
+| `matvec_<q>`, `matmul_<q>`, `embed_<q>` | The multiplies and embedding gather on quantized weights: `q8_0`, `q3_k`, `q4_k`, `q5_k`, `q6_k` | `matvec_quant.wgsl`, `matmul_quant.wgsl` and `embed_quant.wgsl`, composed at compile time with `quant/<q>.wgsl`. That file decodes a row's 32-weight units as ggml's `dequantize_row_*` does. Byte reads throughout, as Q3_K and Q6_K blocks aren't word-aligned. The decode multiply keeps `matvec_bf16`'s fusions and normalizes inputs too wide to stage |
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling) |
 
@@ -155,6 +157,9 @@ Every storage binding must fit `maxStorageBufferBindingSize`, which is
   `minStorageBufferOffsetAlignment`.
 - **The stacked gate and up matrix** must fit one binding, so the decode
   multiply can read both rows of a pair. The plan fails to build otherwise.
+- **Weight types** are per chunk. Stacked weights share chunks while their
+  parts have one type and start new ones where it changes; each launch
+  picks its kernel from its chunk's type.
 
 ### Fusion
 
