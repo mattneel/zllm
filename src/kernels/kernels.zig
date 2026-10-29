@@ -29,6 +29,7 @@ pub const Kernel = enum {
     l2norm_heads,
     gates,
     delta_rule,
+    gated_norm,
     mark_tokens,
     sample,
 
@@ -45,6 +46,8 @@ pub const matmul_tile_t = 16;
 pub const matmul_tile_k = 32;
 /// Widest head `attention` and `delta_rule` handle.
 pub const max_head_dim = 256;
+/// State columns per `delta_rule` workgroup.
+pub const delta_cols = 32;
 /// Most convolution taps `conv_silu` handles.
 pub const max_conv_taps = 8;
 /// Sampler limits: logit-bias entries and stop tokens per request.
@@ -100,6 +103,7 @@ pub const params = struct {
     };
     /// Which phase of `sample` a launch runs.
     pub const SamplePhase = extern struct { phase: u32, round: u32 = 0, _pad: [2]u32 = @splat(0) };
+    pub const GatedNorm = extern struct { v_heads: u32, dim: u32, eps: f32, _pad: u32 = 0 };
     /// Per-request sampler parameters (`sample` and `mark_tokens`).
     pub const Sample = extern struct {
         vocab: u32,

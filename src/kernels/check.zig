@@ -530,7 +530,8 @@ fn checkDeltaRule(c: *Ctx) !Result {
     var t0: u32 = 0;
     for ([_]u32{ 20, 17 }) |m| {
         const out = try c.output(m * inner);
-        try c.launcher().launch(.delta_rule, P.DeltaRule{
+        const l = c.launcher();
+        try l.launch(.delta_rule, P.DeltaRule{
             .k_heads = hk,
             .v_heads = hv,
             .dim = d,
@@ -538,10 +539,10 @@ fn checkDeltaRule(c: *Ctx) !Result {
             .eps = eps,
         }, &.{
             try c.upload(conv[t0 * stride ..][0 .. m * stride]), try c.upload(g[t0 * hv ..][0 .. m * hv]),
-            try c.upload(beta[t0 * hv ..][0 .. m * hv]),         try c.upload(z[t0 * inner ..][0 .. m * inner]),
-            wn,                                                  state,
+            try c.upload(beta[t0 * hv ..][0 .. m * hv]),         state,
             out,                                                 try c.step(m, t0, 0),
-        }, .{ hv, 1, 1 });
+        }, .{ hv, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 });
+        try l.launch(.gated_norm, P.GatedNorm{ .v_heads = hv, .dim = d, .eps = eps }, &.{ out, try c.upload(z[t0 * inner ..][0 .. m * inner]), wn }, .{ hv, m, 1 });
         @memcpy(got[t0 * inner ..][0 .. m * inner], try c.read(out));
         t0 += m;
     }
@@ -579,7 +580,7 @@ fn checkDeltaRule(c: *Ctx) !Result {
             }
         }
     }
-    return .{ .name = "delta_rule (2 steps)", .err = relErr(got, want), .tolerance = 1e-5 };
+    return .{ .name = "delta_rule+norm (2 steps)", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 /// Gaussian logits (σ = 2): every threshold (top-k, top-p, min-p) cuts

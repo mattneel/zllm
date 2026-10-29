@@ -390,7 +390,8 @@ pub const Program = struct {
                         .dim = d,
                         .conv_stride = @intCast(conv_dim),
                         .eps = hp.rms_eps,
-                    }, &.{ conv, g, beta, z, w.norm, state, o, step }, .{ .fixed = .{ hp.gdn_v_heads, 1, 1 } }) });
+                    }, &.{ conv, g, beta, state, o, step }, .{ .fixed = .{ hp.gdn_v_heads, std.math.divCeil(u32, d, kernels.delta_cols) catch unreachable, 1 } }) });
+                    try body.append(arena, .{ .launch = try b.add(.gated_norm, P.GatedNorm{ .v_heads = hp.gdn_v_heads, .dim = d, .eps = hp.rms_eps }, &.{ o, z, w.norm }, .{ .rows_y = hp.gdn_v_heads }) });
                     try matmul(&b, arena, &body, mix, o, &w.wout, capn);
                 },
             }
