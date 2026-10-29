@@ -62,6 +62,8 @@ pub fn build(b: *std.Build) void {
     const gpu_host = b.option(enum { native, d3d12 }, "gpu-host", "Dawn host for GPU checks (default: native)") orelse .native;
     const gpu_run = addCheck(b, check_exe, fixtures, "check-gpu", "Compare the GPU forward pass with the CPU reference", "check_gpu.py");
     gpu_run.addArgs(&.{ "--host", @tagName(gpu_host) });
+    const quant_run = addCheck(b, check_exe, fixtures, "check-quant", "Compare the GPU forward pass on the quantized 27B with llama.cpp", "check_quant.py");
+    quant_run.addArgs(&.{ "--host", @tagName(gpu_host) });
 
     const kernel_step = b.step("gpu-check", "Check every GPU kernel against a CPU computation");
     switch (gpu_host) {

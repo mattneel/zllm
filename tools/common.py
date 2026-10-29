@@ -10,6 +10,8 @@ from pathlib import Path
 # Mirrors the pins in scripts/fixtures.sh.
 GGUF_FILE = "Qwen3.5-0.8B-BF16.gguf"
 HEADER_FILE = "Qwen3.5-0.8B-BF16.header.gguf"
+# The quantized model check_quant.py uses by default (fixtures.sh model27b).
+GGUF27_FILE = "RVN-Q3_K_M-mtp.gguf"
 HF_DIR = "hf/Qwen3.5-0.8B"
 CHAT_TEMPLATE = "hf/Qwen-Fixed-Chat-Templates/chat_template.jinja"
 

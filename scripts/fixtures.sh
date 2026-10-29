@@ -21,6 +21,13 @@ gguf_rev="807dfd9a6fadbf703207aac3bfb0b2b3040d077c"
 gguf_file="Qwen3.5-0.8B-BF16.gguf"
 gguf_sha256="9a7bed4041b7975e0f71fa34670d1e9025213bc92905ac0db75d36c4fa3fa623"
 
+# The M6 target: Qwen 3.8 27B at Q3_K_M, with its MTP layer (13.75 GB). Not
+# part of `all`; `model27b` fetches it.
+gguf27_repo="0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF"
+gguf27_rev="ab8d7bd81d03117501e4da60cccdff4c80f0eea0"
+gguf27_file="RVN-Q3_K_M-mtp.gguf"
+gguf27_sha256="249b354e8e0a6984c903d5c099b9e9d054c1d5580b32e8dd818273dbacdb9a2c"
+
 hf_repo="Qwen/Qwen3.5-0.8B"
 hf_rev="2fc06364715b967f1860aea9cf38778875588b17"
 hf_files=(
@@ -105,6 +112,11 @@ vocab() {
 model() {
 	fetch "https://huggingface.co/$gguf_repo/resolve/$gguf_rev/$gguf_file" \
 		"$dir/models/$gguf_file" "$gguf_sha256"
+}
+
+model27b() {
+	fetch "https://huggingface.co/$gguf27_repo/resolve/$gguf27_rev/$gguf27_file" \
+		"$dir/models/$gguf27_file" "$gguf27_sha256"
 }
 
 llama() {
@@ -200,6 +212,7 @@ dawn() {
 case "${1:-all}" in
 vocab) vocab ;;
 model) model ;;
+model27b) model27b ;;
 llama) llama ;;
 dawn) dawn ;;
 all)
@@ -209,7 +222,7 @@ all)
 	dawn
 	;;
 *)
-	log "usage: $0 [all|vocab|model|llama|dawn]"
+	log "usage: $0 [all|vocab|model|model27b|llama|dawn]"
 	exit 2
 	;;
 esac
