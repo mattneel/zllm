@@ -48,7 +48,7 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
         Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,
         Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul,
         Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantTiles,
-        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,
+        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -386,7 +386,7 @@ const Act = struct { qx: kernels.Arg, dx: kernels.Arg };
 fn quantizeX(c: *Ctx, t: gguf.TensorType, x: kernels.Arg, rows: u32, k: u32) !Act {
     const block = kernels.actBlock(t);
     const act: Act = .{ .qx = try c.output(rows * k / 4), .dx = try c.output(rows * k / block) };
-    try c.launcher().launch(.quantize_q8, P.QuantizeQ8{ .k = k, .block = block }, &.{ x, act.qx, act.dx }, .{ k / 256, rows, 1 });
+    try c.launcher().launch(.quantize_q8, P.QuantizeQ8{ .k = k, .block = block }, &.{ x, act.qx, act.dx, x }, .{ k / 256, rows, 1 });
     return act;
 }
 
@@ -415,6 +415,49 @@ fn checkQuantize(c: *Ctx, t: gguf.TensorType, name: []const u8) !Result {
         worst = @max(worst, @abs(@as(f64, got) - v) / @max(@abs(@as(f64, v)), 1e-30));
     }
     return .{ .name = name, .err = worst, .tolerance = 0 };
+}
+
+/// quantize_q8 computing its input (RMSNorm, SiLU pair) before rounding:
+/// every value must be a rounding of the f64 result to its block's step,
+/// within half a step (the GPU's sums may differ from f64 by ulps).
+fn checkQuantizeFused(c: *Ctx, mode: u32, name: []const u8) !Result {
+    const rows = 5;
+    const k = 768;
+    const width: usize = if (mode == 2) 2 * k else k;
+    const x = try c.random(rows * width, 2);
+    const nw = try c.random(k, 1);
+    const eps: f32 = 1e-6;
+    const act: Act = .{ .qx = try c.output(rows * k / 4), .dx = try c.output(rows * k / 256) };
+    const xa = try c.upload(x);
+    try c.launcher().launch(.quantize_q8, P.QuantizeQ8{ .k = k, .block = 256, .mode = mode, .eps = eps }, &.{ xa, act.qx, act.dx, try c.upload(nw) }, .{ k / 256, rows, 1 });
+    const words = try c.read(act.qx);
+    const d = try c.read(act.dx);
+    var worst: f64 = 0;
+    for (0..rows) |r| {
+        var ss: f64 = 0;
+        for (x[r * width ..][0..k]) |v| ss += @as(f64, v) * v;
+        const scale = 1 / @sqrt(ss / k + eps);
+        for (0..k) |i| {
+            const want: f64 = if (mode == 1) x[r * width + i] * scale * nw[i] else blk: {
+                const g: f64 = x[r * width + i];
+                break :blk g / (1 + @exp(-g)) * x[r * width + k + i];
+            };
+            const j = r * k + i;
+            const word: u32 = @bitCast(words[j / 4]);
+            const q: i8 = @bitCast(@as(u8, @truncate(word >> @intCast(8 * (j % 4)))));
+            const step: f64 = @abs(d[j / 256]);
+            worst = @max(worst, @abs(@as(f64, @floatFromInt(q)) * d[j / 256] - want) / (step / 2));
+        }
+    }
+    return .{ .name = name, .err = worst, .tolerance = 1.0001 };
+}
+
+fn checkQuantizeNorm(c: *Ctx) !Result {
+    return checkQuantizeFused(c, 1, "quantize_q8 of RMSNorm (steps/2)");
+}
+
+fn checkQuantizeSilu(c: *Ctx) !Result {
+    return checkQuantizeFused(c, 2, "quantize_q8 of SiLU pair (steps/2)");
 }
 
 fn checkQuantizeQ8K(c: *Ctx) !Result {

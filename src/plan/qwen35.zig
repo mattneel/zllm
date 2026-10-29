@@ -484,7 +484,6 @@ pub const Program = struct {
         }
         var delta_i: u64 = 0;
         for (m.layers, 0..) |*layer, il| {
-            const pre_norm = try b.add(.rmsnorm, norm, &.{ x, layer.attn_norm, h }, .rows_x);
             switch (layer.mixer) {
                 .attention => |*w| {
                     const kc = try a.buffer(kv_layer, .{ .storage = true });
@@ -493,7 +492,7 @@ pub const Program = struct {
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     const q_row: u32 = @intCast(qkv_row);
                     try body.append(arena, .{ .fork = .{
-                        .prefill = try concat(arena, &.{ &.{pre_norm}, try mm.tiled(qkv, h, &w.wqkv, false) }),
+                        .prefill = try mm.tiled(qkv, .{ .rmsnorm = .{ .x = x, .w = layer.attn_norm, .out = h } }, &w.wqkv, false),
                         .decode = try mm.vector(qkv, x, &w.wqkv, .{ .norm = layer.attn_norm }),
                     } });
                     try body.append(arena, .{ .launch = try b.add(.rope_append, P.RopeAppend{
@@ -518,7 +517,7 @@ pub const Program = struct {
                                 .scale = scale,
                                 .q_row = q_row,
                             }, &.{ qkv, kc, vc, att, step }, .{ .rows_y = hp.n_head })},
-                            try mm.tiled(x, att, &w.wo, true),
+                            try mm.tiled(x, .{ .plain = att }, &w.wo, true),
                         }),
                         .decode = try concat(arena, &.{
                             &.{
@@ -536,7 +535,7 @@ pub const Program = struct {
                     const hist: Arg = .{ .buffer = recurrent.buffer, .offset = base + std.mem.alignForward(u64, state_bytes, al), .size = hist_bytes };
                     const d = hp.gdn_head_dim;
                     try body.append(arena, .{ .fork = .{
-                        .prefill = try concat(arena, &.{ &.{pre_norm}, try mm.tiled(proj, h, &w.wproj, false) }),
+                        .prefill = try mm.tiled(proj, .{ .rmsnorm = .{ .x = x, .w = layer.attn_norm, .out = h } }, &w.wproj, false),
                         .decode = try mm.vector(proj, x, &w.wproj, .{ .norm = layer.attn_norm }),
                     } });
                     try body.append(arena, .{ .launch = try b.add(.delta_prep, P.DeltaPrep{
@@ -566,7 +565,7 @@ pub const Program = struct {
                         .z_off = @intCast(conv_dim),
                     }, &.{ o, proj, w.norm }, .{ .rows_y = hp.gdn_v_heads }) });
                     try body.append(arena, .{ .fork = .{
-                        .prefill = try mm.tiled(x, o, &w.wout, true),
+                        .prefill = try mm.tiled(x, .{ .plain = o }, &w.wout, true),
                         .decode = try mm.vector(x, o, &w.wout, .{ .accumulate = true }),
                     } });
                 },
@@ -574,10 +573,8 @@ pub const Program = struct {
             const ff = hp.n_ff;
             try body.append(arena, .{ .fork = .{
                 .prefill = try concat(arena, &.{
-                    &.{try b.add(.rmsnorm, norm, &.{ x, layer.post_norm, h }, .rows_x)},
-                    try mm.tiled(gu, h, &layer.ffn_gu, false),
-                    &.{try b.add(.silu_mul, P.SiluMul{ .count = capn * ff, .width = ff }, &.{ gu, act }, .{ .elems = ff })},
-                    try mm.tiled(x, act, &layer.ffn_down, true),
+                    try mm.tiled(gu, .{ .rmsnorm = .{ .x = x, .w = layer.post_norm, .out = h } }, &layer.ffn_gu, false),
+                    try mm.tiled(x, .{ .silu = .{ .gu = gu, .width = ff, .out = act } }, &layer.ffn_down, true),
                 }),
                 .decode = try concat(arena, &.{
                     try mm.vector(act, x, &layer.ffn_gu, .{ .norm = layer.post_norm, .silu_pair = ff }),
@@ -590,7 +587,7 @@ pub const Program = struct {
 
         const lm = if (m.output) |*out| out else &m.tok_embd;
         const head: Fork = .{
-            .prefill = try mm.tiled(logits, lm_in, lm, false),
+            .prefill = try mm.tiled(logits, .{ .plain = lm_in }, lm, false),
             .decode = try mm.vector(logits, x, lm, .{ .norm = m.output_norm }),
         };
 
@@ -853,13 +850,37 @@ const Mm = struct {
         silu_pair: ?u32 = null,
     };
 
-    /// out[t][j] (+)= x[t] · w[j] for the rows of a prefill step: tiled.
-    /// Quantized chunks take x rounded to 8-bit blocks (quantize_q8, once
-    /// per block size), and those with too few column tiles split over k
-    /// into `partials` and are added up by matmul_reduce.
-    fn tiled(mm: Mm, out: Arg, x: Arg, w: *const Matrix, accumulate: bool) Allocator.Error![]const kernels.Launch {
+    /// A prefill multiply's input: x as is, or computed from x by the
+    /// kernel that would otherwise run first (into `out`).
+    const Input = union(enum) {
+        plain: Arg,
+        /// RMSNorm(x) · w.
+        rmsnorm: struct { x: Arg, w: Arg, out: Arg },
+        /// silu(gate) · up over gu's rows of gate | up, `width` each.
+        silu: struct { gu: Arg, width: u32, out: Arg },
+    };
+
+    /// out[t][j] (+)= in[t] · w[j] for the rows of a prefill step: tiled.
+    /// Quantized chunks take the input rounded to 8-bit blocks
+    /// (quantize_q8, once per block size), which also computes it from
+    /// `in`, so the f32 input is only produced for BF16 chunks. Chunks with
+    /// too few column tiles split over k into `partials`, added up by
+    /// matmul_reduce.
+    fn tiled(mm: Mm, out: Arg, in: Input, w: *const Matrix, accumulate: bool) Allocator.Error![]const kernels.Launch {
         std.debug.assert(w.k % kernels.matmul_tile_k == 0);
         var list: std.ArrayList(kernels.Launch) = .empty;
+        var bf16 = false;
+        for (w.chunks) |ch| bf16 = bf16 or ch.type == .bf16;
+        const x: Arg = switch (in) {
+            .plain => |a| a,
+            .rmsnorm => |r| r.out,
+            .silu => |s| s.out,
+        };
+        if (bf16) switch (in) {
+            .plain => {},
+            .rmsnorm => |r| try list.append(mm.arena, try mm.b.add(.rmsnorm, P.RmsNorm{ .rows = mm.cap, .dim = w.k, .eps = mm.eps }, &.{ r.x, r.w, r.out }, .rows_x)),
+            .silu => |s| try list.append(mm.arena, try mm.b.add(.silu_mul, P.SiluMul{ .count = mm.cap * s.width, .width = s.width }, &.{ s.gu, s.out }, .{ .elems = s.width })),
+        };
         var rounded: [2]bool = @splat(false);
         for (w.chunks) |ch| {
             if (ch.type == .bf16) continue;
@@ -870,7 +891,12 @@ const Mm = struct {
             if (rounded[i]) continue;
             rounded[i] = true;
             const act = mm.act[i].?;
-            try list.append(mm.arena, try mm.b.add(.quantize_q8, P.QuantizeQ8{ .k = w.k, .block = block }, &.{ x, act.qx, act.dx }, .{ .rows_y = w.k / 256 }));
+            const q: P.QuantizeQ8, const src: Arg, const nw: Arg = switch (in) {
+                .plain => |a| .{ .{ .k = w.k, .block = block }, a, a },
+                .rmsnorm => |r| .{ .{ .k = w.k, .block = block, .mode = 1, .eps = mm.eps }, r.x, r.w },
+                .silu => |s| .{ .{ .k = w.k, .block = block, .mode = 2 }, s.gu, s.gu },
+            };
+            try list.append(mm.arena, try mm.b.add(.quantize_q8, q, &.{ src, act.qx, act.dx, nw }, .{ .rows_y = w.k / 256 }));
         }
         for (w.chunks) |ch| {
             const tiles = kernels.matmulTiles(ch.type);

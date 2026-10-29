@@ -1,5 +1,14 @@
 // Rounds rows of activations to 8-bit blocks for the quantized prefill
-// multiply, as llama.cpp's CPU backend rounds them for a dot product with
+// multiply, computing them first by `mode`, so the kernel that would
+// produce them needn't run:
+//
+// - 0: x as given.
+// - 1: RMSNorm of x times w (as rmsnorm.wgsl); each workgroup sums the
+//   row's squares itself.
+// - 2: silu(gate) · up over x holding rows of gate | up, each `width` wide
+//   (as silu_mul.wgsl).
+//
+// The values are rounded as llama.cpp's CPU backend rounds them for a dot product with
 // quantized weights (ref/matmul.zig, roundLikeLlama): x ≈ q · d.
 //
 // - block = 256 (Q8_K, for the K-quants): d = −max / 127, where max is the
@@ -19,14 +28,20 @@
 struct Params {
     k: u32,
     block: u32,
-    _pad1: u32,
-    _pad2: u32,
+    mode: u32,
+    eps: f32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> x: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> qx: array<u32>;
 @group(0) @binding(3) var<storage, read_write> dx: array<f32>;
+// The RMSNorm weights (mode 1; bound to anything otherwise).
+@group(0) @binding(4) var<storage, read> nw: array<vec4f>;
+
+var<workgroup> squares: array<f32, 64>;
+// The workgroup's computed values.
+var<workgroup> vals: array<vec4f, 64>;
 
 // Per thread: the largest magnitude among its values, and its index.
 var<workgroup> best: array<vec2f, 64>;
@@ -86,7 +101,32 @@ fn round_away(y: f32) -> f32 {
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u32) {
     let row = wg.y;
     let base = row * (p.k / 4u) + wg.x * 64u;
-    let v = x[base + li];
+    var v: vec4f;
+    if (p.mode == 2u) {
+        let src = row * (p.k / 2u) + wg.x * 64u + li;
+        let g = x[src];
+        v = g / (1.0 + exp(-g)) * x[src + p.k / 4u];
+    } else {
+        v = x[base + li];
+    }
+    if (p.mode == 1u) {
+        var sum = 0.0;
+        for (var i = li; i < p.k / 4u; i += 64u) {
+            let r = x[row * (p.k / 4u) + i];
+            sum += dot(r, r);
+        }
+        squares[li] = sum;
+        workgroupBarrier();
+        for (var s = 32u; s > 0u; s /= 2u) {
+            if (li < s) {
+                squares[li] += squares[li + s];
+            }
+            workgroupBarrier();
+        }
+        let scale = 1.0 / sqrt(squares[0] / f32(p.k) + p.eps);
+        v = v * scale * nw[wg.x * 64u + li];
+    }
+    vals[li] = v;
     let a = abs(v);
     // The first of the largest, as a strict > scan from the left.
     var m = vec2f(a.x, 0.0);
@@ -119,7 +159,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
     if (p.block == 256u) {
         if (lead.x != 0.0) {
             let at = u32(lead.y);
-            let max = x[base + at / 4u][at % 4u];
+            let max = vals[at / 4u][at % 4u];
             let iscale = div_rn(-127.0, max);
             d = div_rn(1.0, iscale);
             q = min(vec4f(127.0), vec4f(round_away(iscale * v.x), round_away(iscale * v.y), round_away(iscale * v.z), round_away(iscale * v.w)));

@@ -223,7 +223,13 @@ pub const params = struct {
             _: u29 = 0,
         };
     };
-    pub const QuantizeQ8 = extern struct { k: u32, block: u32, _pad: [2]u32 = @splat(0) };
+    pub const QuantizeQ8 = extern struct {
+        k: u32,
+        block: u32,
+        /// What is rounded: 0 x, 1 RMSNorm(x) · w, 2 silu(gate) · up.
+        mode: u32 = 0,
+        eps: f32 = 0,
+    };
     pub const Repad = extern struct { blocks: u32, src_bytes: u32, dst_bytes: u32, _pad: u32 = 0 };
     pub const SiluMul = extern struct { count: u32, width: u32, _pad: [2]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
