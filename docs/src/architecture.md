@@ -40,10 +40,10 @@ Modules not yet started contain only a `README.md` stating their contract.
 
 | Module | Milestone | Role |
 |---|---|---|
-| `gguf` | M0 | GGUF header, metadata, tensor index, typed tensor views, dequantization |
+| `gguf` | M0 | Zero-copy GGUF header, metadata and tensor index over a borrowed byte slice (mmap or staged prefix) |
 | `tokenizer` | M0 | Byte-level BPE built from `tokenizer.ggml.*` metadata |
 | `graph` | M0 | Architecture hyperparameters and layer schedule from GGUF metadata |
-| `ref` | M0 | CPU f32 reference forward pass; the correctness oracle for every GPU kernel |
+| `ref` | M0 | Dequantization to f32 and the CPU f32 reference forward pass; the correctness oracle for every GPU kernel |
 | `tmpl` | M4 | Handlebars-subset WGSL template renderer |
 | `kernels` | M1 | `*.wgsl.hbs` templates with parameter schemas and cost models |
 | `tune` | M4 | Load-time candidate sweeps |
