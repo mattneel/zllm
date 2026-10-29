@@ -16,6 +16,12 @@ sample the next token on the GPU ([Generation](generation.md)).
 | Windows, run from WSL | Dawn → D3D12 | RTX 5090 Laptop | Local parity and timing |
 | Browser | Chrome's Dawn → D3D12/Metal/Vulkan | RTX 5090 Laptop (D3D12) | The product ([Browser](browser.md)) |
 
+The spec targets D3D12, Metal and Vulkan. D3D12 runs on the 5090 and
+Vulkan on llvmpipe in CI; Metal and hardware Vulkan haven't been run, for
+want of the hardware. The kernels use only core WebGPU plus `shader-f16`
+where available and the packed 4×8 integer builtins, which all three
+backends offer.
+
 Dawn comes from the pinned prebuilt release. Its static archive is wrapped
 into a shared library (`libwebgpu_dawn.so`, `webgpu_dawn.dll`) that exports
 exactly the `webgpu.h` C API, and zllm loads it at run time. zllm never links
