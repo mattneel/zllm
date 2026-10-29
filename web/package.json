@@ -1,0 +1,18 @@
+{
+  "name": "@zllm/web",
+  "private": true,
+  "type": "module",
+  "description": "Browser-side TypeScript for zllm: the book's scripts now, the JS shim and facade from M3",
+  "scripts": {
+    "check": "biome check . && tsc --noEmit",
+    "fix": "biome check --write .",
+    "build:book": "bun build src/book/mermaid.ts --target browser --format iife --minify --outfile ../docs/theme/mermaid-init.js"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.4",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "mermaid": "11.12.1"
+  }
+}

@@ -8,8 +8,9 @@ zig-pkg/
 tools/.venv/
 __pycache__/
 
-# mdBook output
+# mdBook output, and book scripts bundled from web/ (`bun run build:book`)
 docs/book/
+docs/theme/mermaid-init.js
 
 # TypeScript
 node_modules/
