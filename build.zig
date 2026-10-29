@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
     else
         b.path(".fixtures");
     addCheck(b, exe, fixtures, "check-gguf", "Compare the GGUF index with llama.cpp gguf-dump", "check_gguf.py");
+    addCheck(b, exe, fixtures, "check-tokenizer", "Compare tokenization with Hugging Face tokenizers", "check_tokenizer.py");
 }
 
 fn addCheck(
