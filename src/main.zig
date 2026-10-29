@@ -9,6 +9,7 @@ const gen = @import("generate.zig");
 const engine_check = @import("engine_check.zig");
 const bench = @import("bench.zig");
 const profile = @import("profile.zig");
+const soak = @import("soak.zig");
 
 const usage =
     \\usage: zllm <command> [args]
@@ -35,6 +36,8 @@ const usage =
     \\  profile <model.gguf> [tokens] [at]   GPU time per kernel (timestamp queries) over prefill
     \\                                       steps of `tokens` (default 32) from position `at`
     \\                                       (default 0), then decode steps
+    \\  soak <model.gguf> [minutes]          requests of every shape for `minutes` (default 10):
+    \\                                       fails on a device error or a submission past 250 ms
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
@@ -87,12 +90,13 @@ pub fn main(init: std.process.Init) !void {
         else
             .f32;
         try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4], act);
-    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check") or std.mem.eql(u8, cmd, "bench") or std.mem.eql(u8, cmd, "profile")) {
+    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check") or std.mem.eql(u8, cmd, "bench") or std.mem.eql(u8, cmd, "profile") or std.mem.eql(u8, cmd, "soak")) {
         const is_chat = std.mem.eql(u8, cmd, "chat");
         const is_check = std.mem.eql(u8, cmd, "engine-check");
         const is_bench = std.mem.eql(u8, cmd, "bench");
         const is_profile = std.mem.eql(u8, cmd, "profile");
-        var fixed: usize = if (is_chat or is_check or ((is_bench or is_profile) and args.len == 3)) 3 else 4;
+        const is_soak = std.mem.eql(u8, cmd, "soak");
+        var fixed: usize = if (is_chat or is_check or ((is_bench or is_profile or is_soak) and args.len == 3)) 3 else 4;
         // profile takes a second positional argument.
         if (is_profile and args.len > 4 and !std.mem.startsWith(u8, args[4], "--")) fixed = 5;
         if (args.len < fixed) return fail(usage);
@@ -113,7 +117,10 @@ pub fn main(init: std.process.Init) !void {
         const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
         defer rt.destroy();
         std.debug.print("[{s}; loaded in {d} ms; context {d}, {t} KV]\n", .{ rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
-        if (is_profile) {
+        if (is_soak) {
+            const minutes = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 10;
+            if (!try soak.run(rt, minutes, out)) return error.SoakFailed;
+        } else if (is_profile) {
             const chunk = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 32;
             const at = if (args.len > 4) std.fmt.parseInt(u32, args[4], 10) catch return fail(usage) else 0;
             if (chunk == 0) return fail(usage);
