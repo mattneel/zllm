@@ -10,6 +10,12 @@
 //!         .done => |d| break,
 //!     }
 //!
+//! `cancel` ends a request between batches: the batch in flight completes
+//! (and a token it sampled is still emitted), then `.done` reports `abort`.
+//! Every token a completed step processed stays resident, so the state is as
+//! consistent as after any other finish. Text the stream was holding back
+//! (an incomplete UTF-8 sequence or a possible stop string) is dropped.
+//!
 //! Prefill chunks are the largest token count whose predicted cost fits the
 //! submission budget. The prediction is linear, fixed + per_token · m: the
 //! fixed part is measured on one-token steps (calibration before the first
@@ -60,6 +66,8 @@ pub const Finish = enum {
     stop,
     /// max_tokens, or the context is full.
     length,
+    /// `cancel`.
+    abort,
 };
 
 pub const Usage = struct {
@@ -110,6 +118,7 @@ pub const Engine = struct {
     sampled: [2]u32 = .{ 0, 0 },
     pending: ?Pending = null,
     finish: ?Finish = null,
+    cancelled: bool = false,
 
     const Phase = enum { idle, prefill, decode, emit, done };
     const Pending = struct { tokens: u32, samples: bool, prefill: bool };
@@ -185,11 +194,24 @@ pub const Engine = struct {
         e.prefill_pos = r.start;
         e.pending = null;
         e.finish = null;
+        e.cancelled = false;
         e.phase = .prefill;
+    }
+
+    /// Ends the running request after the batch in flight (see above).
+    pub fn cancel(e: *Engine) void {
+        switch (e.phase) {
+            .prefill, .decode, .emit => e.cancelled = true,
+            .idle, .done => {},
+        }
     }
 
     pub fn next(e: *Engine) Error!Event {
         if (e.pending != null) return error.NotSubmitted;
+        if (e.cancelled and e.finish == null and (e.phase == .prefill or e.phase == .decode)) {
+            e.finish = .abort;
+            e.phase = .done;
+        }
         switch (e.phase) {
             .idle => return error.NotSubmitted,
             .prefill => {
@@ -201,6 +223,7 @@ pub const Engine = struct {
                 return .{ .submit = e.rec.batch() };
             },
             .emit => {
+                if (e.cancelled and e.finish == null) e.finish = .abort;
                 e.phase = if (e.finish == null) .decode else .done;
                 return .{ .token = .{ .id = e.sampled[0], .text = e.text.items } };
             },

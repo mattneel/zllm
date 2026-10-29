@@ -7,6 +7,10 @@
 //! turn reuses replies that went through the decode kernels, so it matches
 //! within a rounding tolerance. Prompts are seeded random
 //! token ids; sampling is seeded, with no stop tokens.
+//!
+//! Two scenarios cancel a request first, in decode and in prefill. The
+//! cancelled request must finish with `abort`, and the next prompt must
+//! reuse exactly the tokens its completed steps processed.
 
 const std = @import("std");
 const Io = std.Io;
@@ -39,6 +43,39 @@ const Check = struct {
         }, &discard.writer, &text, &ids);
         if (t.usage.completion_tokens != n_gen) return error.ShortGeneration;
         return .{ .tokens = try c.arena.dupe(u32, ids.items), .logits = logits, .cached = t.usage.cached_tokens };
+    }
+
+    /// Runs `prompt` and cancels it after `tokens` sampled tokens, or with
+    /// null after its first prefill step. Returns the sampled tokens and
+    /// the resident sequence length, or null (reported) if the request did
+    /// not end as cancelled.
+    fn cancelled(c: *Check, name: []const u8, prompt: []const u32, tokens: ?u32) !?struct { tokens: []u32, resident: u32 } {
+        const e = &c.rt.engine;
+        var ids: std.ArrayList(u32) = .empty;
+        try e.start(.{ .prompt = prompt, .max_tokens = n_gen, .sampling = .{ .temperature = 1.0, .top_k = 50, .seed = 7 } });
+        var steps: u32 = 0;
+        const d = while (true) switch (try e.next()) {
+            .submit => |words| {
+                const t0 = Io.Timestamp.now(c.rt.io, .awake);
+                try c.rt.execute(words);
+                try e.complete(@intCast(t0.durationTo(Io.Timestamp.now(c.rt.io, .awake)).toNanoseconds()));
+                steps += 1;
+                if (tokens == null and steps == 1) e.cancel();
+            },
+            .token => |t| {
+                try ids.append(c.arena, t.id);
+                if (tokens) |n| if (ids.items.len == n) e.cancel();
+            },
+            .done => |d| break d,
+        };
+        const want: u32 = tokens orelse 0;
+        const ok = d.finish == .abort and d.usage.completion_tokens == want;
+        if (!ok) {
+            c.ok = false;
+            try c.out.print("FAIL {s:<34} finished {t} after {d} tokens (want abort after {d})\n", .{ name, d.finish, d.usage.completion_tokens, want });
+            return null;
+        }
+        return .{ .tokens = ids.items, .resident = @intCast(e.resident().len) };
     }
 
     /// Runs `prompt` on the state earlier scenarios left, then fresh. With
@@ -122,5 +159,16 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
     _ = try c.scenario("same prompt again", diverged, @intCast(diverged.len - 1), true);
     _ = try c.run(other);
     _ = try c.scenario("unrelated prompt after another", p1, 0, true);
+
+    // Cancelled in decode after 3 tokens: the prompt and the first 2 sampled
+    // tokens are resident (the third was never processed).
+    if (try c.cancelled("cancel in decode", other, 3)) |r| {
+        const next = try std.mem.concat(arena, u32, &.{ other, r.tokens, p1[0..30] });
+        _ = try c.scenario("prompt after a cancelled decode", next, @intCast(other.len + 2), false);
+    }
+    // Cancelled after the first prefill step: that chunk is resident.
+    if (try c.cancelled("cancel in prefill", p1, null)) |r| {
+        _ = try c.scenario("prompt after a cancelled prefill", p1, r.resident, true);
+    }
     return c.ok;
 }
