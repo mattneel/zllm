@@ -82,7 +82,7 @@ range reads of a URL or a local file. The core needs only the GGUF header.
 
 Kernels live in `src/kernels/*.wgsl`, each with a uniform `Params` struct
 mirrored in `kernels.zig`. Weights stay in their GGUF format on the GPU,
-BF16 or quantized, and are decoded in the shader; activations and
+BF16, F16 or quantized, and are decoded in the shader; activations and
 accumulation are f32, except that the quantized prefill multiplies round
 their input to 8 bits as llama.cpp does (below). Two changes to the
 format, made at load: Q6_K blocks (210 bytes) are padded to 224, so every
@@ -93,10 +93,10 @@ unit decodes from one load (128 bytes per block).
 
 | Kernel | Work | Notes |
 |---|---|---|
-| `embed_bf16` | Token embedding gather | Per table chunk |
+| `embed_bf16`, `embed_f16` | Token embedding gather | Per table chunk |
 | `rmsnorm` | Row RMSNorm | One workgroup per row |
-| `matmul_bf16` | x · Wᵀ, prefill | 16 tokens × 64 outputs per workgroup; tiles staged in workgroup memory. Optionally adds into the output (the residual) |
-| `matvec_bf16` | x · Wᵀ, decode | 8 rows per workgroup, each row's dot product over 32 lanes reading 16-byte weight vectors, then a fixed tree. Optionally RMSNorms the staged input first, adds into the output, or computes SiLU(gate) · up over stacked gate and up rows |
+| `matmul_bf16`, `matmul_f16` | x · Wᵀ, prefill | 16 tokens × 64 outputs per workgroup; tiles staged in workgroup memory. Optionally adds into the output (the residual) |
+| `matvec_bf16`, `matvec_f16` | x · Wᵀ, decode | The half-precision kernels are `matvec_half.wgsl`, `matmul_half.wgsl` and `embed_half.wgsl`, composed with `half/bf16.wgsl` or `half/f16.wgsl`, which widen a word's two values. 8 rows per workgroup, each row's dot product over 32 lanes reading 16-byte weight vectors, then a fixed tree. Optionally RMSNorms the staged input first, adds into the output, or computes SiLU(gate) · up over stacked gate and up rows |
 | `silu_mul` | SwiGLU over the stacked gate and up projection, prefill | Elementwise |
 | `rope_append` | Q/K RMSNorm, partial NeoX RoPE at positions pos0 + t, and the K/V cache write | One workgroup per (head, token) of the stacked Q, K, V projection. Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π]. The cache holds f16 pairs (`pack2x16float`) or f32 |
 | `attn_split`, `attn_combine` | Causal GQA over the cache, with the sigmoid output gate (flash-decoding) | One workgroup per (KV head, 64 cache positions, token) scores the block for the whole GQA group and takes a local softmax; the combine merges the blocks. Prefill steps run them in chunks of 32 tokens, so the partials hold one chunk; a token's result depends only on its position. The 27B's prefill attention at position 5,000 dropped from 96 to 61 ms a step when this replaced a kernel with one workgroup per (head, query) |

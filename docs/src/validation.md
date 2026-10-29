@@ -165,10 +165,10 @@ errors to within a factor of 2.
 | Kernel | Max relative error | Tolerance |
 |---|---|---|
 | rmsnorm | 1.6e-7 | 1e-6 |
-| matmul_bf16 (single; 2-chunk accumulating) | 1.3e-6 | 1e-5 |
-| matvec_bf16 (2-chunk; 2-chunk with norm and accumulate; norm and SiLU pair), 3 tokens | 1.9e-7 | 1e-5 |
+| matmul_bf16 (single; 2-chunk accumulating), matmul_f16 | 1.3e-6 | 1e-5 |
+| matvec_bf16 (2-chunk; 2-chunk with norm and accumulate; norm and SiLU pair), matvec_f16 (with norm and accumulate; SiLU pair), 3 tokens | 1.9e-7 | 1e-5 |
 | silu_mul | 1.4e-7 | 1e-6 |
-| embed_bf16 | 0 | 0 |
+| embed_bf16, embed_f16 | 0 | 0 |
 | rope_append, f32 cache | 9.3e-8 | 1e-5 |
 | rope_append, f16 cache | 5.6e-4 | 1e-3 (one f16 step) |
 | attention in 3 chunks, f32 and f16 cache | 3.0e-7 | 1e-5 |
