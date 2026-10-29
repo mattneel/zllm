@@ -32,8 +32,9 @@ const usage =
     \\  gpu-check                           check every GPU kernel against a CPU computation
     \\  bench <model.gguf> [tokens]          time decode steps after a context of `tokens` (default
     \\                                       1024), and each kernel's share of a step
-    \\  profile <model.gguf> [tokens]        GPU time per kernel (timestamp queries) over prefill
-    \\                                       steps of `tokens` (default 32), then decode steps
+    \\  profile <model.gguf> [tokens] [at]   GPU time per kernel (timestamp queries) over prefill
+    \\                                       steps of `tokens` (default 32) from position `at`
+    \\                                       (default 0), then decode steps
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
@@ -91,7 +92,9 @@ pub fn main(init: std.process.Init) !void {
         const is_check = std.mem.eql(u8, cmd, "engine-check");
         const is_bench = std.mem.eql(u8, cmd, "bench");
         const is_profile = std.mem.eql(u8, cmd, "profile");
-        const fixed: usize = if (is_chat or is_check or ((is_bench or is_profile) and args.len == 3)) 3 else 4;
+        var fixed: usize = if (is_chat or is_check or ((is_bench or is_profile) and args.len == 3)) 3 else 4;
+        // profile takes a second positional argument.
+        if (is_profile and args.len > 4 and !std.mem.startsWith(u8, args[4], "--")) fixed = 5;
         if (args.len < fixed) return fail(usage);
         var opts = gen.Options.parse(arena, args[fixed..]) catch |err| switch (err) {
             error.InvalidUsage => return fail(usage),
@@ -112,8 +115,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[{s}; loaded in {d} ms; context {d}, {t} KV]\n", .{ rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
         if (is_profile) {
             const chunk = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 32;
+            const at = if (args.len > 4) std.fmt.parseInt(u32, args[4], 10) catch return fail(usage) else 0;
             if (chunk == 0) return fail(usage);
-            try profile.run(rt, chunk, out);
+            try profile.run(rt, chunk, at, out);
         } else if (is_bench) {
             const fill = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 1024;
             if (fill == 0 or fill >= opts.context) return fail(usage);

@@ -1,6 +1,7 @@
 //! `zllm profile`: GPU time per kernel, from timestamp queries around every
-//! dispatch (Host.startProfile). It runs prefill steps of `chunk` random
-//! tokens, then decode steps with sampling, and reports each kernel's time
+//! dispatch (Host.startProfile). After filling the context to `at` tokens,
+//! it runs prefill steps of `chunk` random tokens, then decode steps with
+//! sampling, and reports each kernel's time
 //! per step. Each dispatch then runs in its own compute pass, so the totals
 //! can exceed an unprofiled step, which is timed too for comparison.
 
@@ -13,7 +14,7 @@ const Kernel = zllm.kernels.Kernel;
 const prefill_steps = 6;
 const decode_steps = 16;
 
-pub fn run(rt: *gen.Runtime, chunk: u32, out: *Io.Writer) !void {
+pub fn run(rt: *gen.Runtime, chunk: u32, at: u32, out: *Io.Writer) !void {
     const gpa = rt.gpa;
     const p = &rt.program;
     var rec: zllm.gpu.cmd.Recorder = .{};
@@ -22,7 +23,7 @@ pub fn run(rt: *gen.Runtime, chunk: u32, out: *Io.Writer) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const total = chunk * (prefill_steps + 1);
+    const total = at + chunk * (prefill_steps + 1);
     if (total + decode_steps * 2 > p.cfg.context or chunk > p.cfg.max_tokens) return error.ChunkTooLarge;
     var prng: std.Random.DefaultPrng = .init(1);
     const tokens = try arena.alloc(u32, total);
@@ -31,9 +32,17 @@ pub fn run(rt: *gen.Runtime, chunk: u32, out: *Io.Writer) !void {
     try p.recordReset(gpa, &rec);
     try p.recordRequest(gpa, &rec, .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .presence_penalty = 1.5 }, tokens, &.{});
 
-    // One unprofiled step to warm up and to time a normal step.
+    // Fill to `at`, unprofiled, in steps of `chunk`.
     var pos: u32 = 0;
-    try p.recordStep(gpa, &rec, .{ .pos0 = pos, .tokens = tokens[0..chunk] });
+    while (pos < at) {
+        const m = @min(chunk, at - pos);
+        try p.recordStep(gpa, &rec, .{ .pos0 = pos, .tokens = tokens[pos..][0..m] });
+        try rec.submit(gpa, 1);
+        _ = try time(rt, &rec);
+        pos += m;
+    }
+    // One unprofiled step to warm up and to time a normal step.
+    try p.recordStep(gpa, &rec, .{ .pos0 = pos, .tokens = tokens[pos..][0..chunk] });
     try rec.submit(gpa, 1);
     const plain_prefill = try time(rt, &rec);
     pos += chunk;
@@ -48,7 +57,7 @@ pub fn run(rt: *gen.Runtime, chunk: u32, out: *Io.Writer) !void {
         pos += chunk;
     }
     try out.print("{s}: prefill steps of {d} tokens at positions {d}..{d}: {d:.2} ms per step unprofiled, {d:.2} ms profiled\n", .{
-        rt.adapter, chunk, chunk, pos, ms(plain_prefill), ms(wall / prefill_steps),
+        rt.adapter, chunk, at + chunk, pos, ms(plain_prefill), ms(wall / prefill_steps),
     });
     try report(rt, prefill_steps, out);
 
