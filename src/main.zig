@@ -1,71 +1,111 @@
+//! zllm command-line tool. Subcommands produce machine-readable output for
+//! the parity harness in tools/.
+
 const std = @import("std");
 const Io = std.Io;
-
 const zllm = @import("zllm");
 
+const usage =
+    \\usage: zllm <command> [args]
+    \\
+    \\commands:
+    \\  gguf-index <model.gguf>   print header, metadata and tensor index as JSON
+    \\
+;
+
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
-
-    // In order to do I/O operations need an `Io` instance.
+    const arena = init.arena.allocator();
+    const gpa = init.gpa;
     const io = init.io;
+    const args = try init.minimal.args.toSlice(arena);
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var stdout: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
+    const out = &stdout.interface;
 
-    try zllm.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    if (args.len < 2) return fail(usage);
+    const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "gguf-index")) {
+        if (args.len != 3) return fail(usage);
+        const mapped = try mapFile(io, args[2]);
+        defer std.posix.munmap(mapped);
+        var file = try zllm.gguf.parse(gpa, mapped, true);
+        defer file.deinit(gpa);
+        try writeIndexJson(out, file);
+    } else {
+        return fail(usage);
+    }
+    try out.flush();
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+fn fail(msg: []const u8) error{InvalidUsage} {
+    std.debug.print("{s}", .{msg});
+    return error.InvalidUsage;
 }
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
+fn mapFile(io: Io, path: []const u8) ![]align(std.heap.page_size_min) const u8 {
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const len = try file.length(io);
+    return std.posix.mmap(null, @intCast(len), .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
 }
 
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try running `zig build test --fuzz` and see if it manages to fail this test case!
+/// JSON shape mirrored by tools/check_gguf.py. Arrays are summarized by type,
+/// length and a SHA-256 of their encoded elements so vocab arrays stay small.
+fn writeIndexJson(w: *Io.Writer, f: zllm.gguf.File) !void {
+    var s: std.json.Stringify = .{ .writer = w, .options = .{ .whitespace = .indent_1 } };
+    try s.beginObject();
+    try s.objectField("version");
+    try s.write(f.version);
+    try s.objectField("alignment");
+    try s.write(f.alignment);
+    try s.objectField("data_offset");
+    try s.write(f.data_offset);
 
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+    try s.objectField("metadata");
+    try s.beginObject();
+    for (f.metadata) |kv| {
+        try s.objectField(kv.key);
+        try s.beginObject();
+        try s.objectField("type");
+        try s.write(@tagName(kv.value));
+        try s.objectField("value");
+        switch (kv.value) {
+            .array => |a| {
+                try s.beginObject();
+                try s.objectField("elem_type");
+                try s.write(@tagName(a.elem_type));
+                try s.objectField("len");
+                try s.write(a.len);
+                var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(a.bytes, &digest, .{});
+                try s.objectField("sha256");
+                try s.print("\"{x}\"", .{&digest});
+                try s.endObject();
+            },
+            inline else => |v| try s.write(v),
+        }
+        try s.endObject();
+    }
+    try s.endObject();
+
+    try s.objectField("tensors");
+    try s.beginArray();
+    for (f.tensors) |t| {
+        try s.beginObject();
+        try s.objectField("name");
+        try s.write(t.name);
+        try s.objectField("type");
+        try s.write(@tagName(t.type));
+        try s.objectField("shape");
+        try s.write(t.shape());
+        try s.objectField("offset");
+        try s.write(f.data_offset + t.offset);
+        try s.objectField("bytes");
+        try s.write(t.byteSize());
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+    try w.writeByte('\n');
 }
