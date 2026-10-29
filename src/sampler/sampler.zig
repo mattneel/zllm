@@ -76,10 +76,17 @@ pub const Params = struct {
         return s;
     }
 
-    /// The bias list as the GPU reads it: (token, f32 bits) pairs.
+    /// The bias list as the GPU reads it: (token, f32 bits) pairs, sorted
+    /// by token for its binary search.
     pub fn biasWords(p: Params, out: [][2]u32) [][2]u32 {
-        for (p.logit_bias, out[0..p.logit_bias.len]) |b, *w| w.* = .{ b.token, @bitCast(b.bias) };
-        return out[0..p.logit_bias.len];
+        const words = out[0..p.logit_bias.len];
+        for (p.logit_bias, words) |b, *w| w.* = .{ b.token, @bitCast(b.bias) };
+        std.mem.sortUnstable([2]u32, words, {}, struct {
+            fn lessThan(_: void, a: [2]u32, b: [2]u32) bool {
+                return a[0] < b[0];
+            }
+        }.lessThan);
+        return words;
     }
 };
 

@@ -244,12 +244,17 @@ pub const Program = struct {
     prompt_ids: Arg,
     prompt_mask: Arg,
     counts: Arg,
-    sample_out: Arg,
+    /// The sampler's state; the drawn token and its stop flag come first.
+    sample_state: Arg,
 
     body: []const Item,
     head: []const kernels.Launch,
     mark: kernels.Launch,
-    sample: kernels.Launch,
+    /// One launch per sampler phase and round.
+    sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch),
+    /// The phases the current request's draws run: the first `sample_len`.
+    sample_steps: [kernels.max_sample_steps]kernels.SampleStep = undefined,
+    sample_len: usize = 0,
 
     // Upload staging, alive until the batch that writes it has executed.
     step_value: P.Step = .{ .m = 0, .pos0 = 0, .u = 0 },
@@ -317,7 +322,7 @@ pub const Program = struct {
         const prompt_mask = try a.storage(hp.vocab);
         const counts = try a.storage(hp.vocab);
         const work = try a.storage(hp.vocab);
-        const sample_out = try a.storage(4);
+        const sample_state = try a.storage(kernels.sampleStateWords(hp.vocab));
 
         var b: kernels.Builder = .{ .gpa = gpa, .arena = arena, .rec = rec, .set = set };
         defer b.deinit();
@@ -406,7 +411,21 @@ pub const Program = struct {
         for (head.items, head_launches) |item, *l| l.* = item.launch;
 
         const mark = try b.addWith(.mark_tokens, sample_params, &.{ prompt_ids, prompt_mask }, .{ .elems = 1 });
-        const sample = try b.addWith(.sample, sample_params, &.{ logits, bias, prompt_mask, counts, work, sample_out, token_ids, step }, .{ .fixed = .{ 1, 1, 1 } });
+        var sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch) = undefined;
+        for (std.enums.values(kernels.SamplePhase)) |phase| {
+            const groups: u32 = if (phase.wide()) kernels.sampleGroups(hp.vocab) else 1;
+            const rounds: u32 = if (phase == .hist or phase == .digit) 4 else 1;
+            for (sample.getPtr(phase), 0..) |*l, r| {
+                // Phases with one round reuse round 0's launch.
+                if (r >= rounds) {
+                    l.* = sample.get(phase)[0];
+                    continue;
+                }
+                l.* = try b.add(.sample, P.SamplePhase{ .phase = @backingInt(phase), .round = @intCast(r) }, &.{
+                    logits, bias, prompt_mask, counts, work, sample_state, token_ids, step, sample_params,
+                }, .{ .fixed = .{ groups, 1, 1 } });
+            }
+        }
         try b.finish();
 
         return .{
@@ -425,7 +444,7 @@ pub const Program = struct {
             .prompt_ids = prompt_ids,
             .prompt_mask = prompt_mask,
             .counts = counts,
-            .sample_out = sample_out,
+            .sample_state = sample_state,
             .body = body.items,
             .head = head_launches,
             .mark = mark,
@@ -455,6 +474,7 @@ pub const Program = struct {
     pub fn recordRequest(p: *Program, gpa: Allocator, rec: *cmd.Recorder, params: sampler.Params, prompt: []const u32, stops: []const u32) Allocator.Error!void {
         std.debug.assert(prompt.len <= p.cfg.context);
         p.sample_value = params.gpu(p.hp.vocab, @intCast(prompt.len), stops);
+        p.sample_len = kernels.sampleSteps(p.sample_value, &p.sample_steps).len;
         try rec.writeBuffer(gpa, p.sample_params.buffer, 0, std.mem.asBytes(&p.sample_value));
         const biases = params.biasWords(p.bias_stage);
         if (biases.len > 0) try rec.writeBuffer(gpa, p.bias.buffer, 0, std.mem.sliceAsBytes(biases));
@@ -525,8 +545,9 @@ pub const Program = struct {
         }
 
         if (s.draw != null) {
-            try p.sample.record(gpa, rec, 1);
-            try rec.readBuffer(gpa, read_token, p.sample_out.buffer, 0, std.mem.asBytes(s.sampled.?));
+            std.debug.assert(p.sample_len > 0);
+            for (p.sample_steps[0..p.sample_len]) |ss| try p.sample.get(ss.phase)[ss.round].record(gpa, rec, 1);
+            try rec.readBuffer(gpa, read_token, p.sample_state.buffer, 0, std.mem.asBytes(s.sampled.?));
         }
     }
 };

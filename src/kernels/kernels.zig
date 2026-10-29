@@ -50,6 +50,10 @@ pub const max_conv_taps = 8;
 /// Sampler limits: logit-bias entries and stop tokens per request.
 pub const max_bias = 1024;
 pub const max_stops = 16;
+/// Tokens per workgroup in the sampler's vocabulary-wide phases.
+pub const sample_span = 1024;
+/// Most candidates the sampler sorts in workgroup memory (top-k ≤ this).
+pub const sample_cap = 1024;
 
 pub const params = struct {
     /// Per-step values, shared by every launch of a step.
@@ -94,6 +98,8 @@ pub const params = struct {
         eps: f32,
         _pad: [3]u32 = @splat(0),
     };
+    /// Which phase of `sample` a launch runs.
+    pub const SamplePhase = extern struct { phase: u32, round: u32 = 0, _pad: [2]u32 = @splat(0) };
     /// Per-request sampler parameters (`sample` and `mark_tokens`).
     pub const Sample = extern struct {
         vocab: u32,
@@ -111,6 +117,80 @@ pub const params = struct {
         stops: [max_stops]u32,
     };
 };
+
+/// The phases of `sample.wgsl`, in its numbering.
+pub const SamplePhase = enum(u32) {
+    prep,
+    reduce,
+    hist,
+    digit,
+    gather,
+    final,
+    mass,
+    pick,
+    bisect_init,
+    bisect_mass,
+    bisect_step,
+
+    /// Whether the phase runs one workgroup per `sample_span` tokens.
+    pub fn wide(ph: SamplePhase) bool {
+        return switch (ph) {
+            .prep, .hist, .gather, .mass, .bisect_mass => true,
+            else => false,
+        };
+    }
+};
+
+pub const SampleStep = struct { phase: SamplePhase, round: u32 = 0 };
+/// Bisection rounds for top-p without a small top-k: one per key bit.
+pub const sample_bisect_rounds = 32;
+pub const max_sample_steps = 2 + 2 * 4 + 4 + 2 * sample_bisect_rounds;
+
+/// The phases one draw runs for a request's parameters.
+pub fn sampleSteps(s: params.Sample, out: *[max_sample_steps]SampleStep) []SampleStep {
+    var n: usize = 0;
+    const add = struct {
+        fn f(o: *[max_sample_steps]SampleStep, i: *usize, ph: SamplePhase, round: u32) void {
+            o[i.*] = .{ .phase = ph, .round = round };
+            i.* += 1;
+        }
+    }.f;
+    add(out, &n, .prep, 0);
+    add(out, &n, .reduce, 0);
+    if (s.greedy != 0) return out[0..n];
+    const top_k = s.top_k > 0;
+    if (top_k) for (0..4) |r| {
+        add(out, &n, .hist, @intCast(r));
+        add(out, &n, .digit, @intCast(r));
+    };
+    if (s.top_p < 1 and top_k and s.top_k <= sample_cap) {
+        add(out, &n, .gather, 0);
+        add(out, &n, .final, 0);
+        return out[0..n];
+    }
+    if (s.top_p < 1) {
+        add(out, &n, .mass, 0);
+        add(out, &n, .bisect_init, 0);
+        for (0..sample_bisect_rounds) |_| {
+            add(out, &n, .bisect_mass, 0);
+            add(out, &n, .bisect_step, 0);
+        }
+    }
+    add(out, &n, .mass, 0);
+    add(out, &n, .pick, 0);
+    return out[0..n];
+}
+
+/// Workgroups of a vocabulary-wide sampler phase.
+pub fn sampleGroups(vocab: u32) u32 {
+    return std.math.divCeil(u32, vocab, sample_span) catch unreachable;
+}
+
+/// Words of the sampler's state buffer; the drawn token and its stop flag
+/// are the first two.
+pub fn sampleStateWords(vocab: u32) u32 {
+    return 16 + 256 + 2 * sampleGroups(vocab) + 2 * sample_cap;
+}
 
 /// RoPE (cos, sin) for positions [0, positions) and the n_rot/2 rotation
 /// pairs, as `qk_norm_rope` reads it. Same formula as the CPU reference.

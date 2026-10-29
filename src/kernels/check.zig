@@ -37,12 +37,11 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,      checkMatmul,       checkMatmulChunked, checkSiluMul,
-        checkAdd,          checkEmbed,        checkQkNormRope,    checkKvAppendF16,
-        checkAttentionF32, checkAttentionF16, checkConvSilu,      checkL2Norm,
-        checkGates,        checkDeltaRule,    checkSampleGreedy,  checkSampleTopKTopP,
-        checkSampleMinP,   checkSampleTopP,   checkSamplePlain,   checkSampleTopK1,
-        checkSampleVocab,
+        checkRmsNorm,         checkMatmul,            checkMatmulChunked, checkSiluMul,      checkAdd,
+        checkEmbed,           checkQkNormRope,        checkKvAppendF16,   checkAttentionF32, checkAttentionF16,
+        checkConvSilu,        checkL2Norm,            checkGates,         checkDeltaRule,    checkSampleGreedy,
+        checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,    checkSamplePlain,  checkSampleTopK1,
+        checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -614,13 +613,16 @@ fn sampleCase(c: *Ctx, name: []const u8, vocab: u32, p: sampler.Params, trials: 
 
     var bias_words: [kernels.max_bias][2]u32 = undefined;
     const biases = p.biasWords(&bias_words);
-    const params = try c.uniform(p.gpu(vocab, 0, &stops));
+    const block = p.gpu(vocab, 0, &stops);
+    const params = try c.uniform(block);
+    var steps_buf: [kernels.max_sample_steps]kernels.SampleStep = undefined;
+    const steps = kernels.sampleSteps(block, &steps_buf);
     const la = try c.upload(logits);
     const ba = try c.upload(if (biases.len > 0) biases else &[_][2]u32{.{ 0, 0 }});
     const pa = try c.upload(prompt_words);
     const ca = try c.output(vocab);
     const work = try c.output(vocab);
-    const out = try c.output(4);
+    const state = try c.output(kernels.sampleStateWords(vocab));
     const next = try c.output(4);
 
     var draws: sampler.Draws = .init(p.seed);
@@ -629,8 +631,14 @@ fn sampleCase(c: *Ctx, name: []const u8, vocab: u32, p: sampler.Params, trials: 
     for (0..trials) |_| {
         const u = draws.next();
         try c.rec.writeBuffer(c.gpa, ca.buffer, 0, std.mem.sliceAsBytes(counts));
-        try c.launcher().launchWith(.sample, params, &.{ la, ba, pa, ca, work, out, next, try c.step(1, 0, u) }, .{ 1, 1, 1 });
-        const got = try c.readWords(out);
+        const step = try c.step(1, 0, u);
+        for (steps) |ss| {
+            const groups: u32 = if (ss.phase.wide()) kernels.sampleGroups(vocab) else 1;
+            try c.launcher().launch(.sample, P.SamplePhase{ .phase = @backingInt(ss.phase), .round = ss.round }, &.{
+                la, ba, pa, ca, work, state, next, step, params,
+            }, .{ groups, 1, 1 });
+        }
+        const got = try c.readWords(state);
         const got_next = try c.readWords(next);
         const got_counts = try c.readWords(ca);
         const want = try sampler.reference(c.arena, logits, p, .{ .prompt = prompt, .counts = counts }, u);
@@ -681,6 +689,16 @@ fn checkSamplePlain(c: *Ctx) !Result {
 
 fn checkSampleTopK1(c: *Ctx) !Result {
     return sampleCase(c, "sample top-k 1", 32000, .{ .top_k = 1, .seed = 5 }, 4);
+}
+
+fn checkSampleLargeTopK(c: *Ctx) !Result {
+    // Past the candidate cap: radix select, then top-p by bisection.
+    return sampleCase(c, "sample k=2000 p=0.8", 32000, .{ .top_k = 2000, .top_p = 0.8, .seed = 7 }, 8);
+}
+
+fn checkSampleTopKSkipped(c: *Ctx) !Result {
+    // min-p leaves fewer than k tokens, so top-k removes nothing.
+    return sampleCase(c, "sample min-p 0.3 k=500", 32000, .{ .min_p = 0.3, .top_k = 500, .seed = 8 }, 8);
 }
 
 fn checkSampleVocab(c: *Ctx) !Result {
