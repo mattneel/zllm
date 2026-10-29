@@ -167,12 +167,18 @@ Qwen 3.8 27B at Q3_K_M (13.75 GB) runs in Chrome on the same GPU:
 | Phase | Chrome |
 |---|---|
 | Load, uncached, over HTTP from localhost | 25.8 s |
+| Load from a local file | 15.3 s |
 | Decode, 3,016 tokens of a chat reply | 27.3 tok/s |
 
 The spec's bar for a warm load is 40 s, from the weight cache. On this
 machine Chrome gives the origin a 12.3 GB quota, which follows the disk's
 free space (53 GB), so the 13.75 GB file doesn't fit and the cache
 declines it. Loading it uncached over localhost already takes 25.8 s.
+
+A model picked as a local file needs no cache: its bytes are on disk
+already. Loaded that way, the 27B takes 15.3 s, the warm load the spec's
+40 s bar is about, since the API takes a `FileSystemFileHandle` an app can
+keep and reopen.
 
 ## Validation
 

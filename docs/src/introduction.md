@@ -47,8 +47,8 @@ reference on every eval position, and the reference matches llama.cpp up to
 llama.cpp's own activation rounding ([Validation](validation.md#the-27b)).
 Decode runs at 28–29 tok/s, past the spec's bar of 20; prefill at
 288–300 tok/s, at the bar of 300 ([Generation](generation.md#the-27b)). In
-Chrome it decodes at 27.3 tok/s and loads in 25.8 s over localhost
-([Browser](browser.md#the-27b)).
+Chrome it decodes at 27.3 tok/s and loads in 15.3 s from a local file
+(25.8 s over localhost; [Browser](browser.md#the-27b)).
 
 See [Validation](validation.md), [GPU backend](gpu.md),
 [Generation](generation.md) and [Browser](browser.md).
