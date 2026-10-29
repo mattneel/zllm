@@ -9,7 +9,9 @@ const usage =
     \\usage: zllm <command> [args]
     \\
     \\commands:
-    \\  gguf-index <model.gguf>   print header, metadata and tensor index as JSON
+    \\  gguf-index <model.gguf>             print header, metadata and tensor index as JSON
+    \\  tokenize <model.gguf> <texts.jsonl>  for each {"text": ...} line, print
+    \\                                       {"ids": [...], "decoded": ...} as one JSON line
     \\
 ;
 
@@ -32,10 +34,50 @@ pub fn main(init: std.process.Init) !void {
         var file = try zllm.gguf.parse(gpa, mapped, true);
         defer file.deinit(gpa);
         try writeIndexJson(out, file);
+    } else if (std.mem.eql(u8, cmd, "tokenize")) {
+        if (args.len != 4) return fail(usage);
+        const mapped = try mapFile(io, args[2]);
+        defer std.posix.munmap(mapped);
+        // The tokenizer needs only metadata, so a header-only prefix suffices.
+        var file = try zllm.gguf.parse(gpa, mapped, false);
+        defer file.deinit(gpa);
+        var tok = try zllm.tokenizer.Tokenizer.load(gpa, file);
+        defer tok.deinit(gpa);
+        const texts = try Io.Dir.cwd().readFileAlloc(io, args[3], gpa, .unlimited);
+        defer gpa.free(texts);
+        try tokenizeLines(gpa, &tok, texts, out);
     } else {
         return fail(usage);
     }
     try out.flush();
+}
+
+fn tokenizeLines(gpa: std.mem.Allocator, tok: *const zllm.tokenizer.Tokenizer, texts: []const u8, out: *Io.Writer) !void {
+    var ids: std.ArrayList(zllm.tokenizer.Id) = .empty;
+    defer ids.deinit(gpa);
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(gpa);
+
+    var lines = std.mem.splitScalar(u8, texts, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(struct { text: []const u8 }, gpa, line, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+
+        ids.clearRetainingCapacity();
+        decoded.clearRetainingCapacity();
+        try tok.encode(gpa, parsed.value.text, &ids);
+        try tok.decode(gpa, ids.items, &decoded);
+
+        var s: std.json.Stringify = .{ .writer = out };
+        try s.beginObject();
+        try s.objectField("ids");
+        try s.write(ids.items);
+        try s.objectField("decoded");
+        try s.write(decoded.items);
+        try s.endObject();
+        try out.writeByte('\n');
+    }
 }
 
 fn fail(msg: []const u8) error{InvalidUsage} {
