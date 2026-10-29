@@ -2,7 +2,8 @@
 //
 // w holds `n` rows of `k` bf16 values (row j contiguous), packed two per u32
 // little-endian. It may be one chunk of a larger matrix: `col0` places its
-// outputs, `out_stride` is the full output row width. k % TK == 0.
+// outputs, `out_stride` is the full output row width. k % TK == 0. With
+// `accumulate`, out += result (a residual add).
 //
 // Tiling: a workgroup computes TT tokens × TN outputs. Each step stages a
 // TT×TK tile of x and a TN×TK tile of w (widened to f32) in workgroup memory,
@@ -14,7 +15,7 @@ struct Params {
     k: u32,
     col0: u32,
     out_stride: u32,
-    _pad0: u32,
+    accumulate: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -82,7 +83,12 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
     for (var q = 0u; q < 4u; q++) {
         let j = j0 + tn + 16u * q;
         if (j < p.n) {
-            out[t * p.out_stride + p.col0 + j] = acc[q];
+            let o = t * p.out_stride + p.col0 + j;
+            if (p.accumulate != 0u) {
+                out[o] += acc[q];
+            } else {
+                out[o] = acc[q];
+            }
         }
     }
 }

@@ -37,20 +37,21 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,      checkMatmul,       checkMatmulChunked,   checkMatvec,            checkSiluMul,
-        checkAdd,          checkEmbed,        checkQkNormRope,      checkKvAppendF16,       checkAttentionF32,
-        checkAttentionF16, checkAttnDecode,   checkConvSilu,        checkL2Norm,            checkGates,
-        checkDeltaRule,    checkSampleGreedy, checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
-        checkSamplePlain,  checkSampleTopK1,  checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
+        checkRmsNorm,           checkMatmul,       checkMatmulChunked, checkMatvec,       checkMatvecNorm,
+        checkMatvecSiluPair,    checkSiluMul,      checkAdd,           checkEmbed,        checkQkNormRope,
+        checkKvAppendF16,       checkAttentionF32, checkAttentionF16,  checkAttnDecode,   checkConvSilu,
+        checkL2Norm,            checkGates,        checkDeltaRule,     checkSampleGreedy, checkSampleTopKTopP,
+        checkSampleMinP,        checkSampleTopP,   checkSamplePlain,   checkSampleTopK1,  checkSampleLargeTopK,
+        checkSampleTopKSkipped, checkSampleVocab,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
         ok = ok and pass;
         const verdict = if (pass) "PASS" else "FAIL";
         if (r.trials > 0) {
-            try out.print("{s} {s:<24} max draw deviation {e:.2} (tolerance {e:.0}); {d}/{d} draws exact\n", .{ verdict, r.name, r.err, r.tolerance, r.exact, r.trials });
+            try out.print("{s} {s:<30} max draw deviation {e:.2} (tolerance {e:.0}); {d}/{d} draws exact\n", .{ verdict, r.name, r.err, r.tolerance, r.exact, r.trials });
         } else {
-            try out.print("{s} {s:<24} max rel err {e:.2} (tolerance {e:.0})\n", .{ verdict, r.name, r.err, r.tolerance });
+            try out.print("{s} {s:<30} max rel err {e:.2} (tolerance {e:.0})\n", .{ verdict, r.name, r.err, r.tolerance });
         }
         _ = arena_state.reset(.retain_capacity);
     }
@@ -177,10 +178,12 @@ fn checkRmsNorm(c: *Ctx) !Result {
     return .{ .name = "rmsnorm", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
-fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32) !Result {
+/// With `accumulate`, the output starts random and the product adds to it.
+fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32, accumulate: bool) !Result {
     const x = try c.random(rows * k, 1);
     const w = try c.randomBf16(n * k, 1);
-    const out = try c.output(rows * n);
+    const init = try c.random(rows * n, if (accumulate) 4 else 0);
+    const out = try c.upload(init);
     const xa = try c.upload(x);
     const l = c.launcher();
     // Optionally split the weights into two chunks, as large matrices are.
@@ -188,7 +191,7 @@ fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32)
     for ([_]u32{ split orelse n, n - (split orelse n) }) |cols| {
         if (cols == 0) continue;
         const wa = try c.upload(w.words[col0 * k / 2 ..][0 .. cols * k / 2]);
-        try l.launch(.matmul_bf16, P.MatmulBf16{ .rows = rows, .n = cols, .k = k, .col0 = col0, .out_stride = n }, &.{ xa, wa, out }, .{
+        try l.launch(.matmul_bf16, P.MatmulBf16{ .rows = rows, .n = cols, .k = k, .col0 = col0, .out_stride = n, .accumulate = @intFromBool(accumulate) }, &.{ xa, wa, out }, .{
             std.math.divCeil(u32, cols, kernels.matmul_tile_n) catch unreachable,
             std.math.divCeil(u32, rows, kernels.matmul_tile_t) catch unreachable,
             1,
@@ -199,7 +202,7 @@ fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32)
 
     const want = try c.arena.alloc(f64, rows * n);
     for (0..rows) |t| for (0..n) |j| {
-        var s: f64 = 0;
+        var s: f64 = init[t * n + j];
         for (0..k) |i| s += @as(f64, x[t * k + i]) * w.values[j * k + i];
         want[t * n + j] = s;
     };
@@ -208,40 +211,108 @@ fn matmulCase(c: *Ctx, name: []const u8, rows: u32, n: u32, k: u32, split: ?u32)
 
 fn checkMatmul(c: *Ctx) !Result {
     // 19 tokens and 100 outputs leave partial tiles in both dimensions.
-    return matmulCase(c, "matmul_bf16", 19, 100, 1024, null);
+    return matmulCase(c, "matmul_bf16", 19, 100, 1024, null, false);
 }
 
 fn checkMatmulChunked(c: *Ctx) !Result {
-    return matmulCase(c, "matmul_bf16 (2 chunks)", 33, 150, 96, 70);
+    return matmulCase(c, "matmul_bf16 (2 chunks, +=)", 33, 150, 96, 70, true);
 }
 
 fn checkMatvec(c: *Ctx) !Result {
     // 3 tokens, 100 outputs (a partial workgroup of rows), split into two
-    // chunks; k = 1000 leaves a partial pass over the 32 lanes.
+    // chunks; k = 4000 is too wide to stage and leaves a partial pass over
+    // the 32 lanes.
+    return matvecCase(c, "matvec_bf16 (2 chunks)", 4000, 37, false);
+}
+
+fn checkMatvecNorm(c: *Ctx) !Result {
+    return matvecCase(c, "matvec_bf16 norm+= (2 chunks)", 1000, 37, true);
+}
+
+/// out (+)= rmsnorm(x) · w for 3 tokens and 100 outputs in two chunks; with
+/// `fused`, the RMSNorm prologue and accumulate epilogue are on.
+fn matvecCase(c: *Ctx, name: []const u8, k: u32, split: u32, fused: bool) !Result {
     const rows = 3;
     const n = 100;
-    const k = 1000;
-    const split = 37;
-    const x = try c.random(rows * k, 1);
+    const eps = 1e-6;
+    const x = try c.random(rows * k, 3);
+    const nw = try c.random(k, 1);
     const w = try c.randomBf16(n * k, 1);
-    const out = try c.output(rows * n);
+    const init = try c.random(rows * n, if (fused) 4 else 0);
+    const out = try c.upload(init);
     const xa = try c.upload(x);
+    const na = try c.upload(nw);
     var col0: u32 = 0;
     for ([_]u32{ split, n - split }) |cols| {
         const wa = try c.upload(w.words[col0 * k / 2 ..][0 .. cols * k / 2]);
-        try c.launcher().launch(.matvec_bf16, P.MatvecBf16{ .n = cols, .k = k, .col0 = col0, .out_stride = n }, &.{ xa, wa, out }, .{
-            std.math.divCeil(u32, cols, kernels.matvec_rows) catch unreachable, rows, 1,
-        });
+        try c.launcher().launch(.matvec_bf16, P.MatvecBf16{
+            .n = cols,
+            .k = k,
+            .col0 = col0,
+            .out_stride = n,
+            .eps = eps,
+            .flags = .{ .norm = fused, .accumulate = fused },
+        }, &.{ xa, wa, out, na }, .{ std.math.divCeil(u32, cols, kernels.matvec_rows) catch unreachable, rows, 1 });
         col0 += cols;
     }
     const got = try c.read(out);
     const want = try c.arena.alloc(f64, rows * n);
-    for (0..rows) |t| for (0..n) |j| {
-        var s: f64 = 0;
-        for (0..k) |i| s += @as(f64, x[t * k + i]) * w.values[j * k + i];
-        want[t * n + j] = s;
-    };
-    return .{ .name = "matvec_bf16 (2 chunks)", .err = relErr(got, want), .tolerance = 1e-5 };
+    const xn = try c.arena.alloc(f64, k);
+    for (0..rows) |t| {
+        normRow(xn, x[t * k ..][0..k], if (fused) nw else null, eps);
+        for (0..n) |j| {
+            var s: f64 = init[t * n + j];
+            for (0..k) |i| s += xn[i] * w.values[j * k + i];
+            want[t * n + j] = s;
+        }
+    }
+    return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
+}
+
+/// out = rmsnorm(x) · w when `w` is given, else x.
+fn normRow(out: []f64, x: []const f32, w: ?[]const f32, eps: f64) void {
+    var ss: f64 = 0;
+    for (x) |v| ss += @as(f64, v) * v;
+    const scale = if (w != null) 1 / @sqrt(ss / @as(f64, @floatFromInt(x.len)) + eps) else 1;
+    for (out, x, 0..) |*o, v, i| o.* = v * scale * if (w) |ww| ww[i] else 1;
+}
+
+/// The FFN up-projection: act = silu(rmsnorm(x) · gate) · (rmsnorm(x) · up),
+/// gate and up stacked in one matrix.
+fn checkMatvecSiluPair(c: *Ctx) !Result {
+    const rows = 3;
+    const ff = 100;
+    const k = 1024;
+    const eps = 1e-6;
+    const x = try c.random(rows * k, 3);
+    const nw = try c.random(k, 1);
+    const w = try c.randomBf16(2 * ff * k, 1);
+    const out = try c.output(rows * ff);
+    try c.launcher().launch(.matvec_bf16, P.MatvecBf16{
+        .n = ff,
+        .k = k,
+        .col0 = 0,
+        .out_stride = ff,
+        .eps = eps,
+        .flags = .{ .norm = true, .silu_pair = true },
+        .half = ff,
+    }, &.{ try c.upload(x), try c.upload(w.words), out, try c.upload(nw) }, .{ std.math.divCeil(u32, ff, kernels.matvec_rows) catch unreachable, rows, 1 });
+    const got = try c.read(out);
+    const want = try c.arena.alloc(f64, rows * ff);
+    const xn = try c.arena.alloc(f64, k);
+    for (0..rows) |t| {
+        normRow(xn, x[t * k ..][0..k], nw, eps);
+        for (0..ff) |j| {
+            var g: f64 = 0;
+            var u: f64 = 0;
+            for (0..k) |i| {
+                g += xn[i] * w.values[j * k + i];
+                u += xn[i] * w.values[(ff + j) * k + i];
+            }
+            want[t * ff + j] = g * sigmoid64(g) * u;
+        }
+    }
+    return .{ .name = "matvec_bf16 norm+silu pair", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 fn checkSiluMul(c: *Ctx) !Result {

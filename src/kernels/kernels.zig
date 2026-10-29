@@ -52,6 +52,9 @@ pub const matmul_tile_k = 32;
 pub const decode_max_rows = 4;
 /// Rows per `matvec_bf16` workgroup.
 pub const matvec_rows = 8;
+/// Widest input `matvec_bf16` stages in workgroup memory, which its RMSNorm
+/// prologue needs.
+pub const matvec_max_staged = 3584;
 /// Widest head `attention` and `delta_rule` handle.
 pub const max_head_dim = 256;
 /// State columns per `delta_rule` workgroup.
@@ -79,9 +82,31 @@ pub const params = struct {
         k: u32,
         col0: u32,
         out_stride: u32,
-        _pad: [3]u32 = @splat(0),
+        /// out += result (a residual add).
+        accumulate: u32 = 0,
+        _pad: [2]u32 = @splat(0),
     };
-    pub const MatvecBf16 = extern struct { n: u32, k: u32, col0: u32, out_stride: u32 };
+    pub const MatvecBf16 = extern struct {
+        n: u32,
+        k: u32,
+        col0: u32,
+        out_stride: u32,
+        eps: f32 = 0,
+        flags: Flags = .{},
+        /// The up rows' first row, with `silu_pair`.
+        half: u32 = 0,
+        _pad: u32 = 0,
+
+        pub const Flags = packed struct(u32) {
+            /// RMSNorm the input first, with `eps` and the weights bound at 4.
+            norm: bool = false,
+            /// out += result.
+            accumulate: bool = false,
+            /// out[j] = silu(row j) · (row half + j).
+            silu_pair: bool = false,
+            _: u29 = 0,
+        };
+    };
     pub const Count = extern struct { count: u32, _pad: [3]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
     pub const QkNormRope = extern struct {

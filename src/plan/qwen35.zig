@@ -643,7 +643,7 @@ fn matmul(b: *kernels.Builder, arena: Allocator, list: *std.ArrayList(Item), out
             .x = std.math.divCeil(u32, ch.rows, kernels.matmul_tile_n) catch unreachable,
             .tile = kernels.matmul_tile_t,
         } });
-        const vector = try b.add(.matvec_bf16, P.MatvecBf16{ .n = ch.rows, .k = w.k, .col0 = ch.row0, .out_stride = w.n }, &.{ x, ch.arg, out }, .{
+        const vector = try b.add(.matvec_bf16, P.MatvecBf16{ .n = ch.rows, .k = w.k, .col0 = ch.row0, .out_stride = w.n }, &.{ x, ch.arg, out, ch.arg }, .{
             .rows_y = std.math.divCeil(u32, ch.rows, kernels.matvec_rows) catch unreachable,
         });
         try list.append(arena, .{ .matmul = .{ .tiled = tiled, .vector = vector } });
