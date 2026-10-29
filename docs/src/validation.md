@@ -226,11 +226,14 @@ up to it:
   except the f16 super-scales, so every quant, scale and high-bit pattern
   occurs. All five types pass.
 - **Kernels:** for each type, `gpu-check` runs the decode multiply with its
-  norm prologue and accumulate epilogue, the prefill multiply, and the
-  embedding gather against float64 over those decoders. Further checks run
-  the unstaged norm path (k = 4,096, too wide for workgroup memory) and the
-  SiLU pair on Q3_K, the 27B's gate and up type. All 17 pass on llvmpipe and
-  the RTX 5090: embeddings exactly, multiplies within 2.1e-7.
+  norm prologue and accumulate epilogue, the prefill multiply accumulating
+  (70 tokens × 150 outputs, whole and split over k through
+  `matmul_reduce`), and the embedding gather against float64 over those
+  decoders. Weights go through `repad` as the loader's do. Further checks
+  run x over two staged tiles (k = 4,096) and the SiLU pair on Q3_K, the
+  27B's gate and up type. All 17 pass on llvmpipe and the RTX 5090:
+  embeddings exactly, decode multiplies within 2.3e-7, prefill multiplies
+  within 1.4e-6.
 - **The model:** `check-quant`, below.
 
 The CPU reference cannot hold the 27B in f32 (108 GB). Quantized matrices
@@ -250,7 +253,7 @@ activations:
 
 | Kernel path | Top-1 | First layer, max rel L2 | Everything, max rel L2 |
 |---|---|---|---|
-| Prefill (8-token steps) | 818/818 | 1.2e-6 | 4.5e-4 |
+| Prefill (8-token steps) | 818/818 | 2.9e-6 | 4.5e-4 |
 | Decode (1-token steps, first 40 positions) | 200/200 | 2.8e-6 | 2.1e-5 |
 
 The bounds are 1e-5 for the first layer (exact up to f32 summation order)

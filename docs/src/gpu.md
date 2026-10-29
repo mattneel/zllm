@@ -77,7 +77,9 @@ range reads of a URL or a local file. The core needs only the GGUF header.
 Kernels live in `src/kernels/*.wgsl`, each with a uniform `Params` struct
 mirrored in `kernels.zig`. Weights stay in their GGUF format on the GPU,
 BF16 or quantized, and are decoded in the shader; activations and
-accumulation are f32.
+accumulation are f32. The one change to the format: Q3_K and Q6_K blocks
+(110 and 210 bytes) are padded to 112 and 224, so every K-quant block
+starts on a 16-byte boundary and is read in 16-byte vectors.
 
 | Kernel | Work | Notes |
 |---|---|---|
@@ -92,7 +94,9 @@ accumulation are f32.
 | `delta_prep` | DeltaNet front end: causal conv and SiLU, L2 norm of q and k, β and decay gates | One workgroup per (head of channels, token); inputs before the step come from the conv history |
 | `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups. Also advances the conv history |
 | `gated_norm` | The SiLU(z)-gated RMSNorm after it | One workgroup per (head, token); z read from the stacked projection |
-| `matvec_<q>`, `matmul_<q>`, `embed_<q>` | The multiplies and embedding gather on quantized weights: `q8_0`, `q3_k`, `q4_k`, `q5_k`, `q6_k` | `matvec_quant.wgsl`, `matmul_quant.wgsl` and `embed_quant.wgsl`, composed at compile time with `quant/<q>.wgsl`. That file decodes a row's 32-weight units as ggml's `dequantize_row_*` does. Byte reads throughout, as Q3_K and Q6_K blocks aren't word-aligned. The decode multiply keeps `matvec_bf16`'s fusions and normalizes inputs too wide to stage |
+| `matvec_<q>`, `matmul_<q>`, `embed_<q>` | The multiplies and embedding gather on quantized weights: `q8_0`, `q3_k`, `q4_k`, `q5_k`, `q6_k` | `matvec_quant.wgsl`, `matmul_quant.wgsl` and `embed_quant.wgsl`, composed at compile time with `quant/<q>.wgsl`. That file decodes a row's 32-weight units as ggml's `dequantize_row_*` does, value for value, 16 weights from 16-byte loads at a time. The decode multiply keeps `matvec_bf16`'s fusions, stages x in 2,048-float tiles, and splits each block among 4–8 lanes (`quant/<q>_dot.wgsl`), consecutive lanes on consecutive vectors. The prefill multiply computes 32 tokens × 128 outputs per workgroup, 4 × 8 per thread |
+| `matmul_reduce` | Adds up a quantized prefill multiply split over k | A matrix with too few column tiles to fill the GPU (a 5,120-row projection has 40) splits k into slices, aiming at 256 workgroups; each slice writes partial sums, and this adds them into the output |
+| `repad` | Pads Q3_K and Q6_K blocks to 16-byte multiples, at load | Each chunk's rows go to a staging buffer, freed after the chunk's own submit |
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling) |
 

@@ -20,7 +20,7 @@ LLM inference on WebGPU from one Zig codebase, built to the standard of a server
 >
 > M3 builds the core to `zllm.wasm` behind the `zllm.js` shim: Chrome generates the same tokens as the native host at 252–295 tok/s on an RTX 5090 Laptop, through `generate` and OpenAI-style `chat.completions.create`, and reloads the cached model in about a second.
 >
-> M6 has started: Qwen 3.8 27B at Q3_K_M runs on the GPU, matching the CPU reference and, up to its activation rounding, llama.cpp. Speed comes next (about 6 tok/s today, against a bar of 20).
+> M6 is under way: Qwen 3.8 27B at Q3_K_M runs on the GPU, matching the CPU reference and, up to its activation rounding, llama.cpp. It decodes at 26–27 tok/s (bar: 20) and prefills at 154 tok/s (bar: 300).
 >
 > M4's decode kernels and M5's fusion rules have started: generation runs at about 285 tok/s and prefill at about 2,890 tok/s, up from 25–34 and 1,560 at M2. See [Browser](https://mattneel.github.io/zllm/browser.html), [Generation](https://mattneel.github.io/zllm/generation.html), [Validation](https://mattneel.github.io/zllm/validation.html) and the [roadmap](https://mattneel.github.io/zllm/introduction.html#status).
 

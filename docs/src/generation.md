@@ -71,6 +71,14 @@ budget:
   budget, smaller chunks would only add steps that each pay that cost. The
   target becomes twice the fixed cost instead. On llvmpipe, where one step
   costs about a second, the plain rule cut chunks to one or two tokens.
+- **Tiles:** the prefill multiplies compute whole tiles of tokens (16 for
+  BF16 weights, 32 for quantized ones), and a partial tile costs as much as
+  a whole one. So the per-token rate counts a step's tokens in whole tiles,
+  and chunks are whole tiles. Where not even one tile fits the target, the
+  chunk is one tile as long as its prediction stays under 90% of the
+  spec's 250 ms hard cap. The 27B's 32-token steps take about 190 ms: with
+  smaller chunks, each 8-token step cost as much and prefill ran at 25
+  tok/s.
 - **Checkpoint boundaries:** chunks also end at multiples of 512 and just
   before the prompt's last token. That token then runs as its own step, which
   measures the fixed cost and produces the logits to sample.
@@ -237,3 +245,32 @@ What remains, of about 3.9 ms per step:
 - **Attention and the sampler:** about 0.3 and 0.2 ms.
 
 Synchronizing a submission costs 0.1–0.2 ms.
+
+### The 27B
+
+Qwen 3.8 27B at Q3_K_M (13.75 GB) on the same GPU, `zllm generate`, greedy:
+
+| Phase | First run | Now | Spec bar |
+|---|---|---|---|
+| Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 154 tok/s, in 31 steps | 300 tok/s |
+| Decode | 6 tok/s | 26–27 tok/s | 20 tok/s |
+
+The quantized kernels made the difference ([GPU backend](gpu.md#kernels)).
+`zllm bench` at position 288 measured the steps:
+
+| Change | ms per decode step |
+|---|---|
+| Byte-wise decode multiply | 175 |
+| x staged in workgroup tiles | 50 |
+| Blocks split among lanes, 8 rows per workgroup | 46 |
+| Q3_K and Q6_K padded; 16-byte loads; four weights decoded at once | 38 |
+
+A decode step reads about 12.2 GB of weights, 13.7 ms at this GPU's
+bandwidth. The Q3_K multiplies, 6.6 GB, take about 19 ms: 11 ms of loads,
+4 ms of decoding and 3.5 ms reading x from workgroup memory.
+
+Prefill is bound by f32 multiply-adds. A 32-token step does 1.7 TFLOP of
+them; at 26 TFLOP/s that takes 66 ms, and decoding the weights and staging
+the tiles about as long again. 300 tok/s within the budget would take
+integer dot products (`dot4I8Packed`) over activations rounded to 8 bits,
+as llama.cpp does, which changes the numerics.

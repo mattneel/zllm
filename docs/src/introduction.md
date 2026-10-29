@@ -41,12 +41,13 @@ M5 has started too. The spec's fusion rules are applied by hand in the Qwen
 from 441 dispatches to 182, and decoding to about 285 tok/s. The fusion
 pass itself, which needs M4's templates, is still to come.
 
-M6 has started with correctness. Qwen 3.8 27B at Q3_K_M loads and runs:
-quantized kernels decode Q3_K to Q8_0 weights as ggml does. On the GPU it
-matches the CPU reference on every eval position, and the reference matches
-llama.cpp up to llama.cpp's own activation rounding
-([Validation](validation.md#the-27b)). Speed is next: decode runs at about
-6 tok/s, against the spec's bar of 20.
+M6 is under way. Qwen 3.8 27B at Q3_K_M loads and runs: quantized kernels
+decode Q3_K to Q8_0 weights as ggml does. On the GPU it matches the CPU
+reference on every eval position, and the reference matches llama.cpp up to
+llama.cpp's own activation rounding ([Validation](validation.md#the-27b)).
+Decode runs at 26–27 tok/s, past the spec's bar of 20; prefill at 154
+tok/s, against a bar of 300 ([Generation](generation.md#the-27b)). Warm
+loading in Chrome is still to be measured.
 
 See [Validation](validation.md), [GPU backend](gpu.md),
 [Generation](generation.md) and [Browser](browser.md).
