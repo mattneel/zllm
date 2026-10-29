@@ -8,6 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
+const ops = @import("../ref/ops.zig");
 
 pub const Kernel = enum {
     rmsnorm,
@@ -15,6 +16,12 @@ pub const Kernel = enum {
     silu_mul,
     add,
     embed_bf16,
+    qk_norm_rope,
+    attention,
+    conv_silu,
+    l2norm_heads,
+    gates,
+    delta_rule,
 
     pub fn source(k: Kernel) []const u8 {
         return switch (k) {
@@ -28,6 +35,10 @@ pub const matmul_tile_n = 64;
 pub const matmul_tile_t = 16;
 /// Reduction step; `k` must be a multiple.
 pub const matmul_tile_k = 32;
+/// Longest sequence `attention` handles (its scores live in workgroup memory).
+pub const attention_max_tokens = 4096;
+/// Widest head `attention` and `delta_rule` handle.
+pub const max_head_dim = 256;
 
 pub const params = struct {
     pub const RmsNorm = extern struct { rows: u32, dim: u32, eps: f32, _pad: u32 = 0 };
@@ -41,7 +52,49 @@ pub const params = struct {
     };
     pub const Count = extern struct { count: u32, _pad: [3]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
+    pub const QkNormRope = extern struct {
+        heads: u32,
+        head_dim: u32,
+        n_rot: u32,
+        row_stride: u32,
+        head_stride: u32,
+        pos0: u32,
+        eps: f32,
+        _pad: u32 = 0,
+    };
+    pub const Attention = extern struct {
+        tokens: u32,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+        _pad: [3]u32 = @splat(0),
+    };
+    pub const ConvSilu = extern struct { tokens: u32, channels: u32, taps: u32, _pad: u32 = 0 };
+    pub const L2NormHeads = extern struct { heads: u32, dim: u32, row_stride: u32, eps: f32 };
+    pub const Gates = extern struct { count: u32, heads: u32, _pad: [2]u32 = @splat(0) };
+    pub const DeltaRule = extern struct {
+        tokens: u32,
+        k_heads: u32,
+        v_heads: u32,
+        dim: u32,
+        conv_stride: u32,
+        eps: f32,
+        _pad: [2]u32 = @splat(0),
+    };
 };
+
+/// RoPE (cos, sin) for positions [0, positions) and the n_rot/2 rotation
+/// pairs, as `qk_norm_rope` reads it. Same formula as the CPU reference.
+pub fn ropeTable(gpa: Allocator, positions: usize, n_rot: usize, base: f32) Allocator.Error![]f32 {
+    const half = n_rot / 2;
+    const table = try gpa.alloc(f32, positions * half * 2);
+    for (0..positions) |pos| for (0..half) |i| {
+        const cs = ops.ropeCosSin(@intCast(pos), i, n_rot, base);
+        table[(pos * half + i) * 2 ..][0..2].* = cs;
+    };
+    return table;
+}
 
 /// One pipeline per kernel.
 pub const Set = struct {

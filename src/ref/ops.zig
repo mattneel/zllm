@@ -53,17 +53,21 @@ pub fn softplus(x: f32) f32 {
 /// pairs (i, i + n_rot/2) rotate by pos * base^(-2i/n_rot).
 pub fn rope(x: []f32, pos: u32, n_rot: usize, base: f32) void {
     const half = n_rot / 2;
-    const p: f32 = @floatFromInt(pos);
     for (0..half) |i| {
-        const exponent = -2.0 * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_rot));
-        const theta = p * std.math.pow(f32, base, exponent);
-        const c = @cos(theta);
-        const s = @sin(theta);
+        const cs = ropeCosSin(pos, i, n_rot, base);
         const x0 = x[i];
         const x1 = x[i + half];
-        x[i] = x0 * c - x1 * s;
-        x[i + half] = x0 * s + x1 * c;
+        x[i] = x0 * cs[0] - x1 * cs[1];
+        x[i + half] = x0 * cs[1] + x1 * cs[0];
     }
+}
+
+/// (cos, sin) of the rotation applied to pair `i` at position `pos`. GPU
+/// kernels read a table of these rather than evaluating trig themselves.
+pub fn ropeCosSin(pos: u32, i: usize, n_rot: usize, base: f32) [2]f32 {
+    const exponent = -2.0 * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_rot));
+    const theta = @as(f32, @floatFromInt(pos)) * std.math.pow(f32, base, exponent);
+    return .{ @cos(theta), @sin(theta) };
 }
 
 /// In-place softmax.
