@@ -15,15 +15,27 @@ scripts/d3d12.sh chat 'C:\path\to\model.gguf'   # on the Windows GPU, from WSL
 ## Engine
 
 `src/sched/sched.zig` is a state machine that never blocks. Its host calls
-`start` with a request, then repeatedly `next`, which returns one of three
+`start` with a request, then repeatedly `next`, which returns one of four
 events:
 
-- **`submit`:** execute this batch, then call `complete` with the elapsed time.
+- **`submit`:** execute this batch, then call `complete` with its GPU time.
 - **`token`:** a sampled token and the text it released.
-- **`done`:** the finish reason (`stop` or `length`) and usage.
+- **`wait`:** complete the oldest outstanding batch first.
+- **`done`:** the finish reason (`stop`, `length` or `abort`) and usage.
 
-The native host executes each batch synchronously. The browser host (M3)
-will resolve the same batches asynchronously.
+The native host executes and completes each batch before calling `next`
+again, so it never sees `wait`. The browser host executes asynchronously
+and keeps two batches in flight: decoding records the next step before the
+previous step's token is read back, since the sampler hands each token to
+the next step on the GPU. The resident sequence holds a placeholder until
+the token arrives. When a step ends the request, the step after it has
+already processed the final token, which stays resident; that step's own
+sample is discarded. This hides Chrome's readback latency
+([Browser](browser.md#two-steps-in-flight)).
+
+`cancel` ends a request after the batch in flight: `done` reports `abort`,
+and the tokens processed so far stay resident, so the next request reuses
+them as after any other finish.
 
 ```mermaid
 stateDiagram-v2
@@ -32,7 +44,7 @@ stateDiagram-v2
   Prefill --> Emit: last prompt token, sampled
   Decode --> Emit: one token, sampled
   Emit --> Decode: no stop
-  Emit --> Done: stop token, stop string, max tokens, context full
+  Emit --> Done: stop token, stop string, max tokens, context full, cancel
   Done --> [*]
 ```
 

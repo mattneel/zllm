@@ -8,4 +8,5 @@
 - [Validation](validation.md)
 - [GPU backend](gpu.md)
 - [Generation](generation.md)
+- [Browser](browser.md)
 - [Contributing](contributing.md)

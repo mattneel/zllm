@@ -53,17 +53,17 @@ Modules not yet started contain only a `README.md` stating their contract.
 | `state` | M2 | The resident sequence, checkpoint slots, prefix reuse |
 | `sampler` | M2 | Sampling parameters, draws, the CPU reference sampler (the kernel is in `kernels`) |
 | `chat` | M2 | The fixed Qwen chat template for text conversations |
-| `gpu` | M1 | Command stream, Dawn host (`webgpu.h` loaded at run time); browser host in M3 |
-| `api` | M3 | C ABI, wasm exports, TypeScript facade |
+| `gpu` | M1 | Command stream, Dawn host (`webgpu.h` loaded at run time); the browser host is `web/src/zllm/gpu.ts` |
+| `api` | M3 | wasm exports (`zllm.wasm`); the TypeScript facade is `web/src/zllm`. The C ABI is not built yet |
 
 `ref` is not in the spec's table: the spec rules out a CPU inference path in
 v1 but requires a CPU f32 reference for validation. It lives in its own module
 so that nothing outside tests depends on it.
 
-`chat` is not in the table either. In the browser, the JavaScript facade
-renders chat templates with `@huggingface/jinja`; the native command line has
-no Jinja, so it carries one fixed template, checked against the Jinja
-original.
+`chat` is not in the table either. It carries one fixed template, checked
+against the Jinja original, which both the command line and the browser use.
+The spec has the browser render a GGUF's own template with
+`@huggingface/jinja`; that is still to come.
 
 ## Async model
 
@@ -82,9 +82,9 @@ exercise the browser control flow.
 
 A batch is a flat stream of `u32` words ([GPU backend](gpu.md#command-stream))
 that the host interprets in one call, so the browser crosses the wasm/JS
-boundary once per batch instead of once per dispatch. Engine epochs on
-completions (so a callback that arrives after unload or device loss is
-recognized as stale) come with the asynchronous browser host in M3.
+boundary once per batch instead of once per dispatch. No completion can
+arrive after unload: the shim cancels and drains the running request before
+it frees the core.
 
 ## Reference-first validation
 

@@ -269,8 +269,26 @@ relative L2.
 | A prompt sharing the first 600 tokens | 512: the checkpoint at 512 | bitwise identical |
 | The same prompt again | 649: the checkpoint before its last token | bitwise identical |
 | The first prompt after an unrelated one | 0: the state is zeroed | bitwise identical |
+| The first prompt again, pipelined as in the browser and stopped by its 6th token | (fresh) | 6 tokens with bitwise identical logits to an unpipelined run; 706 resident, the stop token included |
+| That prompt, its stopped reply, and 30 more tokens | 706 | relative L2 2.3e-5 |
+| After a 300-token prompt cancelled after 3 tokens: it, those 3, and 30 more | 302: the prompt and the 2 processed tokens | relative L2 8.8e-5 |
+| After a 700-token prompt cancelled after its first prefill step: the same prompt | 448: the chunk that ran | bitwise identical |
 
-These are RTX 5090 results; at M2 all five also passed bitwise on llvmpipe.
-Skipping the checkpoint restore fails both checkpoint scenarios, and an
-earlier bug that left the state dirty after dropping the sequence failed all
-five.
+The pipelined run completes each batch only when the engine asks for it
+(`wait`), so every decode step is recorded before the previous token is
+known, as in the browser ([Generation](generation.md#engine)). The cancelled
+decode's follow-up sits closest to the cross-path bound, at 8.8e-5 of 1e-4:
+two of its reused positions went through the decode kernels.
+
+These are RTX 5090 results; at M2 the first five also passed bitwise on
+llvmpipe. Skipping the checkpoint restore fails both checkpoint scenarios,
+and an earlier bug that left the state dirty after dropping the sequence
+failed all five. Leaving the pipelined placeholder unfilled fails the
+scenario after the pipelined stop (699 of 736 reused, want 706).
+
+## Browser
+
+In Chrome on the RTX 5090, greedy generation gives the same 256 tokens as
+the native host, loaded both over HTTP and from a local file
+([Browser](browser.md#validation)). The wasm build compiles in CI; the
+WebGPU path runs only in a browser with a GPU.

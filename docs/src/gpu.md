@@ -14,7 +14,7 @@ sample the next token on the GPU ([Generation](generation.md)).
 |---|---|---|---|
 | Native Linux | Dawn → Vulkan | llvmpipe (Mesa's software renderer) | CI, kernel correctness |
 | Windows, run from WSL | Dawn → D3D12 | RTX 5090 Laptop | Local parity and timing |
-| Browser (M3) | Chrome's Dawn → D3D12/Metal/Vulkan | | The product |
+| Browser | Chrome's Dawn → D3D12/Metal/Vulkan | RTX 5090 Laptop (D3D12) | The product ([Browser](browser.md)) |
 
 Dawn comes from the pinned prebuilt release. Its static archive is wrapped
 into a shared library (`libwebgpu_dawn.so`, `webgpu_dawn.dll`) that exports
@@ -40,9 +40,9 @@ native Linux host falls back to llvmpipe.
 
 The core never calls WebGPU. It appends commands to a `Recorder`
 (`src/gpu/cmd.zig`), a host executes the batch, and the core consumes one
-completion per `submit` and per `read_buffer`. The browser host will interpret
-the same words, crossing the wasm/JS boundary once per batch rather than once
-per dispatch.
+completion per `submit` and per `read_buffer`. The browser host
+(`web/src/zllm/gpu.ts`) interprets the same words, crossing the wasm/JS
+boundary once per batch rather than once per dispatch.
 
 - **Encoding:** little-endian `u32` words. Each command starts with
   `opcode | (words << 8)`, so a host can bounds-check every command.
