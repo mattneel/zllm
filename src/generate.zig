@@ -166,7 +166,8 @@ pub const Runtime = struct {
         var rec: zllm.gpu.cmd.Recorder = .{};
         defer rec.deinit(gpa);
         rt.set = try .create(gpa, &rec);
-        rt.model = try plan.Model.upload(arena, gpa, &rec, file, bytes, limits);
+        host.file = bytes;
+        rt.model = try plan.Model.upload(arena, gpa, &rec, file, limits);
         rt.program = try plan.Program.build(arena, gpa, &rec, &rt.set, &rt.model, .{
             .context = o.context,
             .max_tokens = @min(512, o.context),

@@ -78,12 +78,12 @@ pub const Model = struct {
 
     pub const UploadError = Hparams.Error || Allocator.Error || error{ MissingTensor, BadShape, UnsupportedTensorType, TensorTooLarge };
 
-    /// Records buffer creation and uploads for every weight. `bytes` (the
-    /// GGUF file) must stay valid until the recorded batch has executed;
-    /// `arena` owns the returned layout.
-    pub fn upload(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, file: gguf.File, bytes: []const u8, limits: Limits) UploadError!Model {
+    /// Records buffer creation and an upload from the model file
+    /// (`write_file`) for every weight; the host reads the file. `arena` owns
+    /// the returned layout.
+    pub fn upload(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, file: gguf.File, limits: Limits) UploadError!Model {
         const hp = try Hparams.fromGguf(file);
-        var u: Upload = .{ .arena = arena, .gpa = gpa, .rec = rec, .file = file, .bytes = bytes, .limits = limits };
+        var u: Upload = .{ .arena = arena, .gpa = gpa, .rec = rec, .file = file, .limits = limits };
         const e: u64 = hp.n_embd;
         const ff: u64 = hp.n_ff;
 
@@ -143,7 +143,6 @@ const Upload = struct {
     gpa: Allocator,
     rec: *cmd.Recorder,
     file: gguf.File,
-    bytes: []const u8,
     limits: Limits,
 
     fn info(u: *Upload, comptime fmt: []const u8, layer: ?usize, shape: []const u64, t: gguf.TensorType) !*const gguf.TensorInfo {
@@ -158,17 +157,19 @@ const Upload = struct {
         return ti;
     }
 
-    fn buffer(u: *Upload, data: []const u8) !Arg {
-        if (data.len > u.limits.max_binding) return error.TensorTooLarge;
-        const buf = try u.rec.createBuffer(u.gpa, data.len, .{ .storage = true, .copy_dst = true });
-        try u.rec.writeBuffer(u.gpa, buf, 0, data);
-        return .{ .buffer = buf, .size = data.len };
+    /// Where `ti`'s bytes start in the file.
+    fn fileOffset(u: *const Upload, ti: *const gguf.TensorInfo) u64 {
+        return u.file.data_offset + ti.offset;
     }
 
     /// An f32 tensor of any shape.
     fn tensor(u: *Upload, comptime fmt: []const u8, layer: ?usize, shape: []const u64) !Arg {
         const ti = try u.info(fmt, layer, shape, .f32);
-        return u.buffer(u.file.tensorBytes(u.bytes, ti));
+        const size = ti.byteSize();
+        if (size > u.limits.max_binding) return error.TensorTooLarge;
+        const buf = try u.rec.createBuffer(u.gpa, size, .{ .storage = true, .copy_dst = true });
+        try u.rec.writeFile(u.gpa, buf, 0, u.fileOffset(ti), size);
+        return .{ .buffer = buf, .size = size };
     }
 
     fn vector(u: *Upload, comptime fmt: []const u8, layer: ?usize, n: u64) !Arg {
@@ -186,10 +187,11 @@ const Upload = struct {
     /// chunks.
     fn stacked(u: *Upload, layer: ?usize, k: u64, parts: anytype) !Matrix {
         const row_bytes = k * 2;
-        var datas: [parts.len][]const u8 = undefined;
+        // Each part's (file offset, rows).
+        var spans: [parts.len][2]u64 = undefined;
         var n: u64 = 0;
-        inline for (parts, &datas) |part, *data| {
-            data.* = u.file.tensorBytes(u.bytes, try u.info(part[0], layer, &.{ k, part[1] }, .bf16));
+        inline for (parts, &spans) |part, *span| {
+            span.* = .{ u.fileOffset(try u.info(part[0], layer, &.{ k, part[1] }, .bf16)), part[1] };
             n += part[1];
         }
         const rows_per_chunk = @min(n, u.limits.max_binding / row_bytes);
@@ -203,13 +205,12 @@ const Upload = struct {
             const buf = try u.rec.createBuffer(u.gpa, size, .{ .storage = true, .copy_dst = true });
             // Copy the parts' rows that fall in [row0, row0 + rows).
             var part_row0: u64 = 0;
-            for (datas) |data| {
-                const part_rows = data.len / row_bytes;
+            for (spans) |span| {
+                const part_rows = span[1];
                 const lo = @max(row0, part_row0);
                 const hi = @min(row0 + rows, part_row0 + part_rows);
                 if (lo < hi) {
-                    const src = data[@intCast((lo - part_row0) * row_bytes)..][0..@intCast((hi - lo) * row_bytes)];
-                    try u.rec.writeBuffer(u.gpa, buf, (lo - row0) * row_bytes, src);
+                    try u.rec.writeFile(u.gpa, buf, (lo - row0) * row_bytes, span[0] + (lo - part_row0) * row_bytes, (hi - lo) * row_bytes);
                 }
                 part_row0 += part_rows;
             }

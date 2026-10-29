@@ -349,7 +349,8 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     const n: u32 = @intCast(tokens.len);
     const chunk = @min(opts.chunk, n);
     const set = try zllm.kernels.Set.create(gpa, &rec);
-    const model = try plan.Model.upload(arena, gpa, &rec, file, mapped.bytes, limits);
+    host.file = mapped.bytes;
+    const model = try plan.Model.upload(arena, gpa, &rec, file, limits);
     var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{
         .max_tokens = chunk,
         .context = n,

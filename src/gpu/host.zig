@@ -13,6 +13,8 @@ const c = dawn.c;
 pub const Host = struct {
     gpa: Allocator,
     d: *dawn.Device,
+    /// The model file `write_file` copies from.
+    file: []const u8 = &.{},
     buffers: std.ArrayList(c.WGPUBuffer) = .empty,
     shaders: std.ArrayList(c.WGPUShaderModule) = .empty,
     pipelines: std.ArrayList(c.WGPUComputePipeline) = .empty,
@@ -77,6 +79,14 @@ pub const Host = struct {
                 const data = command.ptrAt([*]const u8, 3);
                 const len: usize = @intCast(command.u64At(5));
                 p.QueueWriteBuffer(h.d.queue, try get(c.WGPUBuffer, h.buffers, a[0]), command.u64At(1), data, len);
+            },
+            .write_file => {
+                try need(a, 7);
+                const start = command.u64At(3);
+                const len = command.u64At(5);
+                if (start > h.file.len or len > h.file.len - start) return error.BadCommand;
+                const data = h.file[@intCast(start)..][0..@intCast(len)];
+                p.QueueWriteBuffer(h.d.queue, try get(c.WGPUBuffer, h.buffers, a[0]), command.u64At(1), data.ptr, data.len);
             },
             .create_shader => {
                 try need(a, 4);

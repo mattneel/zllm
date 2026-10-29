@@ -44,6 +44,11 @@ pub const Op = enum(u8) {
     /// buffer, offset: u64, size: u64 — zero-fills the range, ordered with
     /// dispatches and copies (GPUCommandEncoder.clearBuffer).
     clear_buffer = 11,
+    /// buffer, offset: u64, file_offset: u64, size: u64 — copies a range of
+    /// the model file into the buffer, queued like `write_buffer`. The host
+    /// reads the file itself (natively a mapping; in the browser range reads
+    /// of a URL or a local file), so weights never pass through core memory.
+    write_file = 12,
     _,
 };
 
@@ -126,6 +131,10 @@ pub const Recorder = struct {
     /// `data` must stay valid until the batch has been executed.
     pub fn writeBuffer(r: *Recorder, gpa: Allocator, buffer: Buffer, offset: u64, data: []const u8) Allocator.Error!void {
         try r.put(gpa, .write_buffer, &(.{@backingInt(buffer)} ++ split(offset) ++ addr(data.ptr) ++ split(data.len)));
+    }
+
+    pub fn writeFile(r: *Recorder, gpa: Allocator, buffer: Buffer, offset: u64, file_offset: u64, size: u64) Allocator.Error!void {
+        try r.put(gpa, .write_file, &(.{@backingInt(buffer)} ++ split(offset) ++ split(file_offset) ++ split(size)));
     }
 
     /// `code` must stay valid until the batch has been executed.
@@ -248,6 +257,7 @@ test "recorder output decodes back to the same commands" {
     try r.dispatch(gpa, pl, .{ 4, 2, 1 }, &.{bg});
     try r.readBuffer(gpa, 7, buf, 8, &dst);
     try r.clearBuffer(gpa, buf, 4, 1 << 32);
+    try r.writeFile(gpa, buf, 1 << 32, (5 << 32) + 12, 3 << 31);
     try r.submit(gpa, 9);
     const second = try r.createBuffer(gpa, 4, .{ .uniform = true });
     try std.testing.expectEqual(@as(u32, 1), @backingInt(second));
@@ -288,6 +298,13 @@ test "recorder output decodes back to the same commands" {
     try std.testing.expectEqual(Op.clear_buffer, c.op);
     try std.testing.expectEqual(@as(u64, 4), c.u64At(1));
     try std.testing.expectEqual(@as(u64, 1 << 32), c.u64At(3));
+
+    c = (try it.next()).?;
+    try std.testing.expectEqual(Op.write_file, c.op);
+    try std.testing.expectEqual(@as(u32, 0), c.args[0]);
+    try std.testing.expectEqual(@as(u64, 1 << 32), c.u64At(1));
+    try std.testing.expectEqual(@as(u64, (5 << 32) + 12), c.u64At(3));
+    try std.testing.expectEqual(@as(u64, 3 << 31), c.u64At(5));
 
     c = (try it.next()).?;
     try std.testing.expectEqual(Op.submit, c.op);

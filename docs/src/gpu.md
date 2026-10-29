@@ -65,6 +65,12 @@ per dispatch.
 | `submit` | token |
 | `destroy` | kind, id |
 | `clear_buffer` | buffer, offset, size (zero-fill, ordered with dispatches) |
+| `write_file` | buffer, offset, file offset, size |
+
+Weights never pass through core memory. Each upload is a `write_file`: the
+host copies a range of the model file it opened into the buffer. Natively
+that range comes from a mapping of the file; in the browser it comes from
+range reads of a URL or a local file. The core needs only the GGUF header.
 
 ## Kernels
 
