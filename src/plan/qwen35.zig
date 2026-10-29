@@ -35,7 +35,8 @@ pub const Matrix = struct {
     k: u32,
     chunks: []const Chunk,
 
-    pub const Chunk = struct { arg: Arg, row0: u32, rows: u32 };
+    /// `type`: bf16 or a quantized type (kernels.Kernel.quant).
+    pub const Chunk = struct { arg: Arg, row0: u32, rows: u32, type: gguf.TensorType };
 };
 
 const Attention = struct {
@@ -157,6 +158,19 @@ const Upload = struct {
         return ti;
     }
 
+    /// A matrix weight: bf16, or a type the quantized kernels decode.
+    fn weightInfo(u: *Upload, comptime fmt: []const u8, layer: ?usize, shape: []const u64) !*const gguf.TensorInfo {
+        var buf: [96]u8 = undefined;
+        const name = if (comptime std.mem.indexOf(u8, fmt, "{d}") != null)
+            std.fmt.bufPrint(&buf, fmt, .{layer.?}) catch unreachable
+        else
+            fmt;
+        const ti = u.file.tensor(name) orelse return error.MissingTensor;
+        if (!std.mem.eql(u64, ti.shape(), shape)) return error.BadShape;
+        if (ti.type != .bf16 and kernels.Kernel.quant(.matvec, ti.type) == null) return error.UnsupportedTensorType;
+        return ti;
+    }
+
     /// Where `ti`'s bytes start in the file.
     fn fileOffset(u: *const Upload, ti: *const gguf.TensorInfo) u64 {
         return u.file.data_offset + ti.offset;
@@ -176,47 +190,67 @@ const Upload = struct {
         return u.tensor(fmt, layer, &.{n});
     }
 
-    /// A bf16 GGML {k, n} weight, split into chunks of whole rows.
+    /// A GGML {k, n} weight (bf16 or quantized), split into chunks of whole
+    /// rows.
     fn matrix(u: *Upload, comptime fmt: []const u8, layer: ?usize, k: u64, n: u64) !Matrix {
         return u.stacked(layer, k, &.{.{ fmt, n }});
     }
 
-    /// bf16 GGML {k, n_i} weights sharing an input, stacked by rows into one
+    /// GGML {k, n_i} weights sharing an input, stacked by rows into one
     /// matrix (part i's rows follow part i − 1's) and split into chunks of
-    /// whole rows. Each part's bytes are written at their place in the
-    /// chunks.
+    /// whole rows. Consecutive parts of one weight type share chunks, each
+    /// part's bytes written at their place; a change of type starts new
+    /// chunks, since a chunk is decoded by one kernel.
     fn stacked(u: *Upload, layer: ?usize, k: u64, parts: anytype) !Matrix {
-        const row_bytes = k * 2;
-        // Each part's (file offset, rows).
-        var spans: [parts.len][2]u64 = undefined;
+        const Span = struct { offset: u64, rows: u64, type: gguf.TensorType };
+        var spans: [parts.len]Span = undefined;
         var n: u64 = 0;
         inline for (parts, &spans) |part, *span| {
-            span.* = .{ u.fileOffset(try u.info(part[0], layer, &.{ k, part[1] }, .bf16)), part[1] };
+            const ti = try u.weightInfo(part[0], layer, &.{ k, part[1] });
+            span.* = .{ .offset = u.fileOffset(ti), .rows = part[1], .type = ti.type };
             n += part[1];
         }
-        const rows_per_chunk = @min(n, u.limits.max_binding / row_bytes);
+        var chunks: std.ArrayList(Matrix.Chunk) = .empty;
+        var first: usize = 0;
+        var run_row0: u64 = 0;
+        while (first < spans.len) {
+            // A run of parts of one type.
+            var end = first + 1;
+            while (end < spans.len and spans[end].type == spans[first].type) end += 1;
+            var run_rows: u64 = 0;
+            for (spans[first..end]) |s| run_rows += s.rows;
+            try u.chunkRun(&chunks, k, spans[first].type, spans[first..end], run_row0, run_rows);
+            run_row0 += run_rows;
+            first = end;
+        }
+        return .{ .n = @intCast(n), .k = @intCast(k), .chunks = chunks.items };
+    }
+
+    /// Chunks of a run of parts of type `t` covering matrix rows
+    /// [run_row0, run_row0 + run_rows).
+    fn chunkRun(u: *Upload, chunks: *std.ArrayList(Matrix.Chunk), k: u64, t: gguf.TensorType, spans: anytype, run_row0: u64, run_rows: u64) !void {
+        const l = t.layout().?;
+        const row_bytes = k / l.block_elems * l.block_bytes;
+        const rows_per_chunk = @min(run_rows, u.limits.max_binding / row_bytes);
         if (rows_per_chunk == 0) return error.TensorTooLarge;
-        const count = std.math.divCeil(u64, n, rows_per_chunk) catch unreachable;
-        const chunks = try u.arena.alloc(Matrix.Chunk, @intCast(count));
-        for (chunks, 0..) |*ch, i| {
-            const row0 = i * rows_per_chunk;
-            const rows = @min(rows_per_chunk, n - row0);
-            const size = rows * row_bytes;
+        var row0: u64 = 0;
+        while (row0 < run_rows) : (row0 += rows_per_chunk) {
+            const rows = @min(rows_per_chunk, run_rows - row0);
+            // Storage bindings are whole words.
+            const size = std.mem.alignForward(u64, rows * row_bytes, 4);
             const buf = try u.rec.createBuffer(u.gpa, size, .{ .storage = true, .copy_dst = true });
-            // Copy the parts' rows that fall in [row0, row0 + rows).
+            // Copy the parts' rows that fall in [row0, row0 + rows) of the run.
             var part_row0: u64 = 0;
             for (spans) |span| {
-                const part_rows = span[1];
                 const lo = @max(row0, part_row0);
-                const hi = @min(row0 + rows, part_row0 + part_rows);
+                const hi = @min(row0 + rows, part_row0 + span.rows);
                 if (lo < hi) {
-                    try u.rec.writeFile(u.gpa, buf, (lo - row0) * row_bytes, span[0] + (lo - part_row0) * row_bytes, (hi - lo) * row_bytes);
+                    try u.rec.writeFile(u.gpa, buf, (lo - row0) * row_bytes, span.offset + (lo - part_row0) * row_bytes, (hi - lo) * row_bytes);
                 }
-                part_row0 += part_rows;
+                part_row0 += span.rows;
             }
-            ch.* = .{ .arg = .{ .buffer = buf, .size = size }, .row0 = @intCast(row0), .rows = @intCast(rows) };
+            try chunks.append(u.arena, .{ .arg = .{ .buffer = buf, .size = size }, .row0 = @intCast(run_row0 + row0), .rows = @intCast(rows), .type = t });
         }
-        return .{ .n = @intCast(n), .k = @intCast(k), .chunks = chunks };
     }
 };
 
@@ -326,7 +360,7 @@ pub const Program = struct {
     pub fn build(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *const kernels.Set, m: *const Model, cfg: Config, limits: Limits) BuildError!Program {
         const hp = m.hp;
         if (cfg.max_tokens == 0 or cfg.logit_rows == 0 or cfg.context < cfg.max_tokens or cfg.checkpoints == 0) return error.BadConfig;
-        if (hp.head_dim > kernels.max_head_dim or hp.gdn_head_dim > kernels.max_delta_head or hp.n_embd > kernels.matvec_max_staged or hp.n_embd % 4 != 0) return error.BadConfig;
+        if (hp.head_dim > kernels.max_head_dim or hp.gdn_head_dim > kernels.max_delta_head or hp.n_embd % 4 != 0) return error.BadConfig;
         if (hp.n_head % hp.n_head_kv != 0 or hp.n_head / hp.n_head_kv > kernels.attn_max_group) return error.BadConfig;
         const e: u64 = hp.n_embd;
         const cap: u64 = cfg.max_tokens;
@@ -393,7 +427,7 @@ pub const Program = struct {
         const mm: Mm = .{ .b = &b, .arena = arena, .cap = capn, .eps = hp.rms_eps };
 
         for (m.tok_embd.chunks) |ch| {
-            try body.append(arena, .{ .launch = try b.add(.embed_bf16, P.EmbedBf16{ .dim = hp.n_embd, .row0 = ch.row0, .chunk_rows = ch.rows }, &.{ token_ids, ch.arg, x }, .rows_x) });
+            try body.append(arena, .{ .launch = try b.add(weightKernel(.embed, ch.type), P.EmbedBf16{ .dim = hp.n_embd, .row0 = ch.row0, .chunk_rows = ch.rows }, &.{ token_ids, ch.arg, x }, .rows_x) });
         }
         var delta_i: u64 = 0;
         for (m.layers, 0..) |*layer, il| {
@@ -708,7 +742,7 @@ const Mm = struct {
         std.debug.assert(w.k % kernels.matmul_tile_k == 0);
         const list = try mm.arena.alloc(kernels.Launch, w.chunks.len);
         for (w.chunks, list) |ch, *l| {
-            l.* = try mm.b.add(.matmul_bf16, P.MatmulBf16{
+            l.* = try mm.b.add(weightKernel(.matmul, ch.type), P.MatmulBf16{
                 .rows = mm.cap,
                 .n = ch.rows,
                 .k = w.k,
@@ -725,7 +759,6 @@ const Mm = struct {
 
     /// The same for a decode step, matrix-vector, with `fuse` folded in.
     fn vector(mm: Mm, out: Arg, x: Arg, w: *const Matrix, fuse: Fuse) Program.BuildError![]const kernels.Launch {
-        std.debug.assert(fuse.norm == null or w.k <= kernels.matvec_max_staged);
         if (fuse.silu_pair) |half| {
             // Both halves of a row pair must be in one binding.
             if (w.chunks.len != 1) return error.TooLarge;
@@ -734,8 +767,10 @@ const Mm = struct {
         const flags: P.MatvecBf16.Flags = .{ .norm = fuse.norm != null, .accumulate = fuse.accumulate, .silu_pair = fuse.silu_pair != null };
         const list = try mm.arena.alloc(kernels.Launch, w.chunks.len);
         for (w.chunks, list) |ch, *l| {
+            // The bf16 kernel normalizes only staged inputs.
+            if (ch.type == .bf16 and fuse.norm != null and w.k > kernels.matvec_max_staged) return error.BadConfig;
             const n = fuse.silu_pair orelse ch.rows;
-            l.* = try mm.b.add(.matvec_bf16, P.MatvecBf16{
+            l.* = try mm.b.add(weightKernel(.matvec, ch.type), P.MatvecBf16{
                 .n = n,
                 .k = w.k,
                 .col0 = if (fuse.silu_pair != null) 0 else ch.row0,
@@ -752,6 +787,17 @@ const Mm = struct {
         return list;
     }
 };
+
+/// The kernel for operation `op` on a weight chunk of type `t` (bf16, or a
+/// quantized type Upload.weightInfo accepted).
+fn weightKernel(comptime op: kernels.QuantOp, t: gguf.TensorType) kernels.Kernel {
+    if (t == .bf16) return switch (op) {
+        .matvec => .matvec_bf16,
+        .matmul => .matmul_bf16,
+        .embed => .embed_bf16,
+    };
+    return kernels.Kernel.quant(op, t).?;
+}
 
 fn concat(arena: Allocator, parts: []const []const kernels.Launch) Allocator.Error![]const kernels.Launch {
     return std.mem.concat(arena, kernels.Launch, parts);
