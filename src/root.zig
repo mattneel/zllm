@@ -5,6 +5,8 @@ pub const tokenizer = @import("tokenizer/tokenizer.zig");
 pub const graph = @import("graph/graph.zig");
 pub const ref = @import("ref/ref.zig");
 pub const gpu = @import("gpu/gpu.zig");
+pub const kernels = @import("kernels/kernels.zig");
+pub const kernel_check = @import("kernels/check.zig");
 
 test {
     const std = @import("std");

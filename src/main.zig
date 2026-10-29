@@ -18,6 +18,7 @@ const usage =
     \\                                       token ids; write activation records (format in
     \\                                       tools/llama-dump/dump.cpp)
     \\  gpu-info                            open Dawn and print the adapter and limits as JSON
+    \\  gpu-check                           check every GPU kernel against a CPU computation
     \\
     \\environment:
     \\  ZLLM_THREADS   worker threads for `forward` (default: one per physical core)
@@ -62,6 +63,9 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "gpu-info")) {
         if (args.len != 2) return fail(usage);
         try gpuInfo(gpa, init.environ_map, out);
+    } else if (std.mem.eql(u8, cmd, "gpu-check")) {
+        if (args.len != 2) return fail(usage);
+        try gpuCheck(gpa, init.environ_map, out);
     } else {
         return fail(usage);
     }
@@ -177,12 +181,31 @@ const FileBytes = struct {
     }
 };
 
-fn gpuInfo(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *Io.Writer) !void {
+fn openDawn(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) !*zllm.gpu.dawn.Device {
     const lib = env.get("ZLLM_DAWN") orelse zllm.gpu.dawn.default_library;
-    const d = zllm.gpu.dawn.Device.init(gpa, lib) catch |err| {
+    return zllm.gpu.dawn.Device.init(gpa, lib) catch |err| {
         std.log.err("cannot open Dawn ({s}): {t}", .{ lib, err });
         return err;
     };
+}
+
+fn gpuCheck(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *Io.Writer) !void {
+    const d = try openDawn(gpa, env);
+    defer d.deinit(gpa);
+    var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
+    const info = d.info(&raw);
+    try out.print("{s} ({s})\n", .{ info.device, info.backend });
+    d.freeInfo(raw);
+
+    var host = zllm.gpu.Host.init(gpa, d);
+    defer host.deinit();
+    const ok = try zllm.kernel_check.run(gpa, &host, out);
+    try out.flush();
+    if (!ok) return error.KernelCheckFailed;
+}
+
+fn gpuInfo(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *Io.Writer) !void {
+    const d = try openDawn(gpa, env);
     defer d.deinit(gpa);
     var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
     const info = d.info(&raw);
