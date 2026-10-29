@@ -78,9 +78,12 @@ Kernels live in `src/kernels/*.wgsl`, each with a uniform `Params` struct
 mirrored in `kernels.zig`. Weights stay in their GGUF format on the GPU,
 BF16 or quantized, and are decoded in the shader; activations and
 accumulation are f32, except that the quantized prefill multiplies round
-their input to 8 bits as llama.cpp does (below). The one change to the format: Q3_K and Q6_K blocks
-(110 and 210 bytes) are padded to 112 and 224, so every K-quant block
-starts on a 16-byte boundary and is read in 16-byte vectors.
+their input to 8 bits as llama.cpp does (below). Two changes to the
+format, made at load: Q6_K blocks (210 bytes) are padded to 224, so every
+K-quant block starts on a 16-byte boundary and is read in 16-byte vectors;
+and Q3_K blocks (110 bytes) are repacked into eight 16-byte units of 32
+weights, each holding its 2-bit values, high bits, two scales and d, so a
+unit decodes from one load (128 bytes per block).
 
 | Kernel | Work | Notes |
 |---|---|---|
@@ -98,7 +101,7 @@ starts on a 16-byte boundary and is read in 16-byte vectors.
 | `matvec_<q>`, `matmul_<q>`, `embed_<q>` | The multiplies and embedding gather on quantized weights: `q8_0`, `q3_k`, `q4_k`, `q5_k`, `q6_k` | `matvec_quant.wgsl`, `matmul_quant.wgsl` and `embed_quant.wgsl`, composed at compile time with `quant/<q>.wgsl`. That file decodes a row's 32-weight units as ggml's `dequantize_row_*` does, value for value, 16 weights from 16-byte loads at a time. The decode multiply keeps `matvec_bf16`'s fusions, stages x in 2,048-float tiles, and splits each block among 4–8 lanes (`quant/<q>_dot.wgsl`), consecutive lanes on consecutive vectors. The prefill multiply takes x rounded to 8-bit blocks and sums each weight sub-block's products exactly in integers (`dot4I8Packed`), then scales them, as llama.cpp's `vec_dot` does: 32 tokens × 128 outputs per workgroup, 4 × 8 per thread, the next unit fetched and decoded while the current one computes |
 | `quantize_q8` | Rounds a quantized prefill multiply's input to 8-bit blocks, computing it first where it is an RMSNorm or the SiLU pair, so those kernels don't run | As llama.cpp's CPU backend does for the weight type: Q8_K blocks of 256 for the K-quants, Q8_0 blocks of 32 for Q8_0. Bitwise as the reference's `--llama-activations` mode |
 | `matmul_reduce` | Adds up a quantized prefill multiply split over k | A matrix with too few column tiles to fill the GPU (a 5,120-row projection has 40) splits k into slices, aiming at 256 workgroups; each slice writes partial sums, and this adds them into the output |
-| `repad` | Pads Q3_K and Q6_K blocks to 16-byte multiples, at load | Each chunk's rows go to a staging buffer, freed after the chunk's own submit |
+| `repad`, `repack_q3_k` | Lay out Q6_K (padded) and Q3_K (repacked) blocks at load | Each chunk's rows go to a staging buffer, freed after the chunk's own submit |
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling) |
 

@@ -258,8 +258,8 @@ Qwen 3.8 27B at Q3_K_M (13.75 GB) on the same GPU, `zllm generate`, greedy:
 
 | Phase | First run | Now | Spec bar |
 |---|---|---|---|
-| Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 256–257 tok/s, in 31 steps | 300 tok/s |
-| Decode | 6 tok/s | 26–27 tok/s | 20 tok/s |
+| Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 288–300 tok/s, in 31 steps | 300 tok/s |
+| Decode | 6 tok/s | 28–29 tok/s | 20 tok/s |
 
 The quantized kernels made the difference ([GPU backend](gpu.md#kernels)).
 `zllm bench` at position 288 measured the steps:
@@ -270,12 +270,13 @@ The quantized kernels made the difference ([GPU backend](gpu.md#kernels)).
 | x staged in workgroup tiles | 50 |
 | Blocks split among lanes, 8 rows per workgroup | 46 |
 | Q3_K and Q6_K padded; 16-byte loads; four weights decoded at once | 38 |
+| Q3_K repacked into 16-byte units; x reads staggered across banks | 34 |
 
-A decode step reads about 12.2 GB of weights, 13.7 ms at this GPU's
-bandwidth. The Q3_K multiplies, 6.6 GB, take about 19 ms: 11 ms of loads,
-4 ms of decoding and 3.5 ms reading x from workgroup memory.
+A decode step reads about 13.1 GB of weights (Q3_K repacked), 14.6 ms at
+this GPU's bandwidth. The Q3_K multiplies take 16.5–17.5 ms, the Q4_K ones
+about 9.3 ms.
 
-Prefill steps of the 27B are 32 tokens, about 116 ms each:
+Prefill steps of the 27B are 32 tokens, about 97 ms each:
 
 | Prefill multiply | tok/s, end to end |
 |---|---|
@@ -283,6 +284,7 @@ Prefill steps of the 27B are 32 tokens, about 116 ms each:
 | Input rounded to 8 bits, integer dot products (`dot4I8Packed`) | 227 |
 | The next unit fetched while the current one computes | 247–250 |
 | Rounding fused with the RMSNorm and SiLU that produce its input | 256–257 |
+| Q3_K repacked into self-contained 16-byte units | 288–300 |
 
 In f32 the multiply-adds alone took about 66 ms of a step. Rounding the
 input to 8-bit blocks, as llama.cpp's CPU backend does, makes each weight
@@ -291,9 +293,21 @@ instruction. The GPU is then checked against the reference that rounds
 the same way ([Validation](validation.md#the-27b)). Decode keeps f32
 inputs: it is bound by reading weights, not by arithmetic.
 
-The multiply now takes about 98 ms of a step. It issues about three
-instructions per four products: the integer dot product, a separate add
-(WGSL's `dot4I8Packed` has no accumulator operand) and the sub-block
-scaling. That is near this GPU's issue rate. Rounding the input happens in the
-same kernel that computes it (RMSNorm, SiLU), and the rest of the step
-takes about 36 ms.
+`zllm profile` (below) shows where a step goes now: of about 88 ms of GPU
+time, the Q3_K multiplies take 43 ms and the Q4_K ones 29 ms, both at about
+185 GB/s of weights; the gated delta rule takes 7 ms, attention 3 ms, and
+rounding the inputs and adding up split multiplies 4 ms. Each multiply
+issues about three instructions per four products: the integer dot
+product, a separate add (WGSL's `dot4I8Packed` has no accumulator operand)
+and the sub-block scaling.
+
+### Profiling
+
+`zllm profile <model.gguf> [tokens]` times every dispatch with timestamp
+queries: prefill steps of `tokens` tokens (default 32), then decode steps.
+It reports each kernel's milliseconds per step, and the largest launches by
+grid, which for a multiply identifies its matrix. Each dispatch runs in its
+own compute pass while profiling, so a profiled step takes up to about 10%
+longer than a normal one; both are printed. It found the 27B's gate and up
+projection taking 42% of a prefill step at 107 GB/s, which led to the Q3_K
+repack.
