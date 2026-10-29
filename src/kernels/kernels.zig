@@ -20,6 +20,7 @@ const gguf = @import("../gguf/gguf.zig");
 pub const Kernel = enum {
     rmsnorm,
     matmul_bf16,
+    matmul_reduce,
     matvec_bf16,
     silu_mul,
     embed_bf16,
@@ -99,6 +100,33 @@ fn composed(comptime name: []const u8) []const u8 {
 pub const matmul_tile_n = 64;
 pub const matmul_tile_t = 16;
 pub const matmul_tile_k = 32;
+/// Quantized prefill multiply tiles (matmul_quant.wgsl: TN outputs × TM
+/// tokens).
+pub const matmul_quant_tile_n = 128;
+pub const matmul_quant_tile_t = 32;
+
+/// Split of a quantized prefill multiply over k: a matrix of n rows has
+/// only ⌈n / tile⌉ column tiles per token tile, too few workgroups to keep
+/// the GPU busy, so each takes `count` slices of `k_slice` positions (a
+/// multiple of the 32-weight unit), aiming at matmul_target_groups, and
+/// matmul_reduce adds them up. Slices are at least matmul_min_slice deep.
+pub const matmul_target_groups = 256;
+pub const matmul_min_slice = 512;
+pub const Slices = struct { count: u32, k_slice: u32 };
+
+pub fn matmulSlices(n: u32, k: u32) Slices {
+    const tiles = std.math.divCeil(u32, n, matmul_quant_tile_n) catch unreachable;
+    const want = std.math.divCeil(u32, matmul_target_groups, tiles) catch unreachable;
+    const count = std.math.clamp(want, 1, @max(1, k / matmul_min_slice));
+    const k_slice = std.mem.alignForward(u32, std.math.divCeil(u32, k, count) catch unreachable, 32);
+    return .{ .count = std.math.divCeil(u32, k, k_slice) catch unreachable, .k_slice = k_slice };
+}
+
+/// Tile sizes (outputs, tokens) of the prefill multiply for weights of type `t`.
+pub fn matmulTiles(t: gguf.TensorType) [2]u32 {
+    return if (t == .bf16) .{ matmul_tile_n, matmul_tile_t } else .{ matmul_quant_tile_n, matmul_quant_tile_t };
+}
+
 /// Steps of at most this many tokens (decoding) use the decode kernels:
 /// `matvec_bf16` and split attention.
 pub const decode_max_rows = 4;
@@ -141,6 +169,29 @@ pub const params = struct {
         /// out += result (a residual add).
         accumulate: u32 = 0,
         _pad: [2]u32 = @splat(0),
+    };
+    /// The quantized prefill multiply: as MatmulBf16 over positions
+    /// [z·k_slice, (z + 1)·k_slice) for workgroup z, writing at
+    /// z·slice_stride (matmulSlices).
+    pub const MatmulQuant = extern struct {
+        rows: u32,
+        n: u32,
+        k: u32,
+        col0: u32,
+        out_stride: u32,
+        accumulate: u32 = 0,
+        k_slice: u32,
+        slice_stride: u32 = 0,
+    };
+    pub const MatmulReduce = extern struct {
+        rows: u32,
+        n: u32,
+        slices: u32,
+        col0: u32,
+        out_stride: u32,
+        accumulate: u32 = 0,
+        slice_stride: u32,
+        _pad: u32 = 0,
     };
     pub const MatvecBf16 = extern struct {
         n: u32,
@@ -407,8 +458,8 @@ pub const Grid = union(enum) {
     rows_x,
     /// (x, rows, 1)
     rows_y: u32,
-    /// (x, ⌈rows / tile⌉, 1)
-    tiles_y: struct { x: u32, tile: u32 },
+    /// (x, ⌈rows / tile⌉, z)
+    tiles_y: struct { x: u32, tile: u32, z: u32 = 1 },
     /// One thread per element of rows × width (`Launcher.elementwise`).
     elems: u32,
     /// (x, ⌈keys / block⌉, rows): blocks of cache positions per token.
@@ -420,7 +471,7 @@ pub const Grid = union(enum) {
             .fixed => |f| f,
             .rows_x => .{ rows, 1, 1 },
             .rows_y => |x| .{ x, rows, 1 },
-            .tiles_y => |t| .{ t.x, std.math.divCeil(u32, rows, t.tile) catch unreachable, 1 },
+            .tiles_y => |t| .{ t.x, std.math.divCeil(u32, rows, t.tile) catch unreachable, t.z },
             .elems => |w| Launcher.elementwise(@as(usize, rows) * w),
             .key_blocks => |k| .{ k.x, std.math.divCeil(u32, e.keys, k.block) catch unreachable, rows },
         };

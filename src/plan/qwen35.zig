@@ -79,6 +79,26 @@ pub const Model = struct {
 
     pub const UploadError = Hparams.Error || Allocator.Error || error{ MissingTensor, BadShape, UnsupportedTensorType, TensorTooLarge };
 
+    /// Calls f(context, w) for every multiplied weight (not the embedding
+    /// table).
+    pub fn eachMatrix(m: *const Model, context: anytype, comptime f: fn (@TypeOf(context), *const Matrix) void) void {
+        if (m.output) |*o| f(context, o);
+        for (m.layers) |*l| {
+            f(context, &l.ffn_gu);
+            f(context, &l.ffn_down);
+            switch (l.mixer) {
+                .attention => |*w| {
+                    f(context, &w.wqkv);
+                    f(context, &w.wo);
+                },
+                .delta_net => |*w| {
+                    f(context, &w.wproj);
+                    f(context, &w.wout);
+                },
+            }
+        }
+    }
+
     /// Records buffer creation and an upload from the model file
     /// (`write_file`) for every weight; the host reads the file. `arena` owns
     /// the returned layout.
@@ -447,7 +467,7 @@ pub const Program = struct {
         var body: std.ArrayList(Item) = .empty;
         const capn: u32 = cfg.max_tokens;
         const norm: P.RmsNorm = .{ .rows = capn, .dim = hp.n_embd, .eps = hp.rms_eps };
-        const mm: Mm = .{ .b = &b, .arena = arena, .cap = capn, .eps = hp.rms_eps };
+        const mm: Mm = .{ .b = &b, .arena = arena, .cap = capn, .eps = hp.rms_eps, .partials = try a.storage(Mm.partialFloats(m, cap)) };
 
         for (m.tok_embd.chunks) |ch| {
             try body.append(arena, .{ .launch = try b.add(weightKernel(.embed, ch.type), P.EmbedBf16{ .dim = hp.n_embd, .row0 = ch.row0, .chunk_rows = ch.rows }, &.{ token_ids, ch.arg, x }, .rows_x) });
@@ -749,6 +769,28 @@ const Mm = struct {
     arena: Allocator,
     cap: u32,
     eps: f32,
+    /// Partial sums of the prefill multiplies split over k
+    /// (partialFloats).
+    partials: Arg,
+
+    /// Floats of `partials` for steps of `cap` tokens: the largest split
+    /// chunk's slices × rows × cap, at least one.
+    fn partialFloats(m: *const Model, cap: u64) u64 {
+        const Most = struct {
+            cap: u64,
+            floats: u64 = 1,
+            fn add(s: *@This(), w: *const Matrix) void {
+                for (w.chunks) |ch| {
+                    if (ch.type == .bf16) continue;
+                    const slices = kernels.matmulSlices(ch.rows, w.k);
+                    if (slices.count > 1) s.floats = @max(s.floats, @as(u64, slices.count) * ch.rows * s.cap);
+                }
+            }
+        };
+        var most: Most = .{ .cap = cap };
+        m.eachMatrix(&most, Most.add);
+        return most.floats;
+    }
 
     /// What the decode multiply fuses around it.
     const Fuse = struct {
@@ -760,24 +802,62 @@ const Mm = struct {
         silu_pair: ?u32 = null,
     };
 
-    /// out[t][j] (+)= x[t] · w[j] for the rows of a prefill step: tiled.
+    /// out[t][j] (+)= x[t] · w[j] for the rows of a prefill step: tiled;
+    /// quantized chunks with too few column tiles split over k into
+    /// `partials` and are added up by matmul_reduce.
     fn tiled(mm: Mm, out: Arg, x: Arg, w: *const Matrix, accumulate: bool) Allocator.Error![]const kernels.Launch {
         std.debug.assert(w.k % kernels.matmul_tile_k == 0);
-        const list = try mm.arena.alloc(kernels.Launch, w.chunks.len);
-        for (w.chunks, list) |ch, *l| {
-            l.* = try mm.b.add(weightKernel(.matmul, ch.type), P.MatmulBf16{
+        var list: std.ArrayList(kernels.Launch) = .empty;
+        for (w.chunks) |ch| {
+            const tiles = kernels.matmulTiles(ch.type);
+            const x_tiles = std.math.divCeil(u32, ch.rows, tiles[0]) catch unreachable;
+            if (ch.type == .bf16) {
+                try list.append(mm.arena, try mm.b.add(.matmul_bf16, P.MatmulBf16{
+                    .rows = mm.cap,
+                    .n = ch.rows,
+                    .k = w.k,
+                    .col0 = ch.row0,
+                    .out_stride = w.n,
+                    .accumulate = @intFromBool(accumulate),
+                }, &.{ x, ch.arg, out }, .{ .tiles_y = .{ .x = x_tiles, .tile = tiles[1] } }));
+                continue;
+            }
+            const s = kernels.matmulSlices(ch.rows, w.k);
+            const kernel = weightKernel(.matmul, ch.type);
+            if (s.count == 1) {
+                try list.append(mm.arena, try mm.b.add(kernel, P.MatmulQuant{
+                    .rows = mm.cap,
+                    .n = ch.rows,
+                    .k = w.k,
+                    .col0 = ch.row0,
+                    .out_stride = w.n,
+                    .accumulate = @intFromBool(accumulate),
+                    .k_slice = w.k,
+                }, &.{ x, ch.arg, out }, .{ .tiles_y = .{ .x = x_tiles, .tile = tiles[1] } }));
+                continue;
+            }
+            const stride = mm.cap * ch.rows;
+            std.debug.assert(@as(u64, s.count) * stride * 4 <= mm.partials.size);
+            try list.append(mm.arena, try mm.b.add(kernel, P.MatmulQuant{
                 .rows = mm.cap,
                 .n = ch.rows,
                 .k = w.k,
+                .col0 = 0,
+                .out_stride = ch.rows,
+                .k_slice = s.k_slice,
+                .slice_stride = stride,
+            }, &.{ x, ch.arg, mm.partials }, .{ .tiles_y = .{ .x = x_tiles, .tile = tiles[1], .z = s.count } }));
+            try list.append(mm.arena, try mm.b.add(.matmul_reduce, P.MatmulReduce{
+                .rows = mm.cap,
+                .n = ch.rows,
+                .slices = s.count,
                 .col0 = ch.row0,
                 .out_stride = w.n,
                 .accumulate = @intFromBool(accumulate),
-            }, &.{ x, ch.arg, out }, .{ .tiles_y = .{
-                .x = std.math.divCeil(u32, ch.rows, kernels.matmul_tile_n) catch unreachable,
-                .tile = kernels.matmul_tile_t,
-            } });
+                .slice_stride = stride,
+            }, &.{ mm.partials, out }, .{ .elems = ch.rows }));
         }
-        return list;
+        return list.items;
     }
 
     /// The same for a decode step, matrix-vector, with `fuse` folded in.

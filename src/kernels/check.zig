@@ -387,25 +387,37 @@ fn Quant(comptime t: gguf.TensorType) type {
             return quantMatvec(c, t, "matvec " ++ @tagName(t) ++ " norm+=", 1024, false);
         }
 
+        /// The prefill multiply accumulating, over more than one tile each
+        /// way: whole, and split over k into partials that matmul_reduce
+        /// adds up (kernels.matmulSlices).
         fn matmul(c: *Ctx) !Result {
-            const rows = 19;
-            const n = 100;
-            const k = 512;
-            const x = try c.random(rows * k, 1);
+            const rows = 70;
+            const n = 150;
+            const k = 1024;
+            const s = kernels.matmulSlices(n, k);
+            std.debug.assert(s.count > 1);
+            const x = try c.upload(try c.random(rows * k, 1));
+            const xs = try c.read(x);
             const w = try quantRows(c, t, n, k);
+            const wa = try gpuWeights(c, t, w.bytes);
             const init = try c.random(rows * n, 4);
-            const out = try c.upload(init);
-            try c.launcher().launch(kernels.Kernel.quant(.matmul, t).?, P.MatmulBf16{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .accumulate = 1 }, &.{
-                try c.upload(x), try gpuWeights(c, t, w.bytes), out,
-            }, .{ std.math.divCeil(u32, n, kernels.matmul_tile_n) catch unreachable, std.math.divCeil(u32, rows, kernels.matmul_tile_t) catch unreachable, 1 });
-            const got = try c.read(out);
+            const whole = try c.upload(init);
+            const split = try c.upload(init);
+            const partials = try c.output(s.count * rows * n);
+            const grid: [3]u32 = .{ std.math.divCeil(u32, n, kernels.matmul_quant_tile_n) catch unreachable, std.math.divCeil(u32, rows, kernels.matmul_quant_tile_t) catch unreachable, 1 };
+            const l = c.launcher();
+            const kernel = kernels.Kernel.quant(.matmul, t).?;
+            try l.launch(kernel, P.MatmulQuant{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .accumulate = 1, .k_slice = k }, &.{ x, wa, whole }, grid);
+            try l.launch(kernel, P.MatmulQuant{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .k_slice = s.k_slice, .slice_stride = rows * n }, &.{ x, wa, partials }, .{ grid[0], grid[1], s.count });
+            try l.launch(.matmul_reduce, P.MatmulReduce{ .rows = rows, .n = n, .slices = s.count, .col0 = 0, .out_stride = n, .accumulate = 1, .slice_stride = rows * n }, &.{ partials, split }, kernels.Launcher.elementwise(rows * n));
             const want = try c.arena.alloc(f64, rows * n);
             for (0..rows) |tk| for (0..n) |j| {
-                var s: f64 = init[tk * n + j];
-                for (0..k) |i| s += @as(f64, x[tk * k + i]) * w.values[j * k + i];
-                want[tk * n + j] = s;
+                var sum: f64 = init[tk * n + j];
+                for (0..k) |i| sum += @as(f64, xs[tk * k + i]) * w.values[j * k + i];
+                want[tk * n + j] = sum;
             };
-            return .{ .name = "matmul " ++ @tagName(t) ++ " +=", .err = relErr(got, want), .tolerance = 1e-5 };
+            const err = @max(relErr(try c.read(whole), want), relErr(try c.read(split), want));
+            return .{ .name = "matmul " ++ @tagName(t) ++ " += (whole, split k)", .err = err, .tolerance = 1e-5 };
         }
 
         fn embed(c: *Ctx) !Result {
