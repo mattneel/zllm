@@ -16,6 +16,8 @@ Pass criteria (docs/src/validation.md):
     independent of how the sequence is split into steps.
   * f16 KV cache (the default): top-1 agreement >= F16_TOP1_MIN, and cosine
     >= F16_COSINE_MIN at every position.
+  * `zllm engine-check`: requests that reuse the resident sequence or a
+    checkpoint give logits bitwise identical to fresh runs.
 
 Hosts: `native` runs the Linux build on the Vulkan adapter Dawn finds
 (llvmpipe in CI); `d3d12` runs the Windows build through scripts/d3d12.sh.
@@ -137,6 +139,12 @@ def main() -> int:
 
     print(f"\n{args.host}, f32 KV: top-1 agreement {agree}/{total}; min cosine {worst_cos:.7f} (min {COSINE_MIN}); max rel L2 {worst_rel:.2e} (max {REL_L2_MAX})")
     print(f"{args.host}, f16 KV: top-1 agreement {agree16}/{total} (min {F16_TOP1_MIN:.0%}); min cosine {worst_cos16:.7f} (min {F16_COSINE_MIN})")
+    proc = zllm_on_host(args, paths, "engine-check", paths.gguf)
+    print(f"\n{args.host}, engine-check:")
+    sys.stdout.write("".join(line + "\n" for line in proc.stdout.replace("\r", "").splitlines() if line.startswith(("PASS", "FAIL"))))
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+    fail.expect("engine-check", proc.returncode == 0, f"exit code {proc.returncode}")
     fail.expect("top-1 agreement", agree == total, f"{agree}/{total}")
     fail.expect("f16 KV top-1 agreement", agree16 >= F16_TOP1_MIN * total, f"{agree16}/{total}")
     return fail.report()

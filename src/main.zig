@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const zllm = @import("zllm");
 const gen = @import("generate.zig");
+const engine_check = @import("engine_check.zig");
 
 const usage =
     \\usage: zllm <command> [args]
@@ -23,6 +24,8 @@ const usage =
     \\                                       chat template
     \\  gpu-info                            open Dawn and print the adapter and limits as JSON
     \\  gpu-check                           check every GPU kernel against a CPU computation
+    \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
+    \\                                       logits bitwise identical to a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
     \\                                       as `forward`, on the GPU through Dawn, in
     \\                                       steps of N tokens (default 512; f32 KV)
@@ -68,14 +71,16 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "forward")) {
         if (args.len != 5) return fail(usage);
         try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4]);
-    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat")) {
+    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check")) {
         const is_chat = std.mem.eql(u8, cmd, "chat");
-        const fixed: usize = if (is_chat) 3 else 4;
+        const is_check = std.mem.eql(u8, cmd, "engine-check");
+        const fixed: usize = if (is_chat or is_check) 3 else 4;
         if (args.len < fixed) return fail(usage);
-        const opts = gen.Options.parse(arena, args[fixed..]) catch |err| switch (err) {
+        var opts = gen.Options.parse(arena, args[fixed..]) catch |err| switch (err) {
             error.InvalidUsage => return fail(usage),
             else => return err,
         };
+        if (is_check) opts.context = 2048;
         const mapped = try FileBytes.open(gpa, io, args[2]);
         defer mapped.close(gpa);
         var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
@@ -88,7 +93,9 @@ pub fn main(init: std.process.Init) !void {
         const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
         defer rt.destroy();
         std.debug.print("[loaded in {d} ms; context {d}, {t} KV]\n", .{ t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), opts.context, opts.kv });
-        if (is_chat) {
+        if (is_check) {
+            if (!try engine_check.run(rt, out)) return error.EngineCheckFailed;
+        } else if (is_chat) {
             var in_buf: [64 * 1024]u8 = undefined;
             var stdin: Io.File.Reader = .init(.stdin(), io, &in_buf);
             try gen.chatLoop(rt, opts, &stdin.interface, out);
