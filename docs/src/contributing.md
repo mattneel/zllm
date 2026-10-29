@@ -8,6 +8,7 @@
 | [uv](https://docs.astral.sh/uv/) | `tools/uv.lock` | parity harness in `tools/` |
 | [Bun](https://bun.sh) | `web/bun.lock` | browser-side TypeScript in `web/` |
 | [mdBook](https://rust-lang.github.io/mdBook/) 0.5 | CI workflow | this book |
+| [Dawn](https://dawn.googlesource.com/dawn) | `scripts/fixtures.sh` (prebuilt release) | GPU host; on Linux also `libvulkan1` and `mesa-vulkan-drivers` for llvmpipe |
 
 ## Layout
 
@@ -18,6 +19,8 @@
 | `web/` | Browser-side TypeScript: the book's scripts now, the wasm shim and `zllm.js` from M3 |
 | `docs/` | This book; GitHub Pages serves it from `master` |
 | `scripts/fixtures.sh` | Pinned fixture downloads |
+| `scripts/d3d12.sh` | Builds the Windows binary and runs it on the D3D12 host from WSL |
+| `third_party/dawn` | The vendored `webgpu.h` matching the pinned Dawn release |
 
 ## Checks
 
@@ -27,13 +30,15 @@ Run these before every commit; CI runs the same:
 zig fmt --check . && zig build test
 (cd web && bun run check)
 scripts/fixtures.sh vocab && zig build check-tokenizer
+scripts/fixtures.sh dawn && zig build gpu-check
 (cd web && bun run build:book) && mdbook build docs
 ```
 
 For changes to `gguf`, `graph` or `ref`, also run the fixture-backed checks
-`zig build check-gguf` and `zig build check-forward`. They need the
-1.5 GB model and a llama.cpp build (`scripts/fixtures.sh`), so CI does not
-run them.
+`zig build check-gguf` and `zig build check-forward`. For changes to `gpu`,
+`kernels` or `plan`, run `zig build check-gpu`, and on WSL with a GPU repeat
+both GPU checks with `-Dgpu-host=d3d12`. These need the 1.5 GB model and a
+llama.cpp build (`scripts/fixtures.sh`), so CI does not run them.
 
 ## TypeScript
 

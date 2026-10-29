@@ -45,14 +45,14 @@ Modules not yet started contain only a `README.md` stating their contract.
 | `graph` | M0 | Architecture hyperparameters and layer schedule from GGUF metadata |
 | `ref` | M0 | Dequantization to f32 and the CPU f32 reference forward pass; the correctness oracle for every GPU kernel |
 | `tmpl` | M4 | Handlebars-subset WGSL template renderer |
-| `kernels` | M1 | `*.wgsl.hbs` templates with parameter schemas and cost models |
+| `kernels` | M1 | WGSL compute kernels and their launch parameters; templates with schemas and cost models in M4 |
 | `tune` | M4 | Load-time candidate sweeps |
 | `fuse` | M5 | Graph fusion pass |
-| `plan` | M1 | Buffers, pipelines, bind groups, step recipes |
+| `plan` | M1 | Weight layout (row-chunked to fit bindings), activation buffers, recorded forward pass |
 | `sched` | M2 | Submission building under the time budget |
 | `state` | M2 | KV pages, DeltaNet state, checkpoints |
 | `sampler` | M2 | GPU sampling |
-| `gpu` | M1 | Backend interface; `web` and `dawn` implementations |
+| `gpu` | M1 | Command stream, Dawn host (`webgpu.h` loaded at run time); browser host in M3 |
 | `api` | M3 | C ABI, wasm exports, TypeScript facade |
 
 `ref` is not in the spec's table: the spec rules out a CPU inference path in
@@ -67,18 +67,18 @@ The core is a state machine driven by its host:
 2. The core advances and returns a batch of **commands**: create buffer, write
    buffer, dispatch, submit, read back.
 3. The host executes them and later reports **completions** carrying the
-   command id they answer.
+   token of the `submit` or `read` they answer.
 
 There is no blocking and no Asyncify. The browser shim resolves WebGPU promises
 and feeds completions back; the Dawn backend may simply block and feed them back
 immediately. Both hosts drive the identical core state machine, so native tests
 exercise the browser control flow.
 
-Planned for M1: command batches are packed into a flat recipe that the host
-interprets in one call, so the browser crosses the wasm/JS boundary once per
-submission instead of once per dispatch. Completions will carry an engine
-epoch, so a callback that arrives after unload or device loss is recognized as
-stale and dropped.
+A batch is a flat stream of `u32` words ([GPU backend](gpu.md#command-stream))
+that the host interprets in one call, so the browser crosses the wasm/JS
+boundary once per batch instead of once per dispatch. Engine epochs on
+completions (so a callback that arrives after unload or device loss is
+recognized as stale) come with the asynchronous browser host in M3.
 
 ## Reference-first validation
 
@@ -92,5 +92,6 @@ flowchart LR
   GPU --> FUSED[fused kernels]
 ```
 
-M0 builds the left half: the tokenizer against Hugging Face and the CPU
-reference against llama.cpp. See [Validation](validation.md).
+M0 built the left half: the tokenizer against Hugging Face and the CPU
+reference against llama.cpp. M1 checks every GPU kernel, and the whole GPU
+forward pass, against the CPU reference. See [Validation](validation.md).

@@ -14,16 +14,22 @@ engine of vLLM's class, running as efficiently as WebGPU allows.
 
 ## Status
 
-Milestone **M0** is complete: a GGUF reader, the Qwen tokenizer and a CPU f32
-reference forward pass for Qwen 3.5 0.8B. Each one is checked against a pinned
-reference ([Validation](validation.md)). None of it runs on a GPU yet; the
-next milestone (M1) brings up the Dawn backend and the core kernels, checked
-against this reference.
+Milestones **M0** and **M1** are complete.
+
+- **M0:** a GGUF reader, the Qwen tokenizer and a CPU f32 reference forward
+  pass for Qwen 3.5 0.8B, each checked against a pinned reference.
+- **M1:** the Dawn GPU backend, the command stream and eleven WGSL kernels.
+  The full forward pass runs on the GPU and matches the CPU reference on all
+  818 eval positions, both on an RTX 5090 through D3D12 and on llvmpipe.
+
+See [Validation](validation.md) and [GPU backend](gpu.md). Next is M2: the
+scheduler, persistent state (KV cache and DeltaNet state across steps), GPU
+sampling and a native command-line chat.
 
 | Milestone | Scope | State |
 |---|---|---|
 | M0 | GGUF reader, tokenizer, CPU reference forward pass (0.8B) | done |
-| M1 | Dawn backend, core kernels at parity | |
+| M1 | Dawn backend, core kernels at parity | done |
 | M2 | Scheduler, state, sampler; native CLI chat | |
 | M3 | wasm build, JS shim, browser streaming | |
 | M4 | Templates, tuning, plan cache | |
@@ -39,4 +45,5 @@ against this reference.
 - [Qwen 3.5 GGUF semantics](qwen35.md): what each tensor means, including the
   converter transforms.
 - [Validation](validation.md): pins, checks, thresholds and current results.
+- [GPU backend](gpu.md): hosts, the command stream, kernels and weight layout.
 - [Contributing](contributing.md): toolchain, layout and commit conventions.

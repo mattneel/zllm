@@ -6,4 +6,5 @@
 - [Architecture](architecture.md)
 - [Qwen 3.5 GGUF semantics](qwen35.md)
 - [Validation](validation.md)
+- [GPU backend](gpu.md)
 - [Contributing](contributing.md)
