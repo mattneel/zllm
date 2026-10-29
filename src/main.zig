@@ -17,6 +17,9 @@ const usage =
     \\                                       token ids; write activation records (format in
     \\                                       tools/llama-dump/dump.cpp)
     \\
+    \\environment:
+    \\  ZLLM_THREADS   worker threads for `forward` (default: one per physical core)
+    \\
 ;
 
 pub fn main(init: std.process.Init) !void {
@@ -52,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
         try tokenizeLines(gpa, &tok, texts, out);
     } else if (std.mem.eql(u8, cmd, "forward")) {
         if (args.len != 5) return fail(usage);
-        try forward(gpa, io, args[2], args[3], args[4]);
+        try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4]);
     } else {
         return fail(usage);
     }
@@ -87,12 +90,14 @@ fn tokenizeLines(gpa: std.mem.Allocator, tok: *const zllm.tokenizer.Tokenizer, t
     }
 }
 
-fn forward(gpa: std.mem.Allocator, io: Io, model_path: []const u8, tokens_path: []const u8, out_path: []const u8) !void {
+fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u8, tokens_path: []const u8, out_path: []const u8) !void {
     const mapped = try mapFile(io, model_path);
     defer std.posix.munmap(mapped);
     var file = try zllm.gguf.parse(gpa, mapped, true);
     defer file.deinit(gpa);
-    var model = try zllm.ref.qwen35.Model.load(gpa, file, mapped);
+    const pool = try zllm.ref.Pool.init(gpa, io, threads);
+    defer pool.deinit();
+    var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped);
     defer model.deinit();
 
     const raw = try Io.Dir.cwd().readFileAlloc(io, tokens_path, gpa, .unlimited);
@@ -108,8 +113,7 @@ fn forward(gpa: std.mem.Allocator, io: Io, model_path: []const u8, tokens_path: 
     var fw: Io.File.Writer = .init(out_file, io, &buf);
     var rec: RecordWriter = .{ .w = &fw.interface };
 
-    const threads = std.Thread.getCpuCount() catch 1;
-    try model.forward(gpa, tokens, threads, .{ .ctx = &rec, .emit = RecordWriter.emit });
+    try model.forward(gpa, tokens, pool, .{ .ctx = &rec, .emit = RecordWriter.emit });
     try fw.interface.flush();
 }
 
@@ -128,6 +132,18 @@ const RecordWriter = struct {
         try self.w.writeAll(std.mem.sliceAsBytes(data));
     }
 };
+
+/// `ZLLM_THREADS` if set; otherwise one thread per physical core, since the
+/// reference is FMA-bound and SMT siblings share the FMA units.
+fn defaultThreads(io: Io, env: *const std.process.Environ.Map) usize {
+    if (env.get("ZLLM_THREADS")) |s| {
+        if (std.fmt.parseInt(usize, s, 10)) |n| return @max(1, n) else |_| {}
+    }
+    const logical = std.Thread.getCpuCount() catch 1;
+    var buf: [8]u8 = undefined;
+    const smt = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/smt/active", &buf) catch return logical;
+    return if (std.mem.startsWith(u8, smt, "1")) @max(1, logical / 2) else logical;
+}
 
 fn fail(msg: []const u8) error{InvalidUsage} {
     std.debug.print("{s}", .{msg});

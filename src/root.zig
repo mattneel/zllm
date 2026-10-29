@@ -12,4 +12,6 @@ test {
     _ = @import("tokenizer/pretokenize.zig");
     _ = ref.ops;
     _ = ref.tensor;
+    _ = @import("ref/pool.zig");
+    _ = ref.matmul;
 }

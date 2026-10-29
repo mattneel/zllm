@@ -6,6 +6,14 @@ const gguf = @import("../gguf/gguf.zig");
 
 pub const Error = error{ UnsupportedTensorType, MissingTensor, BadShape } || Allocator.Error;
 
+/// Whether `dequantize` handles `t`.
+pub fn supported(t: gguf.TensorType) bool {
+    return switch (t) {
+        .f32, .f16, .bf16 => true,
+        else => false,
+    };
+}
+
 /// Decodes `bytes` of type `t` into `out` (one f32 per element).
 pub fn dequantize(t: gguf.TensorType, bytes: []const u8, out: []f32) error{UnsupportedTensorType}!void {
     switch (t) {

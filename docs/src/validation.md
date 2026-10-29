@@ -32,7 +32,8 @@ zig build check-forward      # CPU f32 reference vs llama.cpp
 
 The checks need [uv](https://docs.astral.sh/uv/). It runs the harness in
 `tools/` from its lockfile. `-Dfixtures=<dir>` points the checks at another
-fixture directory.
+fixture directory. The reference forward pass uses one thread per physical
+core; set `ZLLM_THREADS` to override that.
 
 ## GGUF reader
 

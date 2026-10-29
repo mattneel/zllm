@@ -1,9 +1,9 @@
-//! CPU f32 reference operators. Straightforward loops, f32 accumulation,
-//! SIMD only for dot products. These define correct results for the GPU
-//! kernels; clarity beats speed here except in `matmul`, which dominates.
+//! CPU f32 reference operators: straightforward loops with f32 accumulation.
+//! They define correct results for the GPU kernels, so clarity comes first.
+//! The matrix multiply, which dominates run time, is tuned separately in
+//! matmul.zig.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 
 const vec_len = 16;
 const V = @Vector(vec_len, f32);
@@ -20,38 +20,6 @@ pub fn dot(a: []const f32, b: []const f32) f32 {
     var sum = @reduce(.Add, acc);
     while (i < a.len) : (i += 1) sum += a[i] * b[i];
     return sum;
-}
-
-/// `out[t][n] = dot(x[t], w[n])` for `t < rows`: x is rows×k, w is n×k
-/// (GGML layout: each output's weights are contiguous), out is rows×n.
-/// Splits the weight rows across `threads`.
-pub fn matmul(out: []f32, x: []const f32, w: []const f32, rows: usize, n: usize, k: usize, threads: usize) void {
-    std.debug.assert(x.len == rows * k and w.len == n * k and out.len == rows * n);
-    const Worker = struct {
-        fn run(o: []f32, xs: []const f32, ws: []const f32, r: usize, nn: usize, kk: usize, first: usize, last: usize) void {
-            for (first..last) |j| {
-                const wr = ws[j * kk ..][0..kk];
-                for (0..r) |t| o[t * nn + j] = dot(xs[t * kk ..][0..kk], wr);
-            }
-        }
-    };
-    var handles: [256]?std.Thread = @splat(null);
-    const n_threads = @max(1, @min(threads, n / 64, handles.len));
-    const chunk = std.math.divCeil(usize, n, n_threads) catch unreachable;
-    for (0..n_threads) |i| {
-        const first = i * chunk;
-        const last = @min(n, first + chunk);
-        if (first >= last) break;
-        if (i + 1 == n_threads) {
-            Worker.run(out, x, w, rows, n, k, first, last);
-        } else {
-            handles[i] = std.Thread.spawn(.{}, Worker.run, .{ out, x, w, rows, n, k, first, last }) catch blk: {
-                Worker.run(out, x, w, rows, n, k, first, last);
-                break :blk null;
-            };
-        }
-    }
-    for (handles[0..n_threads]) |h| if (h) |t| t.join();
 }
 
 /// In place: x / sqrt(mean(x²) + eps) * weight.
@@ -108,32 +76,6 @@ pub fn softmax(x: []f32) void {
         sum += v.*;
     }
     for (x) |*v| v.* /= sum;
-}
-
-test "matmul matches naive product for any thread count" {
-    const gpa = std.testing.allocator;
-    const rows = 3;
-    const n = 130;
-    const k = 37;
-    const x = try gpa.alloc(f32, rows * k);
-    defer gpa.free(x);
-    const w = try gpa.alloc(f32, n * k);
-    defer gpa.free(w);
-    var prng: std.Random.DefaultPrng = .init(1);
-    const r = prng.random();
-    for (x) |*v| v.* = r.float(f32) - 0.5;
-    for (w) |*v| v.* = r.float(f32) - 0.5;
-
-    const out = try gpa.alloc(f32, rows * n);
-    defer gpa.free(out);
-    for ([_]usize{ 1, 2, 7 }) |threads| {
-        matmul(out, x, w, rows, n, k, threads);
-        for (0..rows) |t| for (0..n) |j| {
-            var want: f32 = 0;
-            for (0..k) |i| want += x[t * k + i] * w[j * k + i];
-            try std.testing.expectApproxEqAbs(want, out[t * n + j], 1e-5);
-        };
-    }
 }
 
 test "rope preserves norms, is identity at position 0 and leaves tail dims" {
