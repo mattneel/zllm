@@ -31,7 +31,10 @@
 //! submission budget. The prediction is linear, fixed + per_token · m: the
 //! fixed part is measured on one-token steps (calibration before the first
 //! request, decode, and each prompt's last token), the per-token part on
-//! longer prefill steps. They also end
+//! longer prefill steps, counting their tokens in whole tiles of the prefill
+//! multiplies (a partial tile costs as much as a whole one). Where even one
+//! tile overshoots the budget (a large model), a chunk is one tile as long
+//! as its prediction stays under the hard cap. Chunks also end
 //! at checkpoint positions: every `state.checkpoint_interval` tokens and just
 //! before the prompt's last token, which then runs as its own step and is
 //! sampled. That checkpoint lets a later request with the same prompt, or one
@@ -50,6 +53,8 @@ const Stream = @import("../tokenizer/stream.zig").Stream;
 
 /// Target GPU time per submission (spec §8).
 pub const budget_ns = 150 * std.time.ns_per_ms;
+/// No submission may take longer (spec §8).
+pub const hard_cap_ns = 250 * std.time.ns_per_ms;
 /// Largest prefill chunk while the per-token cost is not yet known. Below it
 /// the first chunk is as many tokens as one-token steps fit in 90% of the
 /// budget: a prefill token costs no more than a whole decode step, so even a
@@ -128,8 +133,9 @@ pub const Engine = struct {
     phase: Phase = .idle,
     /// Measured cost of a one-token step (the fixed part), 0 until seen.
     step_ns: u64 = 0,
-    /// Cost per additional token on the latest prefill step, 0 until seen.
-    /// It grows with position (attention), so the latest is the best guess.
+    /// Cost per additional token on the latest prefill step, its tokens
+    /// counted in whole tiles, 0 until seen. It grows with position
+    /// (attention), so the latest is the best guess.
     token_ns: u64 = 0,
     /// Tokens in the step `token_ns` was measured on.
     rate_tokens: u32 = 0,
@@ -310,7 +316,7 @@ pub const Engine = struct {
             e.step_ns = ema(e.step_ns, elapsed_ns);
         } else if (e.step_ns != 0 and elapsed_ns > e.step_ns) {
             // A step faster than the fixed estimate is noise, not a rate.
-            e.token_ns = (elapsed_ns - e.step_ns) / p.tokens;
+            e.token_ns = (elapsed_ns - e.step_ns) / std.mem.alignForward(u64, p.tokens, e.program.prefill_tile);
             e.rate_tokens = p.tokens;
         }
         const slot = p.slot orelse return;
@@ -345,19 +351,27 @@ pub const Engine = struct {
     /// 90% of the budget, as the cost per token keeps growing with position.
     /// Where a one-token step already takes more than half of it (a slow
     /// GPU), smaller chunks would only add steps that each pay that fixed
-    /// cost, so the target becomes twice the fixed cost instead. A chunk
-    /// grows at most 4× past the step its rate was measured on, since the
-    /// rate rises with the chunk size too.
+    /// cost, so the target becomes twice the fixed cost instead. Chunks are
+    /// whole tiles; where not even one fits the target, a partial tile would
+    /// cost as much, so the chunk is one tile if that stays within 90% of
+    /// the hard cap. A chunk grows at most 4× past the step its rate was
+    /// measured on, since the rate rises with the chunk size too.
     fn chunkSize(e: *const Engine) u32 {
         const pos = e.prefill_pos;
         const left: u32 = @intCast(e.req.prompt.len - pos);
         // Without calibration, measure the fixed cost first.
         var m: u32 = if (e.step_ns == 0) 1 else @intCast(std.math.clamp(budget_ns / 10 * 9 / e.step_ns, 1, first_chunk));
         if (e.token_ns != 0) {
+            const tile: u64 = e.program.prefill_tile;
             const target: u64 = @max(budget_ns / 10 * 9, 2 * e.step_ns);
-            const fit = (target -| e.step_ns) / e.token_ns;
             const ramp = 4 * @as(u64, @max(e.rate_tokens, first_chunk));
-            m = @intCast(@max(1, @min(fit, ramp)));
+            var fit = @min((target -| e.step_ns) / e.token_ns, ramp);
+            if (fit >= tile) {
+                fit = fit / tile * tile;
+            } else if (e.step_ns + e.token_ns * tile <= hard_cap_ns / 10 * 9) {
+                fit = tile;
+            }
+            m = @intCast(@max(1, fit));
         }
         m = @min(m, e.program.cfg.max_tokens, left);
         const boundary = (pos / state.checkpoint_interval + 1) * state.checkpoint_interval;

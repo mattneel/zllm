@@ -388,6 +388,9 @@ pub const Program = struct {
     /// The phases the current request's draws run: the first `sample_len`.
     sample_steps: [kernels.max_sample_steps]kernels.SampleStep = undefined,
     sample_len: usize = 0,
+    /// Tokens per tile of the prefill multiplies: a step's partial tile
+    /// costs as much as a whole one (kernels.matmulTiles).
+    prefill_tile: u32,
 
     // Upload staging, alive until the batch that writes it has executed.
     step_value: P.Step = .{ .m = 0, .pos0 = 0, .u = 0 },
@@ -605,6 +608,7 @@ pub const Program = struct {
         return .{
             .hp = hp,
             .cfg = cfg,
+            .prefill_tile = prefillTile(m),
             .step = step,
             .token_ids = token_ids,
             .x = x,
@@ -762,6 +766,19 @@ const Alloc = struct {
         return a.buffer(count * 4, .{ .storage = true, .copy_src = true, .copy_dst = true });
     }
 };
+
+/// The largest token tile among the model's prefill multiplies.
+fn prefillTile(m: *const Model) u32 {
+    const Tile = struct {
+        tokens: u32 = 1,
+        fn add(s: *@This(), w: *const Matrix) void {
+            for (w.chunks) |ch| s.tokens = @max(s.tokens, kernels.matmulTiles(ch.type)[1]);
+        }
+    };
+    var tile: Tile = .{};
+    m.eachMatrix(&tile, Tile.add);
+    return tile.tokens;
+}
 
 /// Builds a weight's multiply, one launch per chunk, either way.
 const Mm = struct {
