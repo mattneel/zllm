@@ -41,6 +41,9 @@ pub const Op = enum(u8) {
     submit = 9,
     /// kind, id
     destroy = 10,
+    /// buffer, offset: u64, size: u64 — zero-fills the range, ordered with
+    /// dispatches and copies (GPUCommandEncoder.clearBuffer).
+    clear_buffer = 11,
     _,
 };
 
@@ -160,6 +163,11 @@ pub const Recorder = struct {
         try r.put(gpa, .copy_buffer, &(.{@backingInt(src)} ++ split(src_offset) ++ .{@backingInt(dst)} ++ split(dst_offset) ++ split(size)));
     }
 
+    /// `offset` and `size` must be multiples of 4.
+    pub fn clearBuffer(r: *Recorder, gpa: Allocator, buffer: Buffer, offset: u64, size: u64) Allocator.Error!void {
+        try r.put(gpa, .clear_buffer, &(.{@backingInt(buffer)} ++ split(offset) ++ split(size)));
+    }
+
     /// `dst` must stay valid until the read's completion arrives.
     pub fn readBuffer(r: *Recorder, gpa: Allocator, token: u32, buffer: Buffer, offset: u64, dst: []u8) Allocator.Error!void {
         try r.put(gpa, .read_buffer, &(.{ token, @backingInt(buffer) } ++ split(offset) ++ split(dst.len) ++ addr(dst.ptr)));
@@ -239,6 +247,7 @@ test "recorder output decodes back to the same commands" {
     });
     try r.dispatch(gpa, pl, .{ 4, 2, 1 }, &.{bg});
     try r.readBuffer(gpa, 7, buf, 8, &dst);
+    try r.clearBuffer(gpa, buf, 4, 1 << 32);
     try r.submit(gpa, 9);
     const second = try r.createBuffer(gpa, 4, .{ .uniform = true });
     try std.testing.expectEqual(@as(u32, 1), @backingInt(second));
@@ -274,6 +283,11 @@ test "recorder output decodes back to the same commands" {
     c = (try it.next()).?;
     try std.testing.expectEqual(Op.read_buffer, c.op);
     try std.testing.expectEqual(@as(*[8]u8, &dst), c.ptrAt(*[8]u8, 6));
+
+    c = (try it.next()).?;
+    try std.testing.expectEqual(Op.clear_buffer, c.op);
+    try std.testing.expectEqual(@as(u64, 4), c.u64At(1));
+    try std.testing.expectEqual(@as(u64, 1 << 32), c.u64At(3));
 
     c = (try it.next()).?;
     try std.testing.expectEqual(Op.submit, c.op);

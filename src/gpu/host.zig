@@ -134,6 +134,11 @@ pub const Host = struct {
                 const dst = try get(c.WGPUBuffer, h.buffers, a[3]);
                 p.CommandEncoderCopyBufferToBuffer(enc, src, command.u64At(1), dst, command.u64At(4), command.u64At(6));
             },
+            .clear_buffer => {
+                try need(a, 5);
+                const enc = try h.copyEncoder();
+                p.CommandEncoderClearBuffer(enc, try get(c.WGPUBuffer, h.buffers, a[0]), command.u64At(1), command.u64At(3));
+            },
             .read_buffer => {
                 try need(a, 8);
                 const size = command.u64At(4);

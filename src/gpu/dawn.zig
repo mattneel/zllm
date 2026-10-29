@@ -45,6 +45,7 @@ pub const Procs = struct {
     BindGroupLayoutRelease: Proc(c.WGPUProcBindGroupLayoutRelease),
     BindGroupRelease: Proc(c.WGPUProcBindGroupRelease),
     CommandEncoderBeginComputePass: Proc(c.WGPUProcCommandEncoderBeginComputePass),
+    CommandEncoderClearBuffer: Proc(c.WGPUProcCommandEncoderClearBuffer),
     CommandEncoderCopyBufferToBuffer: Proc(c.WGPUProcCommandEncoderCopyBufferToBuffer),
     CommandEncoderFinish: Proc(c.WGPUProcCommandEncoderFinish),
     CommandEncoderRelease: Proc(c.WGPUProcCommandEncoderRelease),
