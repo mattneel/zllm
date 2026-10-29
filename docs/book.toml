@@ -1,0 +1,16 @@
+[book]
+title = "zllm"
+description = "vLLM-class LLM inference on WebGPU from one Zig codebase"
+authors = ["Matt Neel"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/mattneel/zllm"
+edit-url-template = "https://github.com/mattneel/zllm/edit/master/docs/{path}"
+site-url = "/zllm/"
+mathjax-support = true
+additional-js = ["theme/mermaid-init.js"]

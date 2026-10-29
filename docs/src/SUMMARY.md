@@ -1,0 +1,9 @@
+# Summary
+
+[Introduction](introduction.md)
+
+- [Spec (v0.1)](spec.md)
+- [Architecture](architecture.md)
+- [Qwen 3.5 GGUF semantics](qwen35.md)
+- [Validation](validation.md)
+- [Contributing](contributing.md)
