@@ -7,6 +7,7 @@
   "scripts": {
     "check": "biome check . && tsc --noEmit && tsc --noEmit -p tsconfig.dev.json",
     "fix": "biome check --write .",
+    "test": "bun test src/dev",
     "build:book": "bun build src/book/mermaid.ts --target browser --format iife --minify --outfile ../docs/theme/mermaid-init.js",
     "dev": "bun src/dev/serve.ts",
     "build": "bun build src/zllm/index.ts --target browser --format esm --minify --sourcemap=linked --outdir dist --entry-naming zllm.[ext] && cp ../zig-out/web/zllm.wasm dist/"

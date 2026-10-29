@@ -205,7 +205,9 @@ const qwen_instruct: sampler.Params = .{ .temperature = 1.0, .top_p = 1.0, .top_
 const RequestJson = struct {
     prompt: ?[]const u8 = null,
     tokens: ?[]const u32 = null,
-    messages: ?[]const struct { role: zllm.chat.Role, content: []const u8, reasoning: ?[]const u8 = null } = null,
+    messages: ?[]const zllm.chat.Message = null,
+    /// Functions offered to a chat (zllm.chat.Options.tools).
+    tools: []const std.json.Value = &.{},
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     max_tokens: u32,
@@ -351,15 +353,14 @@ const Runtime = struct {
         if (rt.running) return error.Busy;
         _ = rt.request_arena.reset(.retain_capacity);
         const arena = rt.request_arena.allocator();
-        const r = try std.json.parseFromSliceLeaky(RequestJson, arena, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        // Numbers in tools and tool calls stay as written (zllm.chat).
+        const r = try std.json.parseFromSliceLeaky(RequestJson, arena, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always, .parse_numbers = false });
 
         var prompt: std.ArrayList(u32) = .empty;
         var defaults: sampler.Params = .{};
-        if (r.messages) |msgs| {
-            const messages = try arena.alloc(zllm.chat.Message, msgs.len);
-            for (messages, msgs) |*m, j| m.* = .{ .role = j.role, .content = j.content, .reasoning = j.reasoning };
+        if (r.messages) |messages| {
             var text: std.ArrayList(u8) = .empty;
-            try zllm.chat.render(arena, messages, .{ .enable_thinking = r.enable_thinking, .reasoning_effort = r.reasoning_effort }, &text);
+            try zllm.chat.render(arena, messages, .{ .enable_thinking = r.enable_thinking, .reasoning_effort = r.reasoning_effort, .tools = r.tools }, &text);
             try rt.tok.encode(arena, text.items, &prompt);
             defaults = if (r.enable_thinking) qwen_thinking else qwen_instruct;
         } else if (r.tokens) |ids| {

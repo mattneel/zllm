@@ -6,6 +6,7 @@ import { Event, type Exports, FINISH, type FinishReason, NEED_MORE, Out } from "
 import { type Cached, openCached } from "./cache";
 import { Executor, type LoadProgress, planLimits, requestDevice } from "./gpu";
 import { fileSource, type ModelSource, urlSource } from "./source";
+import { argumentsValue, type Tool, type ToolCall, ToolCallSplitter } from "./tools";
 
 /** First read of the model file for its header; doubled until it parses. */
 const HEADER_PREFIX = 8 << 20;
@@ -75,11 +76,19 @@ export interface GenerateChunk {
 }
 
 export interface ChatMessage {
-  role: "system" | "developer" | "user" | "assistant";
-  content: string;
+  role: "system" | "developer" | "user" | "assistant" | "tool";
+  /** Null for an assistant turn that only called tools. */
+  content: string | null;
   /** An assistant turn's reasoning, as returned in `reasoning_content`. */
   reasoning_content?: string;
+  /** An assistant turn's calls. */
+  tool_calls?: ToolCall[];
+  /** A tool turn's call (accepted; the template doesn't show it). */
+  tool_call_id?: string;
 }
+
+/** Why a chat reply ended: as generation, or because it called tools. */
+export type ChatFinishReason = FinishReason | "tool_calls";
 
 export interface ChatRequest {
   messages: ChatMessage[];
@@ -99,6 +108,10 @@ export interface ChatRequest {
   /** Qwen thinking (default on), and its effort ("none" turns it off). */
   enable_thinking?: boolean;
   reasoning_effort?: string;
+  /** Functions the model may call. */
+  tools?: Tool[];
+  /** "auto" (default): call tools or not; "none": tools are left out. */
+  tool_choice?: "auto" | "none";
   signal?: AbortSignal;
 }
 
@@ -109,8 +122,13 @@ export interface ChatCompletionChunk {
   model: string;
   choices: {
     index: 0;
-    delta: { role?: "assistant"; content?: string; reasoning_content?: string };
-    finish_reason: FinishReason | null;
+    delta: {
+      role?: "assistant";
+      content?: string;
+      reasoning_content?: string;
+      tool_calls?: (ToolCall & { index: number })[];
+    };
+    finish_reason: ChatFinishReason | null;
   }[];
   usage?: OpenAIUsage;
 }
@@ -122,8 +140,13 @@ export interface ChatCompletion {
   model: string;
   choices: {
     index: 0;
-    message: { role: "assistant"; content: string; reasoning_content?: string };
-    finish_reason: FinishReason;
+    message: {
+      role: "assistant";
+      content: string | null;
+      reasoning_content?: string;
+      tool_calls?: ToolCall[];
+    };
+    finish_reason: ChatFinishReason;
   }[];
   usage: OpenAIUsage;
 }
@@ -139,7 +162,13 @@ export interface OpenAIUsage {
 interface RequestJson extends SamplingJson {
   prompt?: string;
   tokens?: number[];
-  messages?: { role: ChatMessage["role"]; content: string; reasoning: string | null }[];
+  messages?: {
+    role: ChatMessage["role"];
+    content: string;
+    reasoning: string | null;
+    tool_calls: { function: { name: string; arguments: unknown } }[];
+  }[];
+  tools?: Tool[];
   enable_thinking?: boolean;
   reasoning_effort?: string | null;
   max_tokens: number;
@@ -475,9 +504,13 @@ export class Engine {
     return {
       messages: req.messages.map((m) => ({
         role: m.role,
-        content: m.content,
+        content: m.content ?? "",
         reasoning: m.reasoning_content ?? null,
+        tool_calls: (m.tool_calls ?? []).map((c) => ({
+          function: { name: c.function.name, arguments: argumentsValue(c.function.arguments) },
+        })),
       })),
+      ...(offersTools(req) ? { tools: req.tools } : {}),
       enable_thinking: thinking,
       reasoning_effort: req.reasoning_effort ?? null,
       max_tokens: req.max_completion_tokens ?? req.max_tokens ?? 4096,
@@ -492,7 +525,7 @@ export class Engine {
     const model = "zllm";
     const chunk = (
       delta: ChatCompletionChunk["choices"][number]["delta"],
-      finish: FinishReason | null,
+      finish: ChatFinishReason | null,
     ): ChatCompletionChunk => ({
       id,
       object: "chat.completion.chunk",
@@ -502,15 +535,39 @@ export class Engine {
     });
     yield chunk({ role: "assistant", content: "" }, null);
     const split = new ReasoningSplitter(req.enable_thinking ?? true);
-    for await (const c of this.#request(this.#chatBody(req), req.signal)) {
-      for (const part of split.push(c.text)) {
-        yield chunk(part, null);
-      }
-      if (c.finish !== undefined && c.usage !== undefined) {
-        for (const part of split.flush()) {
-          yield chunk(part, null);
+    // Content passes through the tool-call splitter when tools are offered.
+    const calls = offersTools(req) ? new ToolCallSplitter(req.tools ?? []) : null;
+    function* parts(
+      deltas: Iterable<{ content?: string; reasoning_content?: string }>,
+    ): Generator<ChatCompletionChunk> {
+      for (const d of deltas) {
+        if (d.content !== undefined && calls !== null) {
+          for (const text of calls.push(d.content)) {
+            yield chunk({ content: text }, null);
+          }
+        } else {
+          yield chunk(d, null);
         }
-        yield { ...chunk({}, c.finish), usage: openaiUsage(c.usage) };
+      }
+    }
+    for await (const c of this.#request(this.#chatBody(req), req.signal)) {
+      yield* parts(split.push(c.text));
+      if (c.finish !== undefined && c.usage !== undefined) {
+        yield* parts(split.flush());
+        let finish: ChatFinishReason = c.finish;
+        if (calls !== null) {
+          const { calls: made, rest } = calls.finish();
+          if (rest !== "") {
+            yield chunk({ content: rest }, null);
+          }
+          if (made.length > 0) {
+            yield chunk({ tool_calls: made.map((call, index) => ({ index, ...call })) }, null);
+            if (finish === "stop") {
+              finish = "tool_calls";
+            }
+          }
+        }
+        yield { ...chunk({}, finish), usage: openaiUsage(c.usage) };
       }
     }
   }
@@ -518,20 +575,30 @@ export class Engine {
   async #chatOnce(req: ChatRequest): Promise<ChatCompletion> {
     let content = "";
     let reasoning = "";
+    const toolCalls: ToolCall[] = [];
     let last: ChatCompletionChunk | null = null;
     for await (const c of this.#chatStream(req)) {
       const delta = c.choices[0]?.delta;
       content += delta?.content ?? "";
       reasoning += delta?.reasoning_content ?? "";
+      for (const { index: _, ...call } of delta?.tool_calls ?? []) {
+        toolCalls.push(call);
+      }
       last = c;
     }
     const finish = last?.choices[0]?.finish_reason;
     if (last === null || finish === null || finish === undefined || last.usage === undefined) {
       throw new Error("zllm: the request ended without finishing");
     }
-    const message: ChatCompletion["choices"][number]["message"] = { role: "assistant", content };
+    const message: ChatCompletion["choices"][number]["message"] = {
+      role: "assistant",
+      content: content === "" && toolCalls.length > 0 ? null : content,
+    };
     if (reasoning !== "") {
       message.reasoning_content = reasoning;
+    }
+    if (toolCalls.length > 0) {
+      message.tool_calls = toolCalls;
     }
     return {
       id: last.id,
@@ -627,6 +694,11 @@ class ReasoningSplitter {
       yield { content: out };
     }
   }
+}
+
+/** Whether the request offers tools to the model. */
+function offersTools(req: ChatRequest): boolean {
+  return (req.tools?.length ?? 0) > 0 && req.tool_choice !== "none";
 }
 
 function samplingJson(s: Sampling): SamplingJson {

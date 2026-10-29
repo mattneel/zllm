@@ -9,6 +9,7 @@ export { type CacheUsage, cacheUsage, clearCache } from "./cache";
 export {
   type ChatCompletion,
   type ChatCompletionChunk,
+  type ChatFinishReason,
   type ChatMessage,
   type ChatRequest,
   Engine,
@@ -23,3 +24,4 @@ export {
 } from "./engine";
 export type { LoadProgress } from "./gpu";
 export { fileSource, type ModelSource, urlSource } from "./source";
+export type { Tool, ToolCall } from "./tools";
