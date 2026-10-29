@@ -235,7 +235,9 @@ up to it:
   staged tiles (k = 4,096) and the SiLU pair on Q3_K, the 27B's gate and
   up type, and `quantize_q8` against the reference's rounding, value for
   value, in both block formats. The rows include a negative largest
-  value, a tie between +max and −max, and a zero block. All 19 pass on
+  value, a tie between +max and −max, and a zero block. Two more check
+  it computing its input, RMSNorm and the SiLU pair, first: every value
+  must be within half a step of the f64 result. All 21 pass on
   llvmpipe and the RTX 5090: embeddings and rounding exactly, multiplies
   within 5.6e-7. The rounding needed exact division: WGSL's may be off by
   2.5 ULP, and on D3D12 that moved values across rounding boundaries.
@@ -279,9 +281,9 @@ medians over positions:
 
 | 32-token steps, 818 positions | GPU | llama.cpp | Bound |
 |---|---|---|---|
-| First layer against the rounded reference, worst median rel L2 | 1.4e-5 | 3.4e-5 | 1e-4 |
-| Gap to the f32 reference over its own gap to the rounded one, worst layer | 1.09 | 1.08 | 1.5 |
-| Top-1 against the rounded reference (reported) | 801/818 | | |
+| First layer against the rounded reference, worst median rel L2 | 2.9e-5 | 3.4e-5 | 1e-4 |
+| Gap to the f32 reference over its own gap to the rounded one, worst layer | 1.10 | 1.08 | 1.5 |
+| Top-1 against the rounded reference (reported) | 805/818 | | |
 
 Each kernel on that path, the rounding included, is checked exactly by
 `gpu-check`.

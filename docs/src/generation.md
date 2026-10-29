@@ -252,7 +252,7 @@ Qwen 3.8 27B at Q3_K_M (13.75 GB) on the same GPU, `zllm generate`, greedy:
 
 | Phase | First run | Now | Spec bar |
 |---|---|---|---|
-| Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 247–250 tok/s, in 31 steps | 300 tok/s |
+| Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 256–257 tok/s, in 31 steps | 300 tok/s |
 | Decode | 6 tok/s | 26–27 tok/s | 20 tok/s |
 
 The quantized kernels made the difference ([GPU backend](gpu.md#kernels)).
@@ -276,6 +276,7 @@ Prefill steps of the 27B are 32 tokens, about 116 ms each:
 | f32, register tiles, split over k; tile-sized chunks | 154 |
 | Input rounded to 8 bits, integer dot products (`dot4I8Packed`) | 227 |
 | The next unit fetched while the current one computes | 247–250 |
+| Rounding fused with the RMSNorm and SiLU that produce its input | 256–257 |
 
 In f32 the multiply-adds alone took about 66 ms of a step. Rounding the
 input to 8-bit blocks, as llama.cpp's CPU backend does, makes each weight
@@ -287,5 +288,6 @@ inputs: it is bound by reading weights, not by arithmetic.
 The multiply now takes about 98 ms of a step. It issues about three
 instructions per four products: the integer dot product, a separate add
 (WGSL's `dot4I8Packed` has no accumulator operand) and the sub-block
-scaling. That is near this GPU's issue rate. Rounding the input costs 7 ms
-more, and the rest of the step about 36 ms.
+scaling. That is near this GPU's issue rate. Rounding the input happens in the
+same kernel that computes it (RMSNorm, SiLU), and the rest of the step
+takes about 36 ms.
