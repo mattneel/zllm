@@ -74,9 +74,23 @@ pub fn run(rt: *gen.Runtime, context: u32, out: *Io.Writer) !void {
     try out.print("{s}: decode at position {d}: {d:.2} ms per step (best {d:.2}), {d:.0} tok/s; empty submission {d:.3} ms\n", .{
         rt.adapter, pos, ms(total / steps), ms(best), 1e9 / @as(f64, @floatFromInt(total / steps)), ms(empty),
     });
-    try out.print("without sampling: {d:.2} ms alone, {d:.2} ms for two in one submission; per-submission overhead {d:.2} ms; recording a step {d:.3} ms\n\n", .{
+    try out.print("without sampling: {d:.2} ms alone, {d:.2} ms for two in one submission; per-submission overhead {d:.2} ms; recording a step {d:.3} ms\n", .{
         ms(one), ms(two), ms(2 * one -| two), ms(encode),
     });
+
+    // The floor under every dispatch: a residual add over one row (4
+    // workgroups), 400 times in a row, each depending on the last.
+    const tiny = for (p.body) |item| switch (item) {
+        .launch => |l| if (l.kernel == .add) break l,
+        else => {},
+    } else unreachable;
+    var chain: u64 = std.math.maxInt(u64);
+    for (0..5) |_| {
+        for (0..400) |_| try tiny.record(gpa, &rec, .{ .rows = 1 });
+        try rec.submit(gpa, 1);
+        chain = @min(chain, try time(rt, &rec));
+    }
+    try out.print("a tiny dependent dispatch costs {d:.1} us\n\n", .{@as(f64, @floatFromInt(chain)) / 400 / 1e3});
 
     // Each kernel class's share: the decode step replayed in order without
     // that class, so barriers and caching stay as in a real step.
