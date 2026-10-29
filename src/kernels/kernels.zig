@@ -21,7 +21,6 @@ pub const Kernel = enum {
     matmul_bf16,
     matvec_bf16,
     silu_mul,
-    add,
     embed_bf16,
     rope_append,
     attention,
@@ -104,7 +103,7 @@ pub const params = struct {
             _: u29 = 0,
         };
     };
-    pub const Count = extern struct { count: u32, _pad: [3]u32 = @splat(0) };
+    pub const SiluMul = extern struct { count: u32, width: u32, _pad: [2]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
     pub const RopeAppend = extern struct {
         heads: u32,
@@ -169,7 +168,6 @@ pub const params = struct {
         z_off: u32,
         _pad: [3]u32 = @splat(0),
     };
-
     /// Per-request sampler parameters (`sample` and `mark_tokens`).
     pub const Sample = extern struct {
         vocab: u32,

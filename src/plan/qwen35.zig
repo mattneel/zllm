@@ -59,8 +59,8 @@ const DeltaNet = struct {
 const Layer = struct {
     attn_norm: Arg,
     post_norm: Arg,
-    ffn_gate: Matrix,
-    ffn_up: Matrix,
+    /// gate | up, stacked by rows.
+    ffn_gu: Matrix,
     ffn_down: Matrix,
     mixer: union(graph.LayerKind) {
         delta_net: DeltaNet,
@@ -92,8 +92,7 @@ pub const Model = struct {
             layer.* = .{
                 .attn_norm = try u.vector("blk.{d}.attn_norm.weight", i, e),
                 .post_norm = try u.vector("blk.{d}.post_attention_norm.weight", i, e),
-                .ffn_gate = try u.matrix("blk.{d}.ffn_gate.weight", i, e, ff),
-                .ffn_up = try u.matrix("blk.{d}.ffn_up.weight", i, e, ff),
+                .ffn_gu = try u.stacked(i, e, &.{ .{ "blk.{d}.ffn_gate.weight", ff }, .{ "blk.{d}.ffn_up.weight", ff } }),
                 .ffn_down = try u.matrix("blk.{d}.ffn_down.weight", i, ff, e),
                 .mixer = switch (kind) {
                     .attention => blk: {
@@ -235,34 +234,33 @@ pub const Config = struct {
     checkpoints: u32 = 4,
 };
 
-/// One entry of the step body: a launch, or the end of a layer (where a
-/// check may read the residual stream back).
+/// One entry of the step body.
 pub const Item = union(enum) {
+    /// The same launch on both kernel paths.
     launch: kernels.Launch,
-    matmul: Matmul,
-    attention: Attend,
+    /// Different launches per kernel path.
+    fork: Fork,
+    /// The final RMSNorm into `h`: the prefill head reads it; the decode head
+    /// folds it into its projection, so decode runs it only for a readback.
+    final_norm: kernels.Launch,
+    /// The end of a layer, where a check may read the residual stream back.
     layer_end: u32,
 };
 
-/// An attention layer's attention, prebuilt both ways: per query for
-/// prefill, split over blocks of cache positions for decoding.
-pub const Attend = struct {
-    full: kernels.Launch,
-    split: kernels.Launch,
-    combine: kernels.Launch,
+/// Launches that differ by kernel path: the prefill kernels unfused around
+/// tiled matrix multiplies, the decode kernels fused into matrix-vector
+/// multiplies.
+pub const Fork = struct {
+    prefill: []const kernels.Launch,
+    decode: []const kernels.Launch,
 
-    fn record(a: Attend, gpa: Allocator, rec: *cmd.Recorder, e: kernels.Extent, path: Path) Allocator.Error!void {
-        if (path == .decode) {
-            try a.split.record(gpa, rec, e);
-            try a.combine.record(gpa, rec, e);
-        } else {
-            try a.full.record(gpa, rec, e);
-        }
+    pub fn pick(f: Fork, path: Path) []const kernels.Launch {
+        return if (path == .decode) f.decode else f.prefill;
     }
 };
 
-/// Which kernels a step runs: the tiled prefill kernels, or the decode
-/// kernels (matrix-vector multiplies, split attention) for steps of at most
+/// Which kernels a step runs: the prefill kernels, or the decode kernels
+/// (fused matrix-vector multiplies, split attention) for steps of at most
 /// `kernels.decode_max_rows` tokens. Each is bitwise independent of how a
 /// sequence is split into steps, but the two round differently.
 pub const Path = enum {
@@ -271,17 +269,6 @@ pub const Path = enum {
 
     pub fn of(rows: u32) Path {
         return if (rows <= kernels.decode_max_rows) .decode else .prefill;
-    }
-};
-
-/// One weight chunk's multiply, prebuilt both ways: tiled for prefill,
-/// matrix-vector for decode.
-pub const Matmul = struct {
-    tiled: kernels.Launch,
-    vector: kernels.Launch,
-
-    pub fn pick(mm: Matmul, path: Path) kernels.Launch {
-        return if (path == .decode) mm.vector else mm.tiled;
     }
 };
 
@@ -314,7 +301,9 @@ pub const Program = struct {
     sample_state: Arg,
 
     body: []const Item,
-    head: []const Matmul,
+    /// The vocabulary projection: on the prefill path from `lm_in` (rows
+    /// copied from `h`), on the decode path from `x` with the final norm.
+    head: Fork,
     mark: kernels.Launch,
     /// One launch per sampler phase and round.
     sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch),
@@ -336,7 +325,7 @@ pub const Program = struct {
     pub fn build(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *const kernels.Set, m: *const Model, cfg: Config, limits: Limits) BuildError!Program {
         const hp = m.hp;
         if (cfg.max_tokens == 0 or cfg.logit_rows == 0 or cfg.context < cfg.max_tokens or cfg.checkpoints == 0) return error.BadConfig;
-        if (hp.head_dim > kernels.max_head_dim or hp.gdn_head_dim > kernels.max_delta_head) return error.BadConfig;
+        if (hp.head_dim > kernels.max_head_dim or hp.gdn_head_dim > kernels.max_delta_head or hp.n_embd > kernels.matvec_max_staged or hp.n_embd % 4 != 0) return error.BadConfig;
         if (hp.n_head % hp.n_head_kv != 0 or hp.n_head / hp.n_head_kv > kernels.attn_max_group) return error.BadConfig;
         const e: u64 = hp.n_embd;
         const cap: u64 = cfg.max_tokens;
@@ -344,17 +333,16 @@ pub const Program = struct {
         const kv_dim: u64 = hp.head_dim * hp.n_head_kv;
 
         var a: Alloc = .{ .gpa = gpa, .rec = rec, .limits = limits };
+        const hd: u64 = hp.head_dim;
+        // Row widths of the fused projections.
+        const qkv_row: u64 = 2 * hd * hp.n_head + 2 * kv_dim;
+        const proj_row: u64 = conv_dim + hp.gdn_inner + 2 * @as(u64, hp.gdn_v_heads);
         const x = try a.storage(cap * e);
         const h = try a.storage(cap * e);
-        const mix = try a.storage(cap * e);
-        const gate = try a.storage(cap * hp.n_ff);
-        const up = try a.storage(cap * hp.n_ff);
-        // Q (with the gates) | K | V for each token, as one projection.
-        const qkv_row: u64 = 2 * @as(u64, hp.head_dim) * hp.n_head + 2 * kv_dim;
+        const gu = try a.storage(cap * 2 * hp.n_ff);
+        const act = try a.storage(cap * hp.n_ff);
         const qkv = try a.storage(cap * qkv_row);
-        const att = try a.storage(cap * hp.head_dim * hp.n_head);
-        // The DeltaNet input projection: qkv | z | β | α for each token.
-        const proj_row: u64 = conv_dim + hp.gdn_inner + 2 * @as(u64, hp.gdn_v_heads);
+        const att = try a.storage(cap * hd * hp.n_head);
         const proj = try a.storage(cap * proj_row);
         const conv = try a.storage(cap * conv_dim);
         const beta = try a.storage(cap * hp.gdn_v_heads);
@@ -401,47 +389,57 @@ pub const Program = struct {
         var body: std.ArrayList(Item) = .empty;
         const capn: u32 = cfg.max_tokens;
         const norm: P.RmsNorm = .{ .rows = capn, .dim = hp.n_embd, .eps = hp.rms_eps };
+        const mm: Mm = .{ .b = &b, .arena = arena, .cap = capn, .eps = hp.rms_eps };
 
         for (m.tok_embd.chunks) |ch| {
             try body.append(arena, .{ .launch = try b.add(.embed_bf16, P.EmbedBf16{ .dim = hp.n_embd, .row0 = ch.row0, .chunk_rows = ch.rows }, &.{ token_ids, ch.arg, x }, .rows_x) });
         }
         var delta_i: u64 = 0;
         for (m.layers, 0..) |*layer, il| {
-            try body.append(arena, .{ .launch = try b.add(.rmsnorm, norm, &.{ x, layer.attn_norm, h }, .rows_x) });
+            const pre_norm = try b.add(.rmsnorm, norm, &.{ x, layer.attn_norm, h }, .rows_x);
             switch (layer.mixer) {
                 .attention => |*w| {
                     const kc = try a.buffer(kv_layer, .{ .storage = true });
                     const vc = try a.buffer(kv_layer, .{ .storage = true });
-                    try matmul(&b, arena, &body, qkv, h, &w.wqkv, capn);
-                    const hd = hp.head_dim;
                     const half: u32 = @backingInt(cfg.kv);
+                    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     const q_row: u32 = @intCast(qkv_row);
+                    try body.append(arena, .{ .fork = .{
+                        .prefill = try concat(arena, &.{ &.{pre_norm}, try mm.tiled(qkv, h, &w.wqkv, false) }),
+                        .decode = try mm.vector(qkv, x, &w.wqkv, .{ .norm = layer.attn_norm }),
+                    } });
                     try body.append(arena, .{ .launch = try b.add(.rope_append, P.RopeAppend{
                         .heads = hp.n_head,
                         .kv_heads = hp.n_head_kv,
-                        .head_dim = hd,
+                        .head_dim = hp.head_dim,
                         .n_rot = hp.n_rot,
                         .row = q_row,
-                        .k_off = 2 * hd * hp.n_head,
+                        .k_off = @intCast(2 * hd * hp.n_head),
                         .v_off = @intCast(2 * hd * hp.n_head + kv_dim),
                         .f16 = half,
                         .eps = hp.rms_eps,
                     }, &.{ qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
-                    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    const decode: P.AttnDecode = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hd, .f16 = half, .scale = scale, .max_blocks = max_blocks, .q_row = q_row };
-                    try body.append(arena, .{ .attention = .{
-                        .full = try b.add(.attention, P.Attention{
-                            .heads = hp.n_head,
-                            .kv_heads = hp.n_head_kv,
-                            .head_dim = hd,
-                            .f16 = half,
-                            .scale = scale,
-                            .q_row = q_row,
-                        }, &.{ qkv, kc, vc, att, step }, .{ .rows_y = hp.n_head }),
-                        .split = try b.add(.attn_split, decode, &.{ qkv, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block } }),
-                        .combine = try b.add(.attn_combine, decode, &.{ qkv, attn_part, att, step }, .{ .rows_y = hp.n_head }),
+                    const decode: P.AttnDecode = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .f16 = half, .scale = scale, .max_blocks = max_blocks, .q_row = q_row };
+                    try body.append(arena, .{ .fork = .{
+                        .prefill = try concat(arena, &.{
+                            &.{try b.add(.attention, P.Attention{
+                                .heads = hp.n_head,
+                                .kv_heads = hp.n_head_kv,
+                                .head_dim = hp.head_dim,
+                                .f16 = half,
+                                .scale = scale,
+                                .q_row = q_row,
+                            }, &.{ qkv, kc, vc, att, step }, .{ .rows_y = hp.n_head })},
+                            try mm.tiled(x, att, &w.wo, true),
+                        }),
+                        .decode = try concat(arena, &.{
+                            &.{
+                                try b.add(.attn_split, decode, &.{ qkv, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block } }),
+                                try b.add(.attn_combine, decode, &.{ qkv, attn_part, att, step }, .{ .rows_y = hp.n_head }),
+                            },
+                            try mm.vector(x, att, &w.wo, .{ .accumulate = true }),
+                        }),
                     } });
-                    try matmul(&b, arena, &body, mix, att, &w.wo, capn);
                 },
                 .delta_net => |*w| {
                     const base = delta_i * per_layer;
@@ -449,7 +447,10 @@ pub const Program = struct {
                     const state: Arg = .{ .buffer = recurrent.buffer, .offset = base, .size = state_bytes };
                     const hist: Arg = .{ .buffer = recurrent.buffer, .offset = base + std.mem.alignForward(u64, state_bytes, al), .size = hist_bytes };
                     const d = hp.gdn_head_dim;
-                    try matmul(&b, arena, &body, proj, h, &w.wproj, capn);
+                    try body.append(arena, .{ .fork = .{
+                        .prefill = try concat(arena, &.{ &.{pre_norm}, try mm.tiled(proj, h, &w.wproj, false) }),
+                        .decode = try mm.vector(proj, x, &w.wproj, .{ .norm = layer.attn_norm }),
+                    } });
                     try body.append(arena, .{ .launch = try b.add(.delta_prep, P.DeltaPrep{
                         .channels = @intCast(conv_dim),
                         .taps = hp.conv_kernel,
@@ -476,24 +477,34 @@ pub const Program = struct {
                         .z_row = @intCast(proj_row),
                         .z_off = @intCast(conv_dim),
                     }, &.{ o, proj, w.norm }, .{ .rows_y = hp.gdn_v_heads }) });
-                    try matmul(&b, arena, &body, mix, o, &w.wout, capn);
+                    try body.append(arena, .{ .fork = .{
+                        .prefill = try mm.tiled(x, o, &w.wout, true),
+                        .decode = try mm.vector(x, o, &w.wout, .{ .accumulate = true }),
+                    } });
                 },
             }
-            try body.append(arena, .{ .launch = try b.add(.add, P.Count{ .count = capn * hp.n_embd }, &.{ x, mix }, .{ .elems = hp.n_embd }) });
-            try body.append(arena, .{ .launch = try b.add(.rmsnorm, norm, &.{ x, layer.post_norm, h }, .rows_x) });
-            try matmul(&b, arena, &body, gate, h, &layer.ffn_gate, capn);
-            try matmul(&b, arena, &body, up, h, &layer.ffn_up, capn);
-            try body.append(arena, .{ .launch = try b.add(.silu_mul, P.Count{ .count = capn * hp.n_ff }, &.{ gate, up }, .{ .elems = hp.n_ff }) });
-            try matmul(&b, arena, &body, mix, gate, &layer.ffn_down, capn);
-            try body.append(arena, .{ .launch = try b.add(.add, P.Count{ .count = capn * hp.n_embd }, &.{ x, mix }, .{ .elems = hp.n_embd }) });
+            const ff = hp.n_ff;
+            try body.append(arena, .{ .fork = .{
+                .prefill = try concat(arena, &.{
+                    &.{try b.add(.rmsnorm, norm, &.{ x, layer.post_norm, h }, .rows_x)},
+                    try mm.tiled(gu, h, &layer.ffn_gu, false),
+                    &.{try b.add(.silu_mul, P.SiluMul{ .count = capn * ff, .width = ff }, &.{ gu, act }, .{ .elems = ff })},
+                    try mm.tiled(x, act, &layer.ffn_down, true),
+                }),
+                .decode = try concat(arena, &.{
+                    try mm.vector(act, x, &layer.ffn_gu, .{ .norm = layer.post_norm, .silu_pair = ff }),
+                    try mm.vector(x, act, &layer.ffn_down, .{ .accumulate = true }),
+                }),
+            } });
             try body.append(arena, .{ .layer_end = @intCast(il) });
         }
-        try body.append(arena, .{ .launch = try b.add(.rmsnorm, norm, &.{ x, m.output_norm, h }, .rows_x) });
+        try body.append(arena, .{ .final_norm = try b.add(.rmsnorm, norm, &.{ x, m.output_norm, h }, .rows_x) });
 
-        var head: std.ArrayList(Item) = .empty;
-        try matmul(&b, arena, &head, logits, lm_in, if (m.output) |*out| out else &m.tok_embd, cfg.logit_rows);
-        const head_launches = try arena.alloc(Matmul, head.items.len);
-        for (head.items, head_launches) |item, *l| l.* = item.matmul;
+        const lm = if (m.output) |*out| out else &m.tok_embd;
+        const head: Fork = .{
+            .prefill = try mm.tiled(logits, lm_in, lm, false),
+            .decode = try mm.vector(logits, x, lm, .{ .norm = m.output_norm }),
+        };
 
         const mark = try b.addWith(.mark_tokens, sample_params, &.{ prompt_ids, prompt_mask }, .{ .elems = 1 });
         var sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch) = undefined;
@@ -531,7 +542,7 @@ pub const Program = struct {
             .counts = counts,
             .sample_state = sample_state,
             .body = body.items,
-            .head = head_launches,
+            .head = head,
             .mark = mark,
             .sample = sample,
             .token_stage = try arena.alloc(u32, cfg.max_tokens),
@@ -612,11 +623,16 @@ pub const Program = struct {
             try rec.writeBuffer(gpa, p.token_ids.buffer, 0, std.mem.sliceAsBytes(p.token_stage[0..t.len]));
         }
 
+        // The decode head projects x itself, with the final norm fused, when
+        // it covers every row of the step in one pass; otherwise rows of the
+        // final norm are copied to lm_in for the prefill head.
+        const fused_head = path == .decode and s.logit_rows == m and m <= p.cfg.logit_rows;
+        const want_norm = s.readback != null and s.readback.?.result_norm != null;
         const ext: kernels.Extent = .{ .rows = m, .keys = s.pos0 + m };
         for (p.body) |item| switch (item) {
             .launch => |l| try l.record(gpa, rec, ext),
-            .matmul => |mm| try mm.pick(path).record(gpa, rec, ext),
-            .attention => |at| try at.record(gpa, rec, ext, path),
+            .fork => |f| for (f.pick(path)) |l| try l.record(gpa, rec, ext),
+            .final_norm => |l| if (path == .prefill or want_norm or (s.logit_rows > 0 and !fused_head)) try l.record(gpa, rec, ext),
             .layer_end => |il| if (s.readback) |r| if (r.layer_out.len > 0) {
                 try rec.readBuffer(gpa, read_token, p.x.buffer, 0, std.mem.sliceAsBytes(r.layer_out[il][0 .. m * e]));
             },
@@ -628,8 +644,12 @@ pub const Program = struct {
         var r0 = m - s.logit_rows;
         while (r0 < m) {
             const n = @min(p.cfg.logit_rows, m - r0);
-            try rec.copyBuffer(gpa, p.h.buffer, r0 * e * 4, p.lm_in.buffer, 0, n * e * 4);
-            for (p.head) |mm| try mm.pick(if (path == .decode and n <= kernels.decode_max_rows) .decode else .prefill).record(gpa, rec, .{ .rows = n });
+            if (fused_head) {
+                for (p.head.decode) |l| try l.record(gpa, rec, .{ .rows = n });
+            } else {
+                try rec.copyBuffer(gpa, p.h.buffer, r0 * e * 4, p.lm_in.buffer, 0, n * e * 4);
+                for (p.head.prefill) |l| try l.record(gpa, rec, .{ .rows = n });
+            }
             if (s.readback) |r| if (r.logits) |dst| {
                 const at = (r0 - (m - s.logit_rows)) * vocab;
                 try rec.readBuffer(gpa, read_token, p.logits.buffer, 0, std.mem.sliceAsBytes(dst[at..][0 .. n * vocab]));
@@ -665,17 +685,73 @@ const Alloc = struct {
     }
 };
 
-/// out[t][j] = x[t] · w[j] for the rows of a step, over every weight chunk.
-fn matmul(b: *kernels.Builder, arena: Allocator, list: *std.ArrayList(Item), out: Arg, x: Arg, w: *const Matrix, cap: u32) Allocator.Error!void {
-    std.debug.assert(w.k % kernels.matmul_tile_k == 0);
-    for (w.chunks) |ch| {
-        const tiled = try b.add(.matmul_bf16, P.MatmulBf16{ .rows = cap, .n = ch.rows, .k = w.k, .col0 = ch.row0, .out_stride = w.n }, &.{ x, ch.arg, out }, .{ .tiles_y = .{
-            .x = std.math.divCeil(u32, ch.rows, kernels.matmul_tile_n) catch unreachable,
-            .tile = kernels.matmul_tile_t,
-        } });
-        const vector = try b.add(.matvec_bf16, P.MatvecBf16{ .n = ch.rows, .k = w.k, .col0 = ch.row0, .out_stride = w.n }, &.{ x, ch.arg, out, ch.arg }, .{
-            .rows_y = std.math.divCeil(u32, ch.rows, kernels.matvec_rows) catch unreachable,
-        });
-        try list.append(arena, .{ .matmul = .{ .tiled = tiled, .vector = vector } });
+/// Builds a weight's multiply, one launch per chunk, either way.
+const Mm = struct {
+    b: *kernels.Builder,
+    arena: Allocator,
+    cap: u32,
+    eps: f32,
+
+    /// What the decode multiply fuses around it.
+    const Fuse = struct {
+        /// RMSNorm the input with these weights first.
+        norm: ?Arg = null,
+        /// out += result.
+        accumulate: bool = false,
+        /// The weight is gate | up, each this many rows: out = silu(gate) · up.
+        silu_pair: ?u32 = null,
+    };
+
+    /// out[t][j] (+)= x[t] · w[j] for the rows of a prefill step: tiled.
+    fn tiled(mm: Mm, out: Arg, x: Arg, w: *const Matrix, accumulate: bool) Allocator.Error![]const kernels.Launch {
+        std.debug.assert(w.k % kernels.matmul_tile_k == 0);
+        const list = try mm.arena.alloc(kernels.Launch, w.chunks.len);
+        for (w.chunks, list) |ch, *l| {
+            l.* = try mm.b.add(.matmul_bf16, P.MatmulBf16{
+                .rows = mm.cap,
+                .n = ch.rows,
+                .k = w.k,
+                .col0 = ch.row0,
+                .out_stride = w.n,
+                .accumulate = @intFromBool(accumulate),
+            }, &.{ x, ch.arg, out }, .{ .tiles_y = .{
+                .x = std.math.divCeil(u32, ch.rows, kernels.matmul_tile_n) catch unreachable,
+                .tile = kernels.matmul_tile_t,
+            } });
+        }
+        return list;
     }
+
+    /// The same for a decode step, matrix-vector, with `fuse` folded in.
+    fn vector(mm: Mm, out: Arg, x: Arg, w: *const Matrix, fuse: Fuse) Program.BuildError![]const kernels.Launch {
+        std.debug.assert(fuse.norm == null or w.k <= kernels.matvec_max_staged);
+        if (fuse.silu_pair) |half| {
+            // Both halves of a row pair must be in one binding.
+            if (w.chunks.len != 1) return error.TooLarge;
+            std.debug.assert(w.n == 2 * half);
+        }
+        const flags: P.MatvecBf16.Flags = .{ .norm = fuse.norm != null, .accumulate = fuse.accumulate, .silu_pair = fuse.silu_pair != null };
+        const list = try mm.arena.alloc(kernels.Launch, w.chunks.len);
+        for (w.chunks, list) |ch, *l| {
+            const n = fuse.silu_pair orelse ch.rows;
+            l.* = try mm.b.add(.matvec_bf16, P.MatvecBf16{
+                .n = n,
+                .k = w.k,
+                .col0 = if (fuse.silu_pair != null) 0 else ch.row0,
+                .out_stride = if (fuse.silu_pair) |half| half else w.n,
+                .eps = mm.eps,
+                .flags = flags,
+                .half = fuse.silu_pair orelse 0,
+            }, &.{
+                x,                       ch.arg, out,
+                // Unread without the norm; the weight is a read-only stand-in.
+                fuse.norm orelse ch.arg,
+            }, .{ .rows_y = std.math.divCeil(u32, n, kernels.matvec_rows) catch unreachable });
+        }
+        return list;
+    }
+};
+
+fn concat(arena: Allocator, parts: []const []const kernels.Launch) Allocator.Error![]const kernels.Launch {
+    return std.mem.concat(arena, kernels.Launch, parts);
 }

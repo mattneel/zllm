@@ -37,11 +37,11 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,       checkMatmulChunked,   checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair, checkSiluMul,      checkAdd,             checkEmbed,             checkRopeAppendF32,
-        checkRopeAppendF16,  checkAttentionF32, checkAttentionF16,    checkAttnDecode,        checkDeltaPrep,
-        checkDeltaRule,      checkSampleGreedy, checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
-        checkSamplePlain,    checkSampleTopK1,  checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
+        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,        checkMatvecNorm,
+        checkMatvecSiluPair, checkSiluMul,         checkEmbed,             checkRopeAppendF32, checkRopeAppendF16,
+        checkAttentionF32,   checkAttentionF16,    checkAttnDecode,        checkDeltaPrep,     checkDeltaRule,
+        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,    checkSamplePlain,
+        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -315,27 +315,20 @@ fn checkMatvecSiluPair(c: *Ctx) !Result {
 }
 
 fn checkSiluMul(c: *Ctx) !Result {
-    const n = 70_001;
-    const gate = try c.random(n, 6);
-    const up = try c.random(n, 2);
-    const ga = try c.upload(gate);
-    try c.launcher().launch(.silu_mul, P.Count{ .count = n }, &.{ ga, try c.upload(up) }, kernels.Launcher.elementwise(n));
-    const got = try c.read(ga);
+    // 7 rows of a fused gate|up projection, 10,001 wide.
+    const rows = 7;
+    const width = 10_001;
+    const n = rows * width;
+    const gu = try c.random(2 * n, 6);
+    const act = try c.output(n);
+    try c.launcher().launch(.silu_mul, P.SiluMul{ .count = n, .width = width }, &.{ try c.upload(gu), act }, kernels.Launcher.elementwise(n));
+    const got = try c.read(act);
     const want = try c.arena.alloc(f64, n);
-    for (want, gate, up) |*o, g, u| o.* = @as(f64, g) / (1 + @exp(-@as(f64, g))) * u;
+    for (0..rows) |t| for (0..width) |j| {
+        const g: f64 = gu[t * 2 * width + j];
+        want[t * width + j] = g * sigmoid64(g) * gu[t * 2 * width + width + j];
+    };
     return .{ .name = "silu_mul", .err = relErr(got, want), .tolerance = 1e-6 };
-}
-
-fn checkAdd(c: *Ctx) !Result {
-    const n = 4099;
-    const x = try c.random(n, 1);
-    const y = try c.random(n, 1);
-    const xa = try c.upload(x);
-    try c.launcher().launch(.add, P.Count{ .count = n }, &.{ xa, try c.upload(y) }, kernels.Launcher.elementwise(n));
-    const got = try c.read(xa);
-    const want = try c.arena.alloc(f64, n);
-    for (want, x, y) |*o, a, b| o.* = @as(f32, a + b);
-    return .{ .name = "add", .err = relErr(got, want), .tolerance = 0 };
 }
 
 fn checkEmbed(c: *Ctx) !Result {

@@ -78,10 +78,10 @@ pub fn run(rt: *gen.Runtime, context: u32, out: *Io.Writer) !void {
         ms(one), ms(two), ms(2 * one -| two), ms(encode),
     });
 
-    // The floor under every dispatch: a residual add over one row (4
-    // workgroups), 400 times in a row, each depending on the last.
+    // The floor under every dispatch: the final RMSNorm over one row (one
+    // workgroup), 400 times in a row, each depending on the last.
     const tiny = for (p.body) |item| switch (item) {
-        .launch => |l| if (l.kernel == .add) break l,
+        .final_norm => |l| break l,
         else => {},
     } else unreachable;
     var chain: u64 = std.math.maxInt(u64);
@@ -100,11 +100,10 @@ pub fn run(rt: *gen.Runtime, context: u32, out: *Io.Writer) !void {
     var seq: std.ArrayList(Entry) = .empty;
     for (p.body) |item| switch (item) {
         .launch => |l| try seq.append(arena, .{ .class = @backingInt(l.kernel), .launch = l }),
-        .matmul => |mm| try seq.append(arena, .{ .class = @backingInt(mm.pick(.decode).kernel), .launch = mm.pick(.decode) }),
-        .attention => |at| for ([_]zllm.kernels.Launch{ at.split, at.combine }) |l| try seq.append(arena, .{ .class = @backingInt(l.kernel), .launch = l }),
-        .layer_end => {},
+        .fork => |f| for (f.decode) |l| try seq.append(arena, .{ .class = @backingInt(l.kernel), .launch = l }),
+        .final_norm, .layer_end => {},
     };
-    for (p.head) |mm| try seq.append(arena, .{ .class = head_class, .launch = mm.pick(.decode) });
+    for (p.head.decode) |l| try seq.append(arena, .{ .class = head_class, .launch = l });
     for (p.sample_steps[0..p.sample_len]) |ss| try seq.append(arena, .{ .class = @backingInt(Kernel.sample), .launch = p.sample.get(ss.phase)[ss.round] });
 
     const full = try replay(rt, &rec, seq.items, null, pos);
