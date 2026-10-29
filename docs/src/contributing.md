@@ -45,6 +45,9 @@ Run `check-gpu` on a real GPU: natively on Linux, or with
 hour. llvmpipe is there for `gpu-check`, which takes seconds and is what CI
 runs.
 
+For kernel performance, `zllm bench <model.gguf>` (or `scripts/d3d12.sh
+bench ...`) times decode steps and attributes them to kernel classes.
+
 ## TypeScript
 
 - `tsconfig.json` is strict, plus `noUncheckedIndexedAccess`,

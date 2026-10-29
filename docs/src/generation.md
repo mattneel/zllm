@@ -59,6 +59,11 @@ budget:
 - **Checkpoint boundaries:** chunks also end at multiples of 512 and just
   before the prompt's last token. That token then runs as its own step, which
   measures the fixed cost and produces the logits to sample.
+- **Alignment:** otherwise chunks end only at multiples of 64. Steps of at
+  most 4 tokens run the decode kernels, which round differently from the
+  prefill kernels ([GPU backend](gpu.md#step-program)). Aligned boundaries
+  make the kernels each prompt position goes through depend on the prompt
+  alone, not on step timings.
 - **Decode:** one token per step. The sampler writes the token straight into
   the next step's input on the GPU, so the CPU only reads back the token id
   and its stop flag.
@@ -83,8 +88,13 @@ holds their rows, and the DeltaNet state is the state after the last one.
   token: regenerating the same prompt, editing what follows it, and
   continuing a conversation whose reply was re-rendered differently.
 
-Reuse is exact. A reused prefix gives logits bitwise identical to processing
-the whole prompt from scratch ([Validation](validation.md#engine)).
+Reuse is exact where it can be. A reused prefix gives logits bitwise
+identical to processing the whole prompt from scratch whenever both runs put
+each position through the same kernels. That covers checkpoint restores, a
+repeated prompt and a reset. One case differs: a prompt that extends a turn
+reuses the reply's tokens, which went through the decode kernels, while a
+fresh run would prefill them. There the logits agree within 1e-4 relative
+L2, and 3e-5 is measured ([Validation](validation.md#engine)).
 
 KV is one contiguous f16 cache per attention layer, sized for the context
 (8192 tokens by default, 12 KiB per token for the 0.8B model). The spec's
@@ -109,10 +119,22 @@ The sampler (`src/kernels/sample.wgsl`) follows vLLM's v1 sampler
 7. Top-p: keep a token while the probability ranked above it is < p.
 8. The draw.
 
-Each filter keeps a top segment of the values, so the kernel tracks one
-threshold on order-preserving keys and finds it by bisection, without
-sorting. Stop tokens are checked on the GPU. Two differences from vLLM, both
-deliberate:
+Each filter keeps a top segment of the values, so the kept set is always one
+threshold on order-preserving keys, combined with the min-p test. The kernel
+runs in phases, one dispatch each, chosen per request:
+
+| Phase | Workgroups | Work |
+|---|---|---|
+| prep | one per 1,024 tokens | Bias (binary search in a token-sorted list), penalties, temperature; each workgroup's maximum |
+| reduce | 1 | The maximum and its first index; greedy finishes here |
+| top-k | 4 × (one per 1,024 tokens, then 1) | Radix select: 8-bit histograms of the keys, then the digit holding the k-th largest |
+| top-p, after a top-k of at most 1,024 | one per 1,024 tokens, then 1 | Gather the candidates, sort them in workgroup memory, cut at p, draw in token order |
+| draw | one per 1,024 tokens, then 1 | Each workgroup's kept mass in token order, then the inverse CDF |
+| top-p otherwise | 32 × (one per 1,024 tokens, then 1) | Bisection on the key threshold |
+
+With the chat defaults (top-k 20, top-p 0.95) a draw is 12 dispatches and
+0.2 ms on the RTX 5090. Stop tokens are checked on the GPU. Two differences
+from vLLM, both deliberate:
 
 - **Ties:** tokens tied at a top-k or top-p threshold are all kept. vLLM
   splits them by sort order.
@@ -160,29 +182,35 @@ string itself is not output, as in vLLM by default.
 `generate` samples plainly unless told otherwise, as vLLM does for a model
 without a `generation_config.json`.
 
-## Performance baseline
+## Performance
 
-Measured with `zllm chat` and `zllm generate` on an RTX 5090 Laptop (D3D12),
-f16 KV:
+Measured with `zllm generate` on an RTX 5090 Laptop (D3D12), f16 KV:
 
-| Phase | Rate |
+| Phase | M2 | Now |
+|---|---|---|
+| Prefill, a 2,457-token prompt | 1,562–1,567 tok/s | 2,781–2,807 tok/s, in 12 steps |
+| Decode, greedy, short context | 34 tok/s | 218 tok/s |
+| Decode, greedy, after the 2,457-token prompt | 27 tok/s | 219 tok/s |
+| Decode, top-k 20 + top-p 0.95 | 25 tok/s | 211–212 tok/s |
+
+`zllm bench` attributes a decode step to kernel classes by ablation: the
+step replayed without each class. It drove the decode kernels, step by step,
+at position 1,056:
+
+| Change | ms per decode step |
 |---|---|
-| Prefill, a 2,457-token prompt | 1,562–1,567 tok/s over two runs; the longest step 146 ms |
-| Decode, greedy, short context | 34 tok/s (29 ms per token) |
-| Decode, greedy, after the 2,457-token prompt | 27 tok/s (37 ms per token) |
-| Decode, top-k 20 + top-p 0.95 | 25 tok/s (40 ms per token) |
+| M2 kernels | 42.6 |
+| Matrix-vector multiplies for decode (23.7 → 2.0 ms) | 18.9 |
+| Sampler in phases across the GPU (10.6 → 0.2 ms) | 8.1 |
+| Decode attention split over cache blocks (3.0 → 0.45 ms) | 5.7 |
+| DeltaNet state in registers (1.2 → 0.35 ms) | 5.0 |
 
-The fixed cost of a step is 26 ms. The first step after loading took 70 ms
-before calibration discarded it, and one early version of the cost model,
-fed that figure, overshot to 288 ms steps.
+What remains:
 
-Correctness came first, and the kernels are the M1 kernels made stateful.
-Decode is far from what this GPU can do, for two known reasons that M4's
-kernel catalog and tuning address:
+- **Weights:** a decode step streams 1.5 GB of BF16 weights, about 1.7 ms
+  at this GPU's bandwidth. The matrix-vector kernel reaches 0.5–0.8 TB/s of
+  it.
+- **Dispatches:** each step issues about 440 small dispatches, each with a
+  barrier, which fusion (M5) cuts down.
 
-- **Forward at one token:** the matrix multiply is tiled for prefill. At one
-  token it runs few workgroups with long serial loops. The spec's
-  matrix-vector decode kernel and decode-specific DeltaNet path replace it.
-- **Sampler:** each top-k or top-p bisection sweeps the 248k-entry
-  vocabulary in a single workgroup, about 150 µs per sweep. Selecting
-  candidates across many workgroups first removes most of those sweeps.
+Synchronizing a submission costs about 0.1 ms.

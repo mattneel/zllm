@@ -18,7 +18,7 @@ LLM inference on WebGPU from one Zig codebase, built to the standard of a server
 > - a GPU sampler with vLLM's semantics;
 > - the fixed Qwen chat template.
 >
-> Decode speed is an M2 baseline that M4's kernels address. Next is M3: the browser. See [Generation](https://mattneel.github.io/zllm/generation.html), [Validation](https://mattneel.github.io/zllm/validation.html) and the [roadmap](https://mattneel.github.io/zllm/introduction.html#status).
+> M4's decode kernels have started: generation now runs at about 215 tok/s and prefill at about 2,800 tok/s on an RTX 5090 Laptop, up from 25–34 and 1,560 at M2. Next is M3: the browser. See [Generation](https://mattneel.github.io/zllm/generation.html), [Validation](https://mattneel.github.io/zllm/validation.html) and the [roadmap](https://mattneel.github.io/zllm/introduction.html#status).
 
 ## Building
 

@@ -26,6 +26,11 @@ Milestones **M0**, **M1** and **M2** are complete.
   prefixes exactly through checkpoints. A GPU sampler has vLLM's semantics,
   and `zllm chat` formats conversations with the fixed Qwen chat template.
 
+M4 has started with the decode kernels: a matrix-vector multiply, split
+attention, a register-resident DeltaNet state and a sampler spread across
+the GPU. They take decoding on an RTX 5090 Laptop from 25–34 tok/s to about
+215 tok/s ([Generation](generation.md#performance)).
+
 See [Validation](validation.md), [GPU backend](gpu.md) and
 [Generation](generation.md). Next is M3: the wasm build, the JavaScript shim
 and streaming in the browser.

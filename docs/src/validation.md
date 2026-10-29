@@ -133,7 +133,8 @@ hit every tile and chunk remainder:
 - **Stateful kernels** (the cache append and attention, the convolution, the
   delta rule) run as two steps that carry state between them.
 - **Attention** spans two of its 256-key tiles and is checked against the
-  values the cache actually holds.
+  values the cache actually holds. Decode attention spans three of its
+  64-position blocks, for three query tokens.
 
 The rows below are the RTX 5090 (D3D12) results. llvmpipe gives the same
 errors to within a factor of 2.
@@ -142,13 +143,15 @@ errors to within a factor of 2.
 |---|---|---|
 | rmsnorm | 1.6e-7 | 1e-6 |
 | matmul_bf16 (single and 2-chunk) | 1.3e-6 | 1e-5 |
+| matvec_bf16 (2-chunk, 3 tokens) | 1.2e-7 | 1e-5 |
 | silu_mul | 1.4e-7 | 1e-6 |
 | add, embed_bf16 | 0 | 0 |
-| qk_norm_rope | 9.7e-8 | 1e-5 |
-| kv_append, f16 | 4.9e-4 | 1e-3 (one f16 step) |
-| attention, f32 and f16 cache | 6.5e-7 | 1e-5 |
-| conv_silu (2 steps), l2norm_heads, gates | ≤ 1.5e-7 | 1e-6 |
-| delta_rule (2 steps) | 5.0e-7 | 1e-5 |
+| qk_norm_rope | 1.4e-7 | 1e-5 |
+| kv_append, f16 | 4.8e-4 | 1e-3 (one f16 step) |
+| attention, f32 and f16 cache | 6.0e-7 | 1e-5 |
+| attn_split + attn_combine | 3.1e-7 | 1e-5 |
+| conv_silu (2 steps), l2norm_heads, gates | ≤ 1.4e-7 | 1e-6 |
+| delta_rule + gated_norm (2 steps) | 2.4e-7 | 1e-5 |
 
 D3D12 rounds `pack2x16float` toward zero and llvmpipe to nearest (2.4e-4),
 so the f16 bound is one step, not half. Dropping the attention output gate
@@ -157,9 +160,11 @@ makes `gpu-check` fail with error 1.0.
 The sampler runs on seeded Gaussian logits (σ = 2), so every threshold cuts
 through a dense band of tokens:
 
-- **Configurations:** greedy with penalties and bias; top-k 40 with top-p
-  0.9; min-p 0.05; top-p 0.5; plain T = 1; top-k 1; and the full
-  248,320-token vocabulary with every control at once.
+- **Configurations:** each path through the sampler's phases. They cover
+  greedy with penalties and bias; top-k 40 with top-p 0.9; min-p 0.05;
+  top-p 0.5; plain T = 1; top-k 1; top-k 2,000 with top-p 0.8 (past the
+  candidate cap, so top-p bisects); min-p leaving fewer than k tokens; and
+  the full 248,320-token vocabulary with every control at once.
 - **Each draw:** the stop flag, the next-step token and the count update
   must be right, and the token must be the CPU reference's draw up to
   rounding.
@@ -176,33 +181,48 @@ an interval boundary can land on the neighbour.
 
 | Host | Draws | Exact | Worst deviation |
 |---|---|---|---|
-| RTX 5090, D3D12 | 75 | 75 | 0 |
-| llvmpipe, Vulkan | 75 | 75 | 0 |
+| RTX 5090, D3D12 | 91 | 91 | 0 |
+| llvmpipe, Vulkan | 91 | 91 | 0 |
 
 On different seeded data, one plain T = 1 draw out of 16 picked the
-neighbouring token, 4.4e-8 from its boundary. Halving min-p's cut on the GPU
-fails with deviation 1.0, a token outside every plausible kept set.
+neighbouring token, 4.4e-8 from its boundary. Mutations fail:
+
+- **Min-p cut halved:** deviation 1.0, a token outside every plausible kept
+  set.
+- **Top-p cut halved:** deviations up to 0.3.
+- **Off-by-one in the top-k radix select:** fails the three
+  configurations where top-k cuts (k = 20, 40 and 2,000).
 
 ## GPU forward pass
 
 `zig build check-gpu` runs `zllm forward` (the CPU reference) and
 `zllm gpu-forward` on the same token ids for all 818 eval positions.
 `gpu-forward` processes them as steps against the KV cache and the recurrent
-state, as generation does. With an f32 cache, both use the same BF16 weights
-and f32 activations, so they can differ only by reduction order and the
-rounding of `exp` and similar functions. The bounds are therefore tight:
+state, as generation does, through either kernel path
+([GPU backend](gpu.md#two-kernel-paths)). With an f32 cache, both use the
+same BF16 weights and f32 activations, so they can differ only by reduction
+order and the rounding of `exp` and similar functions. The bounds are
+therefore tight:
 
 | Run | Requirement | Scope |
 |---|---|---|
-| f32 cache, 512-token steps | 100% top-1 agreement; cosine ≥ 0.999999 and relative L2 ≤ 1e-4 | every layer output, final norm and logits, every position |
-| f32 cache, 7-token steps | bitwise identical to 512-token steps | everything |
-| f32 cache, 1-token steps (as decoding runs), first 40 tokens | bitwise identical to 512-token steps | everything |
+| Prefill kernels, f32 cache, 512-token steps | 100% top-1 agreement; cosine ≥ 0.999999 and relative L2 ≤ 1e-4 | every layer output, final norm and logits, every position |
+| Prefill kernels, 7-token steps | bitwise identical to 512-token steps | everything |
+| Decode kernels, 1-token steps (as decoding runs), first 40 positions | the same bounds as 512-token steps | the same |
+| Decode kernels, 3-token steps | bitwise identical to 1-token steps | everything |
 | f16 cache (the default) | ≥ 99% top-1 agreement; cosine ≥ 0.99998 | every layer output, final norm and logits, every position |
 
-| Host | f32: top-1, max relative L2 | Step splits | f16: top-1, min cosine |
+RTX 5090 (D3D12):
+
+| Kernels | Top-1 | Max relative L2 | Splits |
 |---|---|---|---|
-| RTX 5090, D3D12 | 818/818, 9.9e-6 | bitwise identical | 818/818, 0.9999939 |
-| llvmpipe, Vulkan | 818/818, 1.0e-5 | bitwise identical | 818/818, 0.9999984 |
+| Prefill | 818/818 | 1.2e-5 | bitwise identical |
+| Decode | 200/200 | 1.1e-5 | bitwise identical |
+| Prefill, f16 cache | 818/818 | min cosine 0.9999939 | |
+
+At M2, before the decode kernels, llvmpipe gave the same results (818/818,
+1.0e-5). `check-gpu` now runs on real GPUs only: on llvmpipe it takes about
+half an hour.
 
 Top-1 agreement alone is a weak check. Halving the RoPE base on the GPU
 still agrees on 814 of 818 tokens, which would pass the 99% bar used against
@@ -213,17 +233,23 @@ llama.cpp, but it drives the per-layer relative L2 error to 6.3e-2, and
 
 `check-gpu` also runs `zllm engine-check`. It sends requests through the
 real engine after earlier requests left state behind. Then it repeats each
-one after dropping all state. Every sampled step's logits must be bitwise
-identical, and the reused prompt length must be what the reuse rules say:
+one after dropping all state. Each sampled step's logits must match, and the
+reused prompt length must be what the reuse rules say. Logits must be
+bitwise identical wherever both runs put each position through the same
+kernels. Prefill chunks end at multiples of 64, so that holds for every
+scenario but one: a prompt that extends a turn reuses the reply's tokens,
+which went through the decode kernels. That one must agree within 1e-4
+relative L2.
 
-| Scenario | Reused |
-|---|---|
-| A fresh 700-token prompt | 0 |
-| The prompt, its reply, and 40 more tokens | 711: the whole resident sequence |
-| A prompt sharing the first 600 tokens | 512: the checkpoint at 512 |
-| The same prompt again | 649: the checkpoint before its last token |
-| The first prompt after an unrelated one | 0: the state is zeroed |
+| Scenario | Reused | Logits |
+|---|---|---|
+| A fresh 700-token prompt | 0 | bitwise identical |
+| The prompt, its reply, and 40 more tokens | 711: the whole resident sequence | relative L2 3.0e-5 |
+| A prompt sharing the first 600 tokens | 512: the checkpoint at 512 | bitwise identical |
+| The same prompt again | 649: the checkpoint before its last token | bitwise identical |
+| The first prompt after an unrelated one | 0: the state is zeroed | bitwise identical |
 
-All five pass on both hosts. Skipping the checkpoint restore fails both
-checkpoint scenarios. An earlier
-bug that left the state dirty after dropping the sequence failed all five.
+These are RTX 5090 results; at M2 all five also passed bitwise on llvmpipe.
+Skipping the checkpoint restore fails both checkpoint scenarios, and an
+earlier bug that left the state dirty after dropping the sequence failed all
+five.

@@ -76,19 +76,23 @@ and widened in the shader; activations and accumulation are f32.
 |---|---|---|
 | `embed_bf16` | Token embedding gather | Per table chunk |
 | `rmsnorm` | Row RMSNorm | One workgroup per row |
-| `matmul_bf16` | x · Wᵀ | 16 tokens × 64 outputs per workgroup; tiles staged in workgroup memory |
+| `matmul_bf16` | x · Wᵀ, prefill | 16 tokens × 64 outputs per workgroup; tiles staged in workgroup memory |
+| `matvec_bf16` | x · Wᵀ, decode | 8 rows per workgroup, each row's dot product over 32 lanes reading 16-byte weight vectors, then a fixed tree |
 | `silu_mul`, `add` | SwiGLU, residual | Elementwise |
 | `qk_norm_rope` | Per-head Q/K RMSNorm, then partial NeoX RoPE at positions pos0 + t | Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π] |
 | `kv_append` | K and V rows into the cache at pos0 + t | f16 pairs (`pack2x16float`) or f32 |
-| `attention` | Causal GQA over the cache, with the sigmoid output gate | Online softmax over 256-key tiles; no length limit |
+| `attention` | Causal GQA over the cache, with the sigmoid output gate, prefill | One workgroup per (head, query); online softmax over 256-key tiles; no length limit |
+| `attn_split`, `attn_combine` | The same, decode (flash-decoding) | One workgroup per (KV head, 64 cache positions, token) scores the block for the whole GQA group and takes a local softmax; the combine merges the blocks |
 | `conv_silu` | DeltaNet causal conv | One thread per channel; reads and advances the last 3 inputs |
 | `l2norm_heads`, `gates` | DeltaNet front end | |
-| `delta_rule` | Gated delta rule, then SiLU(z)-gated RMSNorm | One workgroup per value head, one thread per state column |
+| `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups |
+| `gated_norm` | The SiLU(z)-gated RMSNorm after it | One workgroup per (head, token) |
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
-| `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | One workgroup; see [Generation](generation.md#sampling) |
+| `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling) |
 
-These are plain WGSL, written to be correct and reasonably fast. M4
-replaces them with templates that are tuned per GPU.
+These are plain WGSL. M4 makes them templates tuned per GPU; the decode
+kernels above are its first part, measured with `zllm bench`
+([Generation](generation.md#performance)).
 
 ## Step program
 
@@ -117,11 +121,20 @@ for prefill, and a replay of the launch list:
 One `submit` per step keeps the step uniform unambiguous: queued writes land
 before the submission they precede.
 
-Every row's arithmetic is the same whatever the step's size. A query walks
-the same key tiles from position 0, and each matrix-multiply output reduces
-in the same order. So splitting a sequence into steps of any size, including
-one token at a time as decoding does, gives bitwise identical results. That
-makes prefix reuse exact, and `check-gpu` checks it.
+### Two kernel paths
+
+Steps of at most 4 tokens, decoding, run the **decode kernels**:
+`matvec_bf16` for every multiply, and split attention. Longer steps run the
+**prefill kernels**. The plan prebuilds every multiply and attention both
+ways, and a step picks one (`plan.Path`).
+
+Within a path, every row's arithmetic is the same whatever the step's size.
+A query walks the same key tiles from position 0, and each multiply output
+reduces in the same order, so splitting a sequence into steps of any size
+gives bitwise identical results. The two paths reduce in different orders,
+so a position processed through one differs from the same position through
+the other by rounding, about 1e-5 relative. `check-gpu` checks both paths
+against the CPU reference, and each path's splits bitwise.
 
 Every storage binding must fit `maxStorageBufferBindingSize`, which is
 128 MiB on llvmpipe and 2 GiB on the 5090:
