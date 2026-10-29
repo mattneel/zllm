@@ -2,7 +2,14 @@
 // reasoning and content. The engine is also exposed as `window.zllmEngine`
 // for scripted checks.
 
-import { type ChatMessage, type Engine, type LoadOptions, load } from "../zllm/index";
+import {
+  type ChatMessage,
+  cacheUsage,
+  clearCache,
+  type Engine,
+  type LoadOptions,
+  load,
+} from "../zllm/index";
 
 declare global {
   interface Window {
@@ -47,7 +54,8 @@ async function start(model: LoadOptions["model"], name: string): Promise<void> {
     });
     window.zllmEngine = engine;
     const s = engine.stats();
-    status.textContent = `${name} on ${s.adapter}, loaded in ${(s.loadMs / 1000).toFixed(1)} s.`;
+    const from = { hit: "from the cache", filled: "and cached", off: "uncached" }[s.cache];
+    status.textContent = `${name} on ${s.adapter}, loaded in ${(s.loadMs / 1000).toFixed(1)} s (${from}).`;
     progress.hidden = true;
     form.hidden = false;
     promptBox.focus();
@@ -147,6 +155,11 @@ promptBox.addEventListener("keydown", (ev) => {
   }
 });
 stop.addEventListener("click", () => controller?.abort());
+el<HTMLButtonElement>("clear-cache").addEventListener("click", async () => {
+  const before = await cacheUsage();
+  await clearCache();
+  status.textContent = `Cleared ${before.entries} cached model(s), ${(before.bytes / 2 ** 20).toFixed(0)} MiB.`;
+});
 el<HTMLButtonElement>("reset").addEventListener("click", () => {
   history = [];
   log.replaceChildren();

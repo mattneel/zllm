@@ -44,9 +44,13 @@ async function serveFile(req: Request, path: string): Promise<Response> {
   if (!(await file.exists())) {
     return new Response("not found", { status: 404 });
   }
+  // Last-Modified lets the shim cache the file (and notice when it changes).
+  const lastModified = new Date(file.lastModified).toUTCString();
   const range = req.headers.get("Range")?.match(/^bytes=(\d+)-(\d*)$/);
   if (range?.[1] === undefined) {
-    return new Response(file, { headers: { "Accept-Ranges": "bytes" } });
+    return new Response(file, {
+      headers: { "Accept-Ranges": "bytes", "Last-Modified": lastModified },
+    });
   }
   const start = Number(range[1]);
   const end = range[2] ? Math.min(Number(range[2]), file.size - 1) : file.size - 1;
@@ -60,6 +64,7 @@ async function serveFile(req: Request, path: string): Promise<Response> {
     status: 206,
     headers: {
       "Accept-Ranges": "bytes",
+      "Last-Modified": lastModified,
       "Content-Range": `bytes ${start}-${end}/${file.size}`,
       "Content-Length": String(end - start + 1),
     },

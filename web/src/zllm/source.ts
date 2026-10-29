@@ -4,6 +4,11 @@
 export interface ModelSource {
   /** File size in bytes. */
   readonly size: number;
+  /**
+   * What names this file for the weight cache (the URL and the server's
+   * ETag or Last-Modified); sources without one are not cached.
+   */
+  readonly identity?: string;
   /** Bytes [offset, offset + length) of the file. */
   read(offset: number, length: number): Promise<Uint8Array<ArrayBuffer>>;
 }
@@ -20,7 +25,9 @@ export function fileSource(file: Blob): ModelSource {
 
 /** A URL served with HTTP range requests. */
 export async function urlSource(url: string, init: RequestInit = {}): Promise<ModelSource> {
-  const head = await fetch(url, { ...init, headers: { Range: "bytes=0-0" } });
+  // Past the HTTP cache: the probe must see the current validator, and the
+  // weight cache (cache.ts) keeps the bytes instead.
+  const head = await fetch(url, { cache: "no-store", ...init, headers: { Range: "bytes=0-0" } });
   if (head.status !== 206) {
     throw new Error(`${url}: range requests unsupported (status ${head.status})`);
   }
@@ -30,10 +37,16 @@ export async function urlSource(url: string, init: RequestInit = {}): Promise<Mo
     throw new Error(`${url}: no file size in Content-Range`);
   }
   await head.body?.cancel();
+  // Without a validator a changed file could not be told apart: no identity.
+  const validator = head.headers.get("ETag") ?? head.headers.get("Last-Modified");
   return {
     size,
+    ...(validator === null
+      ? {}
+      : { identity: `${new URL(url, location.href).href}\n${validator}` }),
     async read(offset, length) {
       const res = await fetch(url, {
+        cache: "no-store",
         ...init,
         headers: { Range: `bytes=${offset}-${offset + length - 1}` },
       });

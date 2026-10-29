@@ -5,6 +5,7 @@
 //   const reply = await engine.chat.completions.create({ messages });
 
 export type { FinishReason } from "./abi";
+export { type CacheUsage, cacheUsage, clearCache } from "./cache";
 export {
   type ChatCompletion,
   type ChatCompletionChunk,

@@ -3,6 +3,7 @@
 // its events into async iterables.
 
 import { Event, type Exports, FINISH, type FinishReason, NEED_MORE, Out } from "./abi";
+import { type Cached, openCached } from "./cache";
 import { Executor, type LoadProgress, planLimits, requestDevice } from "./gpu";
 import { fileSource, type ModelSource, urlSource } from "./source";
 
@@ -18,6 +19,11 @@ export interface LoadOptions {
   context?: number;
   /** KV cache format (default f16). */
   kv?: "f16" | "f32";
+  /**
+   * Keep the model in the browser's origin private file system, so later
+   * loads read it from disk (default true; URLs only, see cache.ts).
+   */
+  cache?: boolean;
   /** An existing device; by default the high-performance adapter's. */
   device?: GPUDevice;
   onProgress?: (p: LoadProgress) => void;
@@ -156,13 +162,34 @@ export interface Stats {
   adapter: string;
   model: Record<string, unknown>;
   loadMs: number;
+  /** Where the weights came from: the cache, the network while filling it, or uncached. */
+  cache: "hit" | "filled" | "off";
   /** The last request's usage. */
   last: Usage | null;
 }
 
 export async function load(opts: LoadOptions): Promise<Engine> {
   const t0 = performance.now();
-  const source = await openSource(opts.model);
+  const opened = await openSource(opts.model);
+  const cached: Cached = opts.cache === false ? { none: opened } : await openCached(opened);
+  const source = "hit" in cached ? cached.hit : "fill" in cached ? cached.fill.source : cached.none;
+  try {
+    const engine = await loadFrom(source, opts);
+    if ("fill" in cached) {
+      await cached.fill.commit();
+    }
+    engine.cache = "hit" in cached ? "hit" : "fill" in cached ? "filled" : "off";
+    engine.loadMs = performance.now() - t0;
+    return engine;
+  } catch (e) {
+    if ("fill" in cached) {
+      await cached.fill.discard();
+    }
+    throw e;
+  }
+}
+
+async function loadFrom(source: ModelSource, opts: LoadOptions): Promise<Engine> {
   const wasmUrl = opts.wasm ?? new URL("./zllm.wasm", import.meta.url);
   const { instance } = await WebAssembly.instantiateStreaming(fetch(wasmUrl), {
     env: {
@@ -203,7 +230,6 @@ export async function load(opts: LoadOptions): Promise<Engine> {
   for await (const _ of engine.drive()) {
     // Loading emits no tokens.
   }
-  engine.loadMs = performance.now() - t0;
   return engine;
 }
 
@@ -235,6 +261,7 @@ export class Engine {
    */
   readonly #inFlight: Promise<number>[] = [];
   loadMs = 0;
+  cache: Stats["cache"] = "off";
 
   readonly chat = {
     completions: {
@@ -315,6 +342,7 @@ export class Engine {
       adapter: this.#adapter,
       model: JSON.parse(info),
       loadMs: this.loadMs,
+      cache: this.cache,
       last: this.#last,
     };
   }
