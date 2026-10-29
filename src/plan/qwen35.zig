@@ -69,6 +69,17 @@ const Layer = struct {
     },
 };
 
+/// The multi-token prediction block (src/ref/qwen35.zig `Mtp`).
+const Mtp = struct {
+    enorm: Arg,
+    hnorm: Arg,
+    /// [enorm(embedding), hnorm(hidden)] → n_embd.
+    eh_proj: Matrix,
+    /// A full-attention block.
+    block: Layer,
+    head_norm: Arg,
+};
+
 /// Weights resident on the GPU.
 pub const Model = struct {
     hp: Hparams,
@@ -76,6 +87,8 @@ pub const Model = struct {
     output: ?Matrix,
     output_norm: Arg,
     layers: []const Layer,
+    /// The MTP block, for models that have one.
+    mtp: ?Mtp,
 
     pub const UploadError = Hparams.Error || Allocator.Error || error{ MissingTensor, BadShape, UnsupportedTensorType, TensorTooLarge };
 
@@ -83,19 +96,25 @@ pub const Model = struct {
     /// table).
     pub fn eachMatrix(m: *const Model, context: anytype, comptime f: fn (@TypeOf(context), *const Matrix) void) void {
         if (m.output) |*o| f(context, o);
-        for (m.layers) |*l| {
-            f(context, &l.ffn_gu);
-            f(context, &l.ffn_down);
-            switch (l.mixer) {
-                .attention => |*w| {
-                    f(context, &w.wqkv);
-                    f(context, &w.wo);
-                },
-                .delta_net => |*w| {
-                    f(context, &w.wproj);
-                    f(context, &w.wout);
-                },
-            }
+        for (m.layers) |*l| eachLayerMatrix(l, context, f);
+        if (m.mtp) |*t| {
+            f(context, &t.eh_proj);
+            eachLayerMatrix(&t.block, context, f);
+        }
+    }
+
+    fn eachLayerMatrix(l: *const Layer, context: anytype, comptime f: fn (@TypeOf(context), *const Matrix) void) void {
+        f(context, &l.ffn_gu);
+        f(context, &l.ffn_down);
+        switch (l.mixer) {
+            .attention => |*w| {
+                f(context, &w.wqkv);
+                f(context, &w.wo);
+            },
+            .delta_net => |*w| {
+                f(context, &w.wproj);
+                f(context, &w.wout);
+            },
         }
     }
 
@@ -116,19 +135,7 @@ pub const Model = struct {
                 .ffn_gu = try u.stacked(i, e, &.{ .{ "blk.{d}.ffn_gate.weight", ff }, .{ "blk.{d}.ffn_up.weight", ff } }),
                 .ffn_down = try u.matrix("blk.{d}.ffn_down.weight", i, ff, e),
                 .mixer = switch (kind) {
-                    .attention => blk: {
-                        const hd: u64 = hp.head_dim;
-                        break :blk .{ .attention = .{
-                            .wqkv = try u.stacked(i, e, &.{
-                                .{ "blk.{d}.attn_q.weight", 2 * hd * hp.n_head },
-                                .{ "blk.{d}.attn_k.weight", hd * hp.n_head_kv },
-                                .{ "blk.{d}.attn_v.weight", hd * hp.n_head_kv },
-                            }),
-                            .wo = try u.matrix("blk.{d}.attn_output.weight", i, hd * hp.n_head, e),
-                            .q_norm = try u.vector("blk.{d}.attn_q_norm.weight", i, hd),
-                            .k_norm = try u.vector("blk.{d}.attn_k_norm.weight", i, hd),
-                        } };
-                    },
+                    .attention => .{ .attention = try u.attention(hp, i) },
                     .delta_net => blk: {
                         const conv_dim: u64 = 2 * hp.gdn_head_dim * hp.gdn_k_heads + hp.gdn_inner;
                         break :blk .{ .delta_net = .{
@@ -149,8 +156,30 @@ pub const Model = struct {
             };
         }
 
+        const mtp: ?Mtp = if (hp.n_layer_nextn == 1) blk: {
+            const i: usize = hp.n_layer;
+            break :blk .{
+                .enorm = try u.vector("blk.{d}.nextn.enorm.weight", i, e),
+                .hnorm = try u.vector("blk.{d}.nextn.hnorm.weight", i, e),
+                .eh_proj = try u.matrix("blk.{d}.nextn.eh_proj.weight", i, 2 * e, e),
+                .block = .{
+                    .attn_norm = try u.vector("blk.{d}.attn_norm.weight", i, e),
+                    .post_norm = try u.vector("blk.{d}.post_attention_norm.weight", i, e),
+                    .ffn_gu = try u.stacked(i, e, &.{ .{ "blk.{d}.ffn_gate.weight", ff }, .{ "blk.{d}.ffn_up.weight", ff } }),
+                    .ffn_down = try u.matrix("blk.{d}.ffn_down.weight", i, ff, e),
+                    .mixer = .{ .attention = try u.attention(hp, i) },
+                },
+                // The model's output norm where the block has no own.
+                .head_norm = if (u.has("blk.{d}.nextn.shared_head_norm.weight", i))
+                    try u.vector("blk.{d}.nextn.shared_head_norm.weight", i, e)
+                else
+                    try u.vector("output_norm.weight", null, e),
+            };
+        } else null;
+
         return .{
             .hp = hp,
+            .mtp = mtp,
             .tok_embd = try u.matrix("token_embd.weight", null, e, hp.vocab),
             .output = if (file.tensor("output.weight") != null) try u.matrix("output.weight", null, e, hp.vocab) else null,
             .output_norm = try u.vector("output_norm.weight", null, e),
@@ -178,6 +207,27 @@ const Upload = struct {
         if (!std.mem.eql(u64, ti.shape(), shape)) return error.BadShape;
         if (ti.type != t) return error.UnsupportedTensorType;
         return ti;
+    }
+
+    fn has(u: *const Upload, comptime fmt: []const u8, layer: usize) bool {
+        var buf: [96]u8 = undefined;
+        return u.file.tensor(std.fmt.bufPrint(&buf, fmt, .{layer}) catch unreachable) != null;
+    }
+
+    /// Layer `i`'s gated full attention.
+    fn attention(u: *Upload, hp: Hparams, i: usize) Model.UploadError!Attention {
+        const e: u64 = hp.n_embd;
+        const hd: u64 = hp.head_dim;
+        return .{
+            .wqkv = try u.stacked(i, e, &.{
+                .{ "blk.{d}.attn_q.weight", 2 * hd * hp.n_head },
+                .{ "blk.{d}.attn_k.weight", hd * hp.n_head_kv },
+                .{ "blk.{d}.attn_v.weight", hd * hp.n_head_kv },
+            }),
+            .wo = try u.matrix("blk.{d}.attn_output.weight", i, hd * hp.n_head, e),
+            .q_norm = try u.vector("blk.{d}.attn_q_norm.weight", i, hd),
+            .k_norm = try u.vector("blk.{d}.attn_k_norm.weight", i, hd),
+        };
     }
 
     /// A matrix weight: BF16, F16, or a type the quantized kernels decode.
@@ -307,6 +357,8 @@ pub const Config = struct {
     kv: KvFormat = .f16,
     /// DeltaNet checkpoint slots.
     checkpoints: u32 = 4,
+    /// Build the MTP block's step (recordMtp); needs a model with one.
+    mtp: bool = false,
 };
 
 /// One entry of the step body.
@@ -388,6 +440,7 @@ pub const Program = struct {
     /// Tokens per tile of the prefill multiplies: a step's partial tile
     /// costs as much as a whole one (kernels.matmulTiles).
     prefill_tile: u32,
+    mtp: ?MtpProgram = null,
 
     // Upload staging, alive until the batch that writes it has executed.
     step_value: P.Step = .{ .m = 0, .pos0 = 0, .u = 0 },
@@ -477,48 +530,28 @@ pub const Program = struct {
             .act = .{ try Mm.actScratch(&a, m, cap, 256), try Mm.actScratch(&a, m, cap, 32) },
         };
 
+        const lb: LayerBuilder = .{
+            .a = &a,
+            .mm = mm,
+            .hp = hp,
+            .kv_layer = kv_layer,
+            .kv = cfg.kv,
+            .max_blocks = max_blocks,
+            .x = x,
+            .h = h,
+            .gu = gu,
+            .act = act,
+            .qkv = qkv,
+            .att = att,
+            .attn_part = attn_part,
+        };
         for (m.tok_embd.chunks) |ch| {
             try body.append(arena, .{ .launch = try b.add(weightKernel(.embed, ch.type), P.EmbedBf16{ .dim = hp.n_embd, .row0 = ch.row0, .chunk_rows = ch.rows }, &.{ token_ids, ch.arg, x }, .rows_x) });
         }
         var delta_i: u64 = 0;
         for (m.layers, 0..) |*layer, il| {
             switch (layer.mixer) {
-                .attention => |*w| {
-                    const kc = try a.buffer(kv_layer, .{ .storage = true });
-                    const vc = try a.buffer(kv_layer, .{ .storage = true });
-                    const half: u32 = @backingInt(cfg.kv);
-                    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    const q_row: u32 = @intCast(qkv_row);
-                    try body.append(arena, .{ .fork = .{
-                        .prefill = try mm.tiled(qkv, .{ .rmsnorm = .{ .x = x, .w = layer.attn_norm, .out = h } }, &w.wqkv, false),
-                        .decode = try mm.vector(qkv, x, &w.wqkv, .{ .norm = layer.attn_norm }),
-                    } });
-                    try body.append(arena, .{ .launch = try b.add(.rope_append, P.RopeAppend{
-                        .heads = hp.n_head,
-                        .kv_heads = hp.n_head_kv,
-                        .head_dim = hp.head_dim,
-                        .n_rot = hp.n_rot,
-                        .row = q_row,
-                        .k_off = @intCast(2 * hd * hp.n_head),
-                        .v_off = @intCast(2 * hd * hp.n_head + kv_dim),
-                        .f16 = half,
-                        .eps = hp.rms_eps,
-                    }, &.{ qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
-                    // Split attention over blocks of cache positions, in
-                    // chunks of attn_rows tokens; a step records the chunks
-                    // its rows reach.
-                    var attn: std.ArrayList(kernels.Launch) = .empty;
-                    var row0: u32 = 0;
-                    while (row0 < capn) : (row0 += kernels.attn_rows) {
-                        const params: P.Attention = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .f16 = half, .scale = scale, .max_blocks = max_blocks, .q_row = q_row, .row0 = row0 };
-                        try attn.append(arena, try b.add(.attn_split, params, &.{ qkv, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } }));
-                        try attn.append(arena, try b.add(.attn_combine, params, &.{ qkv, attn_part, att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = row0, .max_rows = kernels.attn_rows } }));
-                    }
-                    try body.append(arena, .{ .fork = .{
-                        .prefill = try concat(arena, &.{ attn.items, try mm.tiled(x, .{ .plain = att }, &w.wo, true) }),
-                        .decode = try concat(arena, &.{ attn.items[0..2], try mm.vector(x, att, &w.wo, .{ .accumulate = true }) }),
-                    } });
-                },
+                .attention => |*w| try lb.attention(&body, layer.attn_norm, w, rope, step),
                 .delta_net => |*w| {
                     const base = delta_i * per_layer;
                     delta_i += 1;
@@ -561,17 +594,7 @@ pub const Program = struct {
                     } });
                 },
             }
-            const ff = hp.n_ff;
-            try body.append(arena, .{ .fork = .{
-                .prefill = try concat(arena, &.{
-                    try mm.tiled(gu, .{ .rmsnorm = .{ .x = x, .w = layer.post_norm, .out = h } }, &layer.ffn_gu, false),
-                    try mm.tiled(x, .{ .silu = .{ .gu = gu, .width = ff, .out = act } }, &layer.ffn_down, true),
-                }),
-                .decode = try concat(arena, &.{
-                    try mm.vector(act, x, &layer.ffn_gu, .{ .norm = layer.post_norm, .silu_pair = ff }),
-                    try mm.vector(x, act, &layer.ffn_down, .{ .accumulate = true }),
-                }),
-            } });
+            try lb.ffn(&body, layer);
             try body.append(arena, .{ .layer_end = @intCast(il) });
         }
         try body.append(arena, .{ .final_norm = try b.add(.rmsnorm, norm, &.{ x, m.output_norm, h }, .rows_x) });
@@ -581,6 +604,43 @@ pub const Program = struct {
             .prefill = try mm.tiled(logits, .{ .plain = lm_in }, lm, false),
             .decode = try mm.vector(logits, x, lm, .{ .norm = m.output_norm }),
         };
+
+        const mtp: ?MtpProgram = if (!cfg.mtp) null else if (m.mtp) |*t| blk: {
+            const mtp_step = try a.buffer(@sizeOf(P.Step), .{ .uniform = true, .copy_dst = true });
+            const mtp_tokens = try a.storage(cap);
+            const e1 = try a.storage(cap * e);
+            const cat = try a.storage(cap * 2 * e);
+            // The block's cache row i holds position i + 1 (position 0 has
+            // no hidden state before it): its RoPE table starts at 1.
+            const shifted = try kernels.ropeTable(arena, cfg.context + 1, hp.n_rot, hp.rope_base);
+            const mtp_rope = try a.storage(rope_table.len);
+            try rec.writeBuffer(gpa, mtp_rope.buffer, 0, std.mem.sliceAsBytes(shifted[hp.n_rot / 2 * 2 ..]));
+
+            var pre: std.ArrayList(kernels.Launch) = .empty;
+            for (m.tok_embd.chunks) |ch| {
+                try pre.append(arena, try b.add(weightKernel(.embed, ch.type), P.EmbedBf16{ .dim = hp.n_embd, .row0 = ch.row0, .chunk_rows = ch.rows }, &.{ mtp_tokens, ch.arg, x }, .rows_x));
+            }
+            try pre.append(arena, try b.add(.rmsnorm, norm, &.{ x, t.enorm, e1 }, .rows_x));
+            try pre.append(arena, try b.add(.rmsnorm, norm, &.{ h, t.hnorm, x }, .rows_x));
+            var mbody: std.ArrayList(Item) = .empty;
+            try mbody.append(arena, .{ .fork = .{
+                .prefill = try mm.tiled(x, .{ .plain = cat }, &t.eh_proj, false),
+                .decode = try mm.vector(x, cat, &t.eh_proj, .{}),
+            } });
+            try lb.attention(&mbody, t.block.attn_norm, &t.block.mixer.attention, mtp_rope, mtp_step);
+            try lb.ffn(&mbody, &t.block);
+            break :blk .{
+                .step = mtp_step,
+                .tokens = mtp_tokens,
+                .e1 = e1,
+                .cat = cat,
+                .pre = pre.items,
+                .body = mbody.items,
+                .head_norm = try b.add(.rmsnorm, norm, &.{ x, t.head_norm, h }, .rows_x),
+                .head = .{ .prefill = head.prefill, .decode = try mm.vector(logits, x, lm, .{ .norm = t.head_norm }) },
+                .token_stage = try arena.alloc(u32, cfg.max_tokens),
+            };
+        } else return error.BadConfig;
 
         const mark = try b.addWith(.mark_tokens, sample_params, &.{ prompt_ids, prompt_mask }, .{ .elems = 1 });
         var sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch) = undefined;
@@ -604,6 +664,7 @@ pub const Program = struct {
             .hp = hp,
             .cfg = cfg,
             .prefill_tile = prefillTile(m),
+            .mtp = mtp,
             .step = step,
             .token_ids = token_ids,
             .x = x,
@@ -674,6 +735,8 @@ pub const Program = struct {
         /// The kernels to use; by default the decode kernels for steps of at
         /// most `kernels.decode_max_rows` tokens, else the prefill kernels.
         path: ?Path = null,
+        /// Leave every row's final hidden state in `h` for recordMtp.
+        hidden: bool = false,
     };
 
     /// Where a step's readbacks land, row-major [rows][dim]: `layer_out[i]`
@@ -704,7 +767,7 @@ pub const Program = struct {
         // it covers every row of the step in one pass; otherwise rows of the
         // final norm are copied to lm_in for the prefill head.
         const fused_head = path == .decode and s.logit_rows == m and m <= p.cfg.logit_rows;
-        const want_norm = s.readback != null and s.readback.?.result_norm != null;
+        const want_norm = s.hidden or (s.readback != null and s.readback.?.result_norm != null);
         const ext: kernels.Extent = .{ .rows = m, .keys = s.pos0 + m };
         for (p.body) |item| switch (item) {
             .launch => |l| try l.record(gpa, rec, ext),
@@ -716,23 +779,7 @@ pub const Program = struct {
         };
         if (s.readback) |r| if (r.result_norm) |dst| try rec.readBuffer(gpa, read_token, p.h.buffer, 0, std.mem.sliceAsBytes(dst[0 .. m * e]));
 
-        // Logit rows in passes of at most cfg.logit_rows.
-        const vocab: usize = p.hp.vocab;
-        var r0 = m - s.logit_rows;
-        while (r0 < m) {
-            const n = @min(p.cfg.logit_rows, m - r0);
-            if (fused_head) {
-                for (p.head.decode) |l| try l.record(gpa, rec, .{ .rows = n });
-            } else {
-                try rec.copyBuffer(gpa, p.h.buffer, r0 * e * 4, p.lm_in.buffer, 0, n * e * 4);
-                for (p.head.prefill) |l| try l.record(gpa, rec, .{ .rows = n });
-            }
-            if (s.readback) |r| if (r.logits) |dst| {
-                const at = (r0 - (m - s.logit_rows)) * vocab;
-                try rec.readBuffer(gpa, read_token, p.logits.buffer, 0, std.mem.sliceAsBytes(dst[at..][0 .. n * vocab]));
-            };
-            r0 += n;
-        }
+        try p.recordHead(gpa, rec, p.head, m, s.logit_rows, fused_head, if (s.readback) |r| r.logits else null);
 
         if (s.draw != null) {
             std.debug.assert(p.sample_len > 0);
@@ -740,10 +787,174 @@ pub const Program = struct {
             try rec.readBuffer(gpa, read_token, p.sample_state.buffer, 0, std.mem.asBytes(s.sampled.?));
         }
     }
+
+    /// Projects a step's last `logit_rows` of its m rows to logits, in
+    /// passes of at most cfg.logit_rows: `fused` from x with the norm folded
+    /// in, else from the final norm's rows in `h`.
+    fn recordHead(p: *const Program, gpa: Allocator, rec: *cmd.Recorder, head: Fork, m: u32, logit_rows: u32, fused: bool, readback: ?[]f32) Allocator.Error!void {
+        const e: usize = p.hp.n_embd;
+        const vocab: usize = p.hp.vocab;
+        var r0 = m - logit_rows;
+        while (r0 < m) {
+            const n = @min(p.cfg.logit_rows, m - r0);
+            if (fused) {
+                for (head.decode) |l| try l.record(gpa, rec, .{ .rows = n });
+            } else {
+                try rec.copyBuffer(gpa, p.h.buffer, r0 * e * 4, p.lm_in.buffer, 0, n * e * 4);
+                for (head.prefill) |l| try l.record(gpa, rec, .{ .rows = n });
+            }
+            if (readback) |dst| {
+                const at = (r0 - (m - logit_rows)) * vocab;
+                try rec.readBuffer(gpa, read_token, p.logits.buffer, 0, std.mem.sliceAsBytes(dst[at..][0 .. n * vocab]));
+            }
+            r0 += n;
+        }
+    }
+
+    pub const MtpStep = struct {
+        /// Main position of the first row's hidden state: the block's cache
+        /// row, at position pos0 + 1.
+        pos0: u32,
+        /// For each row, the token after its hidden state's position.
+        tokens: []const u32,
+        logit_rows: u32 = 0,
+        path: ?Path = null,
+        /// Where the logit rows land, row-major.
+        logits: ?[]f32 = null,
+    };
+
+    /// Runs the MTP block over rows of the previous step's final hidden
+    /// states (a step with `hidden`, or the final norm read back): row r
+    /// drafts the token two after position pos0 + r.
+    pub fn recordMtp(p: *Program, gpa: Allocator, rec: *cmd.Recorder, s: MtpStep) Allocator.Error!void {
+        const t = &p.mtp.?;
+        const m: u32 = @intCast(s.tokens.len);
+        const path = s.path orelse Path.of(m);
+        std.debug.assert(m > 0 and m <= p.cfg.max_tokens and s.pos0 + m <= p.cfg.context and s.logit_rows <= m);
+        std.debug.assert(path == .prefill or m <= kernels.decode_max_rows);
+        const e: u64 = p.hp.n_embd;
+
+        t.step_value = .{ .m = m, .pos0 = s.pos0, .u = 0 };
+        try rec.writeBuffer(gpa, t.step.buffer, 0, std.mem.asBytes(&t.step_value));
+        @memcpy(t.token_stage[0..m], s.tokens);
+        try rec.writeBuffer(gpa, t.tokens.buffer, 0, std.mem.sliceAsBytes(t.token_stage[0..m]));
+
+        const ext: kernels.Extent = .{ .rows = m, .keys = s.pos0 + m };
+        for (t.pre) |l| try l.record(gpa, rec, ext);
+        // Row r of cat: [enorm(embedding) (e1), hnorm(hidden) (x)].
+        for (0..m) |r| {
+            try rec.copyBuffer(gpa, t.e1.buffer, r * e * 4, t.cat.buffer, r * 2 * e * 4, e * 4);
+            try rec.copyBuffer(gpa, p.x.buffer, r * e * 4, t.cat.buffer, (r * 2 + 1) * e * 4, e * 4);
+        }
+        for (t.body) |item| switch (item) {
+            .launch => |l| try l.record(gpa, rec, ext),
+            .fork => |f| for (f.pick(path)) |l| try l.record(gpa, rec, ext),
+            .final_norm, .layer_end => unreachable,
+        };
+        if (s.logit_rows == 0) return;
+        const fused = path == .decode and s.logit_rows == m and m <= p.cfg.logit_rows;
+        if (!fused) try t.head_norm.record(gpa, rec, ext);
+        try p.recordHead(gpa, rec, t.head, m, s.logit_rows, fused, s.logits);
+    }
+};
+
+/// The MTP block's step: its own step uniform, token ids, cache and
+/// RoPE table, over the main program's activation buffers.
+pub const MtpProgram = struct {
+    step: Arg,
+    tokens: Arg,
+    e1: Arg,
+    cat: Arg,
+    /// The embedding, then enorm into e1 and hnorm of `h` into x.
+    pre: []const kernels.Launch,
+    /// eh_proj from cat into x, then the attention block.
+    body: []const Item,
+    head_norm: kernels.Launch,
+    head: Fork,
+    step_value: P.Step = .{ .m = 0, .pos0 = 0, .u = 0 },
+    token_stage: []u32,
 };
 
 /// Completion token of every read a Program records.
 pub const read_token = 0xffff_fffe;
+
+/// Builds a decoder layer's launches over the step's activation buffers.
+const LayerBuilder = struct {
+    a: *Alloc,
+    mm: Mm,
+    hp: Hparams,
+    kv_layer: u64,
+    kv: KvFormat,
+    max_blocks: u32,
+    x: Arg,
+    h: Arg,
+    gu: Arg,
+    act: Arg,
+    qkv: Arg,
+    att: Arg,
+    attn_part: Arg,
+
+    /// Gated full attention with a new KV cache, positioned by `rope` and
+    /// `step`.
+    fn attention(lb: LayerBuilder, body: *std.ArrayList(Item), attn_norm: Arg, w: *const Attention, rope: Arg, step: Arg) Program.BuildError!void {
+        const hp = lb.hp;
+        const mm = lb.mm;
+        const b = mm.b;
+        const arena = mm.arena;
+        const hd: u64 = hp.head_dim;
+        const kv_dim: u64 = hd * hp.n_head_kv;
+        const qkv_row: u64 = 2 * hd * hp.n_head + 2 * kv_dim;
+        const kc = try lb.a.buffer(lb.kv_layer, .{ .storage = true });
+        const vc = try lb.a.buffer(lb.kv_layer, .{ .storage = true });
+        const half: u32 = @backingInt(lb.kv);
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const q_row: u32 = @intCast(qkv_row);
+        try body.append(arena, .{ .fork = .{
+            .prefill = try mm.tiled(lb.qkv, .{ .rmsnorm = .{ .x = lb.x, .w = attn_norm, .out = lb.h } }, &w.wqkv, false),
+            .decode = try mm.vector(lb.qkv, lb.x, &w.wqkv, .{ .norm = attn_norm }),
+        } });
+        try body.append(arena, .{ .launch = try b.add(.rope_append, P.RopeAppend{
+            .heads = hp.n_head,
+            .kv_heads = hp.n_head_kv,
+            .head_dim = hp.head_dim,
+            .n_rot = hp.n_rot,
+            .row = q_row,
+            .k_off = @intCast(2 * hd * hp.n_head),
+            .v_off = @intCast(2 * hd * hp.n_head + kv_dim),
+            .f16 = half,
+            .eps = hp.rms_eps,
+        }, &.{ lb.qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
+        // Split attention over blocks of cache positions, in chunks of
+        // attn_rows tokens; a step records the chunks its rows reach.
+        var attn: std.ArrayList(kernels.Launch) = .empty;
+        var row0: u32 = 0;
+        while (row0 < mm.cap) : (row0 += kernels.attn_rows) {
+            const params: P.Attention = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .f16 = half, .scale = scale, .max_blocks = lb.max_blocks, .q_row = q_row, .row0 = row0 };
+            try attn.append(arena, try b.add(.attn_split, params, &.{ lb.qkv, kc, vc, lb.attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } }));
+            try attn.append(arena, try b.add(.attn_combine, params, &.{ lb.qkv, lb.attn_part, lb.att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = row0, .max_rows = kernels.attn_rows } }));
+        }
+        try body.append(arena, .{ .fork = .{
+            .prefill = try concat(arena, &.{ attn.items, try mm.tiled(lb.x, .{ .plain = lb.att }, &w.wo, true) }),
+            .decode = try concat(arena, &.{ attn.items[0..2], try mm.vector(lb.x, lb.att, &w.wo, .{ .accumulate = true }) }),
+        } });
+    }
+
+    /// The SiLU feed-forward block, added to x.
+    fn ffn(lb: LayerBuilder, body: *std.ArrayList(Item), layer: *const Layer) Program.BuildError!void {
+        const mm = lb.mm;
+        const ff = lb.hp.n_ff;
+        try body.append(mm.arena, .{ .fork = .{
+            .prefill = try concat(mm.arena, &.{
+                try mm.tiled(lb.gu, .{ .rmsnorm = .{ .x = lb.x, .w = layer.post_norm, .out = lb.h } }, &layer.ffn_gu, false),
+                try mm.tiled(lb.x, .{ .silu = .{ .gu = lb.gu, .width = ff, .out = lb.act } }, &layer.ffn_down, true),
+            }),
+            .decode = try concat(mm.arena, &.{
+                try mm.vector(lb.act, lb.x, &layer.ffn_gu, .{ .norm = layer.post_norm, .silu_pair = ff }),
+                try mm.vector(lb.x, lb.act, &layer.ffn_down, .{ .accumulate = true }),
+            }),
+        } });
+    }
+};
 
 /// Records buffer creation, checking each fits one binding.
 const Alloc = struct {

@@ -46,7 +46,8 @@ const usage =
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
-    \\              [--path prefill|decode]   as `forward`, on the GPU through Dawn, in
+    \\              [--path prefill|decode] [--mtp]
+    \\                                       as `forward`, on the GPU through Dawn, in
     \\                                       steps of N tokens (default 512; f32 KV;
     \\                                       the decode kernels for steps of up to 4)
     \\
@@ -351,11 +352,18 @@ const ForwardOptions = struct {
     kv: zllm.plan.qwen35.KvFormat = .f32,
     /// Force the prefill or decode kernels (decode: steps of at most 4).
     path: ?zllm.plan.qwen35.Path = null,
+    /// Also run the MTP block and write mtp_logits.
+    mtp: bool = false,
 
     fn parse(args: []const []const u8) !ForwardOptions {
         var o: ForwardOptions = .{};
         var i: usize = 0;
         while (i < args.len) : (i += 2) {
+            if (std.mem.eql(u8, args[i], "--mtp")) {
+                o.mtp = true;
+                i -= 1;
+                continue;
+            }
             if (i + 1 == args.len) return fail(usage);
             if (std.mem.eql(u8, args[i], "--chunk")) {
                 o.chunk = std.fmt.parseInt(u32, args[i + 1], 10) catch return fail(usage);
@@ -412,6 +420,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
         .logit_rows = @min(chunk, 64),
         .kv = opts.kv,
         .checkpoints = 1,
+        .mtp = opts.mtp,
     }, limits);
     try program.recordReset(gpa, &rec);
     try rec.submit(gpa, 0);
@@ -425,6 +434,8 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     const result_norm = try arena.alloc(f32, n * e);
     const logits = try arena.alloc(f32, @as(usize, n) * hp.vocab);
     const step_layers = try arena.alloc([]f32, hp.n_layer);
+    // Row i drafts token i + 2, so there are n - 1 rows.
+    const mtp_logits: []f32 = if (opts.mtp) try arena.alloc(f32, @as(usize, n - 1) * hp.vocab) else &.{};
     var pos0: u32 = 0;
     var steps: u32 = 0;
     while (pos0 < n) : (steps += 1) {
@@ -440,6 +451,15 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
                 .result_norm = result_norm[pos0 * e ..][0 .. m * e],
                 .logits = logits[@as(usize, pos0) * hp.vocab ..][0 .. @as(usize, m) * hp.vocab],
             },
+        });
+        // The rows with a next token, over this step's final hidden states.
+        const rows = @min(m, n - 1 - pos0);
+        if (opts.mtp and rows > 0) try program.recordMtp(gpa, &rec, .{
+            .pos0 = pos0,
+            .tokens = tokens[pos0 + 1 ..][0..rows],
+            .logit_rows = rows,
+            .path = opts.path,
+            .logits = mtp_logits[@as(usize, pos0) * hp.vocab ..][0 .. @as(usize, rows) * hp.vocab],
         });
         try rec.submit(gpa, steps + 1);
         try runBatch(&host, &rec, &completions);
@@ -466,6 +486,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     }
     try RecordWriter.emit(&rw, "result_norm", result_norm, e, n);
     try RecordWriter.emit(&rw, "result_output", logits, hp.vocab, n);
+    if (opts.mtp) try RecordWriter.emit(&rw, "mtp_logits", mtp_logits, hp.vocab, n - 1);
     try fw.interface.flush();
 }
 

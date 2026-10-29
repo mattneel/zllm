@@ -5,6 +5,10 @@ For each eval text in tools/corpus/eval.jsonl, the same token ids run through
 check_forward.py) and `zllm gpu-forward` on a Dawn host, which processes them
 as steps against the KV cache and the recurrent state.
 
+With a model that has an MTP block, every run also produces `mtp_logits` (the
+block's drafts, one row per position but the last), held to the same bounds as
+the logits.
+
 Pass criteria (docs/src/validation.md):
   * f32 KV cache, 512-token steps: both use the same bf16 weights and f32
     activations, so they may differ only by reduction order and
@@ -94,10 +98,10 @@ def main() -> int:
         """Bounds against the reference for the first `rows` positions; returns top-1 agreement."""
         print(f"  {'tensor':<14} {'min cos':>10} {'max rel L2':>11}   [{path} kernels]")
         names = sorted((n for n in ref if n.startswith("l_out-")), key=lambda n: int(n.split("-")[1]))
-        for name in [*names, "result_norm", "result_output"]:
+        for name in [*names, "result_norm", "result_output", "mtp_logits"]:
             if name not in gpu:
                 continue
-            cos, rel, _ = row_stats(gpu[name], ref[name][:rows])
+            cos, rel, _ = row_stats(gpu[name], ref[name][: len(gpu[name])])
             print(f"  {name:<14} {cos.min():>10.7f} {rel.max():>11.2e}")
             worst[path][0] = min(worst[path][0], float(cos.min()))
             worst[path][1] = max(worst[path][1], float(rel.max()))
@@ -107,10 +111,15 @@ def main() -> int:
                 fail.expect(f"{label}: {name} rel L2 at {p}", False, f"{rel[p]:.2e} > {REL_L2_MAX}")
         top = int((gpu["result_output"].argmax(axis=1) == ref["result_output"][:rows].argmax(axis=1)).sum())
         print(f"  top-1 agreement {top}/{rows}")
+        if "mtp_logits" in gpu:
+            draft = gpu["mtp_logits"]
+            top_mtp = int((draft.argmax(axis=1) == ref["mtp_logits"][: len(draft)].argmax(axis=1)).sum())
+            print(f"  MTP top-1 agreement {top_mtp}/{len(draft)}")
+            fail.expect(f"{label}: MTP top-1 agreement", top_mtp == len(draft), f"{top_mtp}/{len(draft)}")
         return top
 
     def bitwise(a: dict, b: dict, rows: int) -> bool:
-        return all(np.array_equal(a[n].view(np.uint32), b[n][:rows].view(np.uint32)) for n in b)
+        return all(np.array_equal(a[n].view(np.uint32), b[n][: len(a[n])].view(np.uint32)) for n in b)
 
     with tempfile.TemporaryDirectory() as tmp:
         for ev in evals:
@@ -118,16 +127,18 @@ def main() -> int:
             tok = Path(tmp) / f"{ev['name']}.i32"
             tok.write_bytes(np.asarray(ids, dtype="<i4").tobytes())
             ref_path, gpu_path = Path(tmp) / "ref.bin", Path(tmp) / "gpu.bin"
-            subprocess.run([args.zllm, "forward", str(paths.gguf), str(tok), str(ref_path)], check=True)
-            timing = run_gpu(args, paths, paths.gguf, tok, gpu_path, "--chunk", "512", "--kv", "f32", "--path", "prefill")
-            ref, gpu = read_records(ref_path), read_records(gpu_path)
+            subprocess.run([args.zllm, "forward", str(paths.gguf), str(tok), str(ref_path), "--mtp"], check=True)
+            ref = read_records(ref_path)
+            mtp = ("--mtp",) if "mtp_logits" in ref else ()
+            timing = run_gpu(args, paths, paths.gguf, tok, gpu_path, "--chunk", "512", "--kv", "f32", "--path", "prefill", *mtp)
+            gpu = read_records(gpu_path)
             fail.expect_eq(f"{ev['name']}: tensor names", sorted(gpu), sorted(ref))
             print(f"\n{ev['name']}: {len(ids)} tokens  [{timing}]")
             agree += compare(ev["name"], "prefill", gpu, ref, len(ids))
             total += len(ids)
 
             split_path = Path(tmp) / "split.bin"
-            timing = run_gpu(args, paths, paths.gguf, tok, split_path, "--chunk", "7", "--kv", "f32", "--path", "prefill")
+            timing = run_gpu(args, paths, paths.gguf, tok, split_path, "--chunk", "7", "--kv", "f32", "--path", "prefill", *mtp)
             same = bitwise(read_records(split_path), gpu, len(ids))
             print(f"  prefill kernels, steps of 7: {'bitwise identical' if same else 'DIFFERENT'}  [{timing}]")
             fail.expect(f"{ev['name']}: prefill steps of 7 bitwise", same, "outputs differ from 512-token steps")
@@ -135,18 +146,18 @@ def main() -> int:
             part = Path(tmp) / "part.i32"
             part.write_bytes(np.asarray(ids[:DECODE_TOKENS], dtype="<i4").tobytes())
             one_path, three_path = Path(tmp) / "one.bin", Path(tmp) / "three.bin"
-            timing = run_gpu(args, paths, paths.gguf, part, one_path, "--chunk", "1", "--kv", "f32", "--path", "decode")
+            timing = run_gpu(args, paths, paths.gguf, part, one_path, "--chunk", "1", "--kv", "f32", "--path", "decode", *mtp)
             one = read_records(one_path)
             print(f"  decode kernels, steps of 1, first {DECODE_TOKENS} tokens  [{timing}]")
             decode_agree += compare(f"{ev['name']} (decode)", "decode", one, ref, DECODE_TOKENS)
             decode_total += DECODE_TOKENS
-            timing = run_gpu(args, paths, paths.gguf, part, three_path, "--chunk", "3", "--kv", "f32", "--path", "decode")
+            timing = run_gpu(args, paths, paths.gguf, part, three_path, "--chunk", "3", "--kv", "f32", "--path", "decode", *mtp)
             same = bitwise(read_records(three_path), one, DECODE_TOKENS)
             print(f"  decode kernels, steps of 3: {'bitwise identical' if same else 'DIFFERENT'}  [{timing}]")
             fail.expect(f"{ev['name']}: decode steps of 3 bitwise", same, "outputs differ from 1-token steps")
 
             f16_path = Path(tmp) / "f16.bin"
-            timing = run_gpu(args, paths, paths.gguf, tok, f16_path, "--chunk", "512", "--kv", "f16", "--path", "prefill")
+            timing = run_gpu(args, paths, paths.gguf, tok, f16_path, "--chunk", "512", "--kv", "f16", "--path", "prefill", *mtp)
             f16 = read_records(f16_path)
             cos16 = min(float(row_stats(f16[n], ref[n])[0].min()) for n in ref)
             top16 = int((f16["result_output"].argmax(axis=1) == ref["result_output"].argmax(axis=1)).sum())

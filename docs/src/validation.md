@@ -346,6 +346,15 @@ therefore tight:
 | Decode kernels, 3-token steps | bitwise identical to 1-token steps | everything |
 | f16 cache (the default) | ≥ 99% top-1 agreement; cosine ≥ 0.99998 | every layer output, final norm and logits, every position |
 
+With a model that has an MTP block (the 0.8B fixture does), every run also
+runs the block over each step's final hidden states, and its draft logits
+(`mtp_logits`, one row per position but the last) are held to the same
+bounds as the logits, plus 100% top-1 agreement with the reference's drafts.
+On llvmpipe they agree to 7.5e-6 relative L2 on both kernel paths, and the
+step splits stay bitwise identical. On the 27B in 64-token steps, the
+quantized prefill puts them 2.3% (median) from the f32 reference, as it does
+the logits.
+
 RTX 5090 (D3D12):
 
 | Kernels | Top-1 | Max relative L2 | Splits |
@@ -397,7 +406,9 @@ decode's follow-up sits closest to the cross-path bound, at 8.8e-5 of 1e-4:
 two of its reused positions went through the decode kernels.
 
 These are RTX 5090 results; at M2 the first five also passed bitwise on
-llvmpipe. Skipping the checkpoint restore fails both checkpoint scenarios,
+llvmpipe. They no longer do: on llvmpipe the fresh prompt now differs from
+its fresh rerun, the extended turn lands at 1.4e-4, and the diverging prompt
+fails on some runs and passes on others. The cause is not yet known. Skipping the checkpoint restore fails both checkpoint scenarios,
 and an earlier bug that left the state dirty after dropping the sequence
 failed all five. Leaving the pipelined placeholder unfilled fails the
 scenario after the pipelined stop (699 of 736 reused, want 706).
