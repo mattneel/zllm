@@ -177,13 +177,19 @@ against.
 `zllm chat` formats conversations with the fixed Qwen chat template,
 [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
 @ `855bffc4`, v22.5. `src/chat/chat.zig` transcribes it for text
-conversations without tools, including:
+conversations with its default options, including:
 
 - **Thinking control:** the `enable_thinking` and `reasoning_effort`
   options, and `<|think_off|>`-style tags in system and user messages.
 - **Reasoning:** split out of earlier replies or passed separately.
 - **System prompts:** leading system messages merged into one.
 - **Whitespace:** trimmed like Python's `str.strip`.
+- **Tools:** the functions offered, in the system turn; calls in the
+  XML format; tool responses grouped into one user turn, with the
+  template's warnings after tool errors. Tools and arguments are written
+  as `transformers`' `tojson` writes them. Numbers keep the spelling they
+  were sent with, which matches except where Python would normalize it
+  (`1E2`, `1.50`).
 
 `check-chat` compares the transcription with the Jinja template, rendered as
 Hugging Face `transformers` renders it.

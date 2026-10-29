@@ -32,6 +32,12 @@ for await (const chunk of engine.chat.completions.create({ messages, stream: tru
 }
 const reply = await engine.chat.completions.create({ messages, enable_thinking: false });
 
+// Tool calling, in the OpenAI format.
+const tools = [{ type: "function", function: { name: "get_weather", parameters: { /* JSON Schema */ } } }];
+const turn = await engine.chat.completions.create({ messages, tools });
+// turn.choices[0]: finish_reason "tool_calls", message.tool_calls [{ id, type, function: { name, arguments } }]
+messages.push(turn.choices[0].message, { role: "tool", tool_call_id: id, content: "18°C, clear" });
+
 engine.tokenize("text"); engine.detokenize(ids);
 engine.interruptGenerate(); // or pass `signal`, or stop reading the stream
 engine.stats(); await engine.unload();
@@ -47,6 +53,15 @@ await zllm.cacheUsage(); await zllm.clearCache();
   back with its `reasoning_content` re-renders exactly as generated, so the
   whole conversation stays resident and a new turn prefills only its new
   message.
+- **Tools** are offered as the template offers them, in the system turn
+  with its XML call format. An assistant turn's `tool_calls` (arguments
+  as JSON text, decoded first, as vLLM does) and `tool` messages render
+  as the template renders them. A reply's `<tool_call>` blocks become
+  `tool_calls`, with `finish_reason` `"tool_calls"`. Parameter values are
+  converted by the tool's schema type, as vLLM's Qwen3 XML parser does.
+  Streamed text stops at the first call, and the calls arrive in one
+  `tool_calls` delta at the end. `tool_choice: "none"` leaves the tools
+  out; forcing a call (`"required"` or a named function) isn't supported.
 - **Cancelling** (`interruptGenerate`, the request's `AbortSignal`, or a
   consumer that stops reading) ends the request after the GPU step in
   flight, with finish reason `abort`.
@@ -170,6 +185,6 @@ declines it. Loading it uncached over localhost already takes 25.8 s.
 
 - **Model and template coverage:** only the Qwen 3.5 BF16 GGUFs, with the
   fixed Qwen template. Rendering a GGUF's own chat template with
-  `@huggingface/jinja`, and tool-call parsers, are still to come.
+  `@huggingface/jinja` is still to come.
 - **Plan cache:** a plan cache (M4) would skip setup work that a cached
   load still does: compiling pipelines and calibrating.

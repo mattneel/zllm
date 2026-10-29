@@ -71,7 +71,7 @@ zero mismatches. That fuzz run is not a pinned check.
 
 ## Chat template
 
-`check-chat` renders the 34 conversations in `tools/corpus/chat.jsonl` with
+`check-chat` renders the 44 conversations in `tools/corpus/chat.jsonl` with
 `zllm chat-render` (`src/chat/chat.zig`) and with the pinned Jinja template,
 set up as Hugging Face `transformers` sets it up for
 `apply_chat_template`. Every prompt must match byte for byte. The corpus
@@ -82,7 +82,18 @@ covers:
 - reasoning inside replies, in tag variants, and passed separately;
 - `preserve_thinking` off;
 - Unicode whitespace trimming;
-- a conversation past the template's 50-message rule.
+- a conversation past the template's 50-message rule;
+- tools offered with and without a system prompt, thinking and an effort
+  tag; calls with and without text before them, several per turn, and
+  with non-string arguments (numbers, nested objects, arrays, null,
+  non-ASCII and escaped characters); grouped tool responses; the
+  template's tool-error warnings, including responses that look like
+  errors but read as code or command output; and a multi-step
+  conversation with no real user query.
+
+The browser's tool-call parser has unit tests (`bun run test` in `web/`):
+schema conversion, streaming in any chunking, partial tags and calls that
+don't parse.
 
 Joining merged system messages with one newline instead of two fails it.
 
