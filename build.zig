@@ -28,9 +28,35 @@ pub fn build(b: *std.Build) void {
         .{ .cwd_relative = p }
     else
         b.path(".fixtures");
-    addCheck(b, check_exe, fixtures, "check-gguf", "Compare the GGUF index with llama.cpp gguf-dump", "check_gguf.py");
-    addCheck(b, check_exe, fixtures, "check-tokenizer", "Compare tokenization with Hugging Face tokenizers", "check_tokenizer.py");
-    addCheck(b, check_exe, fixtures, "check-forward", "Compare the reference forward pass with llama.cpp", "check_forward.py");
+    _ = addCheck(b, check_exe, fixtures, "check-gguf", "Compare the GGUF index with llama.cpp gguf-dump", "check_gguf.py");
+    _ = addCheck(b, check_exe, fixtures, "check-tokenizer", "Compare tokenization with Hugging Face tokenizers", "check_tokenizer.py");
+    _ = addCheck(b, check_exe, fixtures, "check-forward", "Compare the reference forward pass with llama.cpp", "check_forward.py");
+
+    // GPU checks run on a Dawn host: `native` is this build on whatever
+    // adapter Dawn finds (llvmpipe in CI); `d3d12` is the Windows build run
+    // from WSL through scripts/d3d12.sh.
+    const gpu_host = b.option(enum { native, d3d12 }, "gpu-host", "Dawn host for GPU checks (default: native)") orelse .native;
+    const gpu_run = addCheck(b, check_exe, fixtures, "check-gpu", "Compare the GPU forward pass with the CPU reference", "check_gpu.py");
+    gpu_run.addArgs(&.{ "--host", @tagName(gpu_host) });
+
+    const kernel_step = b.step("gpu-check", "Check every GPU kernel against a CPU computation");
+    switch (gpu_host) {
+        .native => {
+            // The Dawn path is only known at run time, so set it in a shell.
+            const run = b.addSystemCommand(&.{ "sh", "-c", "ZLLM_DAWN=\"$1/dawn/libwebgpu_dawn.so\" exec \"$2\" gpu-check", "sh" });
+            run.addDirectoryArg(fixtures);
+            run.addArtifactArg(check_exe);
+            run.has_side_effects = true;
+            kernel_step.dependOn(&run.step);
+        },
+        .d3d12 => {
+            const run = b.addSystemCommand(&.{"bash"});
+            run.addFileArg(b.path("scripts/d3d12.sh"));
+            run.addArg("gpu-check");
+            run.has_side_effects = true;
+            kernel_step.dependOn(&run.step);
+        },
+    }
 }
 
 /// Options for the zllm library module; it also imports `webgpuModule`.
@@ -78,7 +104,7 @@ fn addCheck(
     name: []const u8,
     description: []const u8,
     script: []const u8,
-) void {
+) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{ "uv", "run", "--frozen", "--project" });
     run.addDirectoryArg(b.path("tools"));
     run.addArg("python");
@@ -89,4 +115,5 @@ fn addCheck(
     run.addDirectoryArg(fixtures);
     run.has_side_effects = true;
     b.step(name, description).dependOn(&run.step);
+    return run;
 }
