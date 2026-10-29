@@ -46,7 +46,7 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
         checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec,
         Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,
         Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul,
-        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantUnstaged,
+        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantTiles,
         checkQuantSiluPair,
     }) |f| {
         const r = try f(&ctx);
@@ -343,7 +343,7 @@ fn checkSiluMul(c: *Ctx) !Result {
 fn quantRows(c: *Ctx, t: gguf.TensorType, rows: usize, k: usize) !struct { bytes: []u8, values: []f32 } {
     const l = t.layout().?;
     const n_blocks = rows * k / l.block_elems;
-    const bytes = try c.arena.alloc(u8, std.mem.alignForward(usize, n_blocks * l.block_bytes, 4));
+    const bytes = try c.arena.alloc(u8, n_blocks * l.block_bytes);
     c.rand.bytes(bytes);
     const scales: []const usize = switch (t) {
         .q8_0 => &.{0},
@@ -357,8 +357,25 @@ fn quantRows(c: *Ctx, t: gguf.TensorType, rows: usize, k: usize) !struct { bytes
         std.mem.writeInt(u16, bytes[b * l.block_bytes + off ..][0..2], @bitCast(v), .little);
     };
     const values = try c.arena.alloc(f32, rows * k);
-    try ref_tensor.dequantize(t, bytes[0 .. n_blocks * l.block_bytes], values);
+    try ref_tensor.dequantize(t, bytes, values);
     return .{ .bytes = bytes, .values = values };
+}
+
+/// Uploads raw GGUF blocks of type `t` in the layout the quantized kernels
+/// read: as they are, or for a padded type through `repad`, as the model
+/// loader does.
+fn gpuWeights(c: *Ctx, t: gguf.TensorType, raw: []const u8) !kernels.Arg {
+    const l = t.layout().?;
+    const stride = kernels.blockStride(t);
+    const blocks = raw.len / l.block_bytes;
+    const padded = try c.arena.alloc(u8, std.mem.alignForward(usize, raw.len, 16));
+    @memset(padded, 0);
+    @memcpy(padded[0..raw.len], raw);
+    const src = try c.upload(padded);
+    if (stride == l.block_bytes) return src;
+    const out = try c.output(std.mem.alignForward(usize, blocks * stride, 16) / 4);
+    try c.launcher().launch(.repad, P.Repad{ .blocks = @intCast(blocks), .src_bytes = l.block_bytes, .dst_bytes = stride }, &.{ src, out }, kernels.Launcher.elementwise(blocks * stride / 4));
+    return out;
 }
 
 /// The quantized kernels for type `t`: the decode multiply with its norm
@@ -379,7 +396,7 @@ fn Quant(comptime t: gguf.TensorType) type {
             const init = try c.random(rows * n, 4);
             const out = try c.upload(init);
             try c.launcher().launch(kernels.Kernel.quant(.matmul, t).?, P.MatmulBf16{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .accumulate = 1 }, &.{
-                try c.upload(x), try c.upload(w.bytes), out,
+                try c.upload(x), try gpuWeights(c, t, w.bytes), out,
             }, .{ std.math.divCeil(u32, n, kernels.matmul_tile_n) catch unreachable, std.math.divCeil(u32, rows, kernels.matmul_tile_t) catch unreachable, 1 });
             const got = try c.read(out);
             const want = try c.arena.alloc(f64, rows * n);
@@ -403,9 +420,7 @@ fn Quant(comptime t: gguf.TensorType) type {
             const ta = try c.upload(&tokens);
             for ([_][2]u32{ .{ 0, split }, .{ split, vocab - split } }) |chunk| {
                 const bytes = table.bytes[chunk[0] * row_bytes ..][0 .. chunk[1] * row_bytes];
-                const padded = try c.arena.alloc(u8, std.mem.alignForward(usize, bytes.len, 4));
-                @memcpy(padded[0..bytes.len], bytes);
-                try c.launcher().launch(kernels.Kernel.quant(.embed, t).?, P.EmbedBf16{ .dim = dim, .row0 = chunk[0], .chunk_rows = chunk[1] }, &.{ ta, try c.upload(padded), out }, .{ tokens.len, 1, 1 });
+                try c.launcher().launch(kernels.Kernel.quant(.embed, t).?, P.EmbedBf16{ .dim = dim, .row0 = chunk[0], .chunk_rows = chunk[1] }, &.{ ta, try gpuWeights(c, t, bytes), out }, .{ tokens.len, 1, 1 });
             }
             const got = try c.read(out);
             const want = try c.arena.alloc(f64, tokens.len * dim);
@@ -441,7 +456,7 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
         .eps = eps,
         .flags = .{ .norm = true, .accumulate = !pair, .silu_pair = pair },
         .half = if (pair) n else 0,
-    }, &.{ try c.upload(x), try c.upload(w.bytes), out, try c.upload(nw) }, .{ std.math.divCeil(u32, n, kernels.matvec_rows) catch unreachable, rows, 1 });
+    }, &.{ try c.upload(x), try gpuWeights(c, t, w.bytes), out, try c.upload(nw) }, .{ std.math.divCeil(u32, n, kernels.matvec_quant_rows) catch unreachable, rows, 1 });
     const got = try c.read(out);
     const want = try c.arena.alloc(f64, rows * n);
     const xn = try c.arena.alloc(f64, k);
@@ -460,9 +475,9 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
     return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
-fn checkQuantUnstaged(c: *Ctx) !Result {
-    // Too wide to stage in workgroup memory, as the 27B's 5,120 is.
-    return quantMatvec(c, .q4_k, "matvec q4_k norm+= unstaged", 4096, false);
+fn checkQuantTiles(c: *Ctx) !Result {
+    // Two staged tiles of x, as the 27B's 5,120-wide inputs take three.
+    return quantMatvec(c, .q4_k, "matvec q4_k norm+= (2 tiles)", 4096, false);
 }
 
 fn checkQuantSiluPair(c: *Ctx) !Result {

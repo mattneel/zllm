@@ -32,6 +32,7 @@ pub const Kernel = enum {
     gated_norm,
     mark_tokens,
     sample,
+    repad,
     // Quantized weights: matvec_quant.wgsl, matmul_quant.wgsl and
     // embed_quant.wgsl, each composed with its type's decoder.
     matvec_q8_0,
@@ -67,6 +68,18 @@ pub const Kernel = enum {
 
 pub const QuantOp = enum { matvec, matmul, embed };
 
+/// Bytes per block of type `t` as the quantized kernels read it: the GGUF
+/// block size, padded to a multiple of 16 where it is not one already
+/// (`repad` lays the blocks out), so blocks take 16-byte loads. Q8_0 keeps
+/// its 34 bytes: padding would cost 41%, and its kernels read words.
+pub fn blockStride(t: gguf.TensorType) u32 {
+    return switch (t) {
+        .q3_k => 112,
+        .q6_k => 224,
+        else => t.layout().?.block_bytes,
+    };
+}
+
 /// A kernel's WGSL: its own file, or for `<op>_<type>` the shared quant
 /// helpers, the type's decoder and the operation's body.
 fn composed(comptime name: []const u8) []const u8 {
@@ -74,7 +87,9 @@ fn composed(comptime name: []const u8) []const u8 {
         const prefix = @tagName(op) ++ "_q";
         if (std.mem.startsWith(u8, name, prefix)) {
             const t = name[@tagName(op).len + 1 ..];
-            return @embedFile("quant/common.wgsl") ++ @embedFile("quant/" ++ t ++ ".wgsl") ++ @embedFile(@tagName(op) ++ "_quant.wgsl");
+            // The decode multiply also takes the type's block-major decoder.
+            const dot = if (op == .matvec) @embedFile("quant/" ++ t ++ "_dot.wgsl") else "";
+            return @embedFile("quant/common.wgsl") ++ @embedFile("quant/" ++ t ++ ".wgsl") ++ dot ++ @embedFile(@tagName(op) ++ "_quant.wgsl");
         }
     }
     return @embedFile(name ++ ".wgsl");
@@ -89,6 +104,10 @@ pub const matmul_tile_k = 32;
 pub const decode_max_rows = 4;
 /// Rows per `matvec_bf16` workgroup.
 pub const matvec_rows = 8;
+/// Rows per quantized decode-multiply workgroup (8 lane groups × R rows,
+/// matvec_quant.wgsl). More rows share each staged x tile, but the 27B's
+/// 5,120-row projections then leave too few workgroups to hide latency.
+pub const matvec_quant_rows = 8;
 /// Widest input `matvec_bf16` stages in workgroup memory, which its RMSNorm
 /// prologue needs.
 pub const matvec_max_staged = 3584;
@@ -144,6 +163,7 @@ pub const params = struct {
             _: u29 = 0,
         };
     };
+    pub const Repad = extern struct { blocks: u32, src_bytes: u32, dst_bytes: u32, _pad: u32 = 0 };
     pub const SiluMul = extern struct { count: u32, width: u32, _pad: [2]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
     pub const RopeAppend = extern struct {

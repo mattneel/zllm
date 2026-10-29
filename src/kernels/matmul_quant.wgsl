@@ -18,7 +18,7 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read> w: array<vec4u>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 
 const TT: u32 = 16u;
@@ -47,9 +47,14 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
         if (li < TN) {
             let j = j0 + li;
             if (j < p.n) {
-                let wv = unit(j * row_bytes, k0 / TK);
-                for (var c = 0u; c < TK; c++) {
-                    ws[li * (TK + 1u) + c] = wv[c];
+                let h = head(j * row_bytes, k0 / TK);
+                for (var i0 = 0u; i0 < 8u; i0 += 4u) {
+                    let q = quad(h, i0);
+                    for (var e = 0u; e < 4u; e++) {
+                        for (var c = 0u; c < 4u; c++) {
+                            ws[li * (TK + 1u) + 4u * (i0 + e) + c] = q[e][c];
+                        }
+                    }
                 }
             } else {
                 for (var c = 0u; c < TK; c++) {

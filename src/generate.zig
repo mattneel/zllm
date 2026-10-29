@@ -167,7 +167,7 @@ pub const Runtime = struct {
         defer rec.deinit(gpa);
         rt.set = try .create(gpa, &rec);
         host.file = bytes;
-        rt.model = try plan.Model.upload(arena, gpa, &rec, file, limits);
+        rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
         rt.program = try plan.Program.build(arena, gpa, &rec, &rt.set, &rt.model, .{
             .context = o.context,
             .max_tokens = @min(512, o.context),

@@ -3,27 +3,40 @@
 const BLOCK_ELEMS: u32 = 256u;
 const BLOCK_BYTES: u32 = 176u;
 
-fn scale_min_k4(sb: u32, j: u32) -> vec2u {
+// scale_min_k4, as for Q4_K.
+fn scale_min_words(sw: vec3u, j: u32) -> vec2u {
     if (j < 4u) {
-        return vec2u(wbyte(sb + j) & 63u, wbyte(sb + j + 4u) & 63u);
+        return vec2u(byte12(sw, j) & 63u, byte12(sw, j + 4u) & 63u);
     }
-    return vec2u((wbyte(sb + j + 4u) & 0xfu) | ((wbyte(sb + j - 4u) >> 6u) << 4u),
-                 (wbyte(sb + j + 4u) >> 4u) | ((wbyte(sb + j) >> 6u) << 4u));
+    return vec2u((byte12(sw, j + 4u) & 0xfu) | ((byte12(sw, j - 4u) >> 6u) << 4u),
+                 (byte12(sw, j + 4u) >> 4u) | ((byte12(sw, j) >> 6u) << 4u));
 }
 
-fn unit(row_byte: u32, u: u32) -> array<f32, 32> {
+struct Head {
+    qs: u32,
+    qh: u32,
+    shift: u32,
+    bit: u32,
+    d1: f32,
+    m1: f32,
+}
+
+fn head(row_byte: u32, u: u32) -> Head {
     let b = row_byte + (u / 8u) * BLOCK_BYTES;
     let s = u % 8u;
-    let sm = scale_min_k4(b + 4u, s);
-    let d1 = whalf(b) * f32(sm.x);
-    let m1 = whalf(b + 2u) * f32(sm.y);
-    let q0 = b + 48u + 32u * (s / 2u);
-    let shift = 4u * (s % 2u);
-    var y: array<f32, 32>;
-    for (var l = 0u; l < 32u; l++) {
-        let high = select(0u, 16u, ((wbyte(b + 16u + l) >> s) & 1u) != 0u);
-        y[l] = d1 * f32(((wbyte(q0 + l) >> shift) & 0xfu) + high) - m1;
-    }
-    return y;
+    let hv = w[b >> 4u];
+    let dm = unpack2x16float(hv.x);
+    let sm = scale_min_words(hv.yzw, s);
+    return Head(b + 48u + 32u * (s / 2u), b + 16u, 4u * (s % 2u), s, dm.x * f32(sm.x), dm.y * f32(sm.y));
 }
 
+fn quad(h: Head, i0: u32) -> array<vec4f, 4> {
+    let qv = w[(h.qs + 4u * i0) >> 4u];
+    let hv = w[(h.qh + 4u * i0) >> 4u];
+    var r: array<vec4f, 4>;
+    for (var e = 0u; e < 4u; e++) {
+        let q = ((qv[e] >> h.shift) & 0x0f0f0f0fu) | (((hv[e] >> h.bit) & 0x01010101u) << 4u);
+        r[e] = h.d1 * vec4f(unpack4xU8(q)) - h.m1;
+    }
+    return r;
+}

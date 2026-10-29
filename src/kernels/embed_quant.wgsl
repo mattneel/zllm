@@ -11,7 +11,7 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> tokens: array<u32>;
-@group(0) @binding(2) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read> w: array<vec4u>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 
 @compute @workgroup_size(256)
@@ -23,9 +23,16 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
     }
     let row_bytes = (p.dim / BLOCK_ELEMS) * BLOCK_BYTES;
     for (var u = lid.x; u < p.dim / 32u; u += 256u) {
-        let wv = unit((tok - p.row0) * row_bytes, u);
-        for (var l = 0u; l < 32u; l++) {
-            out[t * p.dim + 32u * u + l] = wv[l];
+        let h = head((tok - p.row0) * row_bytes, u);
+        for (var i0 = 0u; i0 < 8u; i0 += 4u) {
+            let q = quad(h, i0);
+            for (var e = 0u; e < 4u; e++) {
+                let o = t * p.dim + 32u * u + 4u * (i0 + e);
+                out[o] = q[e].x;
+                out[o + 1u] = q[e].y;
+                out[o + 2u] = q[e].z;
+                out[o + 3u] = q[e].w;
+            }
         }
     }
 }

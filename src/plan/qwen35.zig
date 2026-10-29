@@ -82,9 +82,9 @@ pub const Model = struct {
     /// Records buffer creation and an upload from the model file
     /// (`write_file`) for every weight; the host reads the file. `arena` owns
     /// the returned layout.
-    pub fn upload(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, file: gguf.File, limits: Limits) UploadError!Model {
+    pub fn upload(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *const kernels.Set, file: gguf.File, limits: Limits) UploadError!Model {
         const hp = try Hparams.fromGguf(file);
-        var u: Upload = .{ .arena = arena, .gpa = gpa, .rec = rec, .file = file, .limits = limits };
+        var u: Upload = .{ .arena = arena, .gpa = gpa, .rec = rec, .set = set, .file = file, .limits = limits };
         const e: u64 = hp.n_embd;
         const ff: u64 = hp.n_ff;
 
@@ -143,6 +143,8 @@ const Upload = struct {
     arena: Allocator,
     gpa: Allocator,
     rec: *cmd.Recorder,
+    /// For `repad`.
+    set: *const kernels.Set,
     file: gguf.File,
     limits: Limits,
 
@@ -227,27 +229,48 @@ const Upload = struct {
     }
 
     /// Chunks of a run of parts of type `t` covering matrix rows
-    /// [run_row0, run_row0 + run_rows).
+    /// [run_row0, run_row0 + run_rows). Quantized blocks whose size is not a
+    /// multiple of 16 (Q3_K, Q6_K) are laid out padded
+    /// (kernels.blockStride): the rows go to a staging buffer first, then
+    /// `repad` places each block, and the staging buffer is dropped after
+    /// its own submit, so at most one chunk's worth is ever extra.
     fn chunkRun(u: *Upload, chunks: *std.ArrayList(Matrix.Chunk), k: u64, t: gguf.TensorType, spans: anytype, run_row0: u64, run_rows: u64) !void {
         const l = t.layout().?;
-        const row_bytes = k / l.block_elems * l.block_bytes;
-        const rows_per_chunk = @min(run_rows, u.limits.max_binding / row_bytes);
+        const blocks_per_row = k / l.block_elems;
+        const file_row = blocks_per_row * l.block_bytes;
+        const stride: u64 = kernels.blockStride(t);
+        const gpu_row = blocks_per_row * stride;
+        const repad = stride != l.block_bytes;
+        const rows_per_chunk = @min(run_rows, u.limits.max_binding / gpu_row);
         if (rows_per_chunk == 0) return error.TensorTooLarge;
         var row0: u64 = 0;
         while (row0 < run_rows) : (row0 += rows_per_chunk) {
             const rows = @min(rows_per_chunk, run_rows - row0);
-            // Storage bindings are whole words.
-            const size = std.mem.alignForward(u64, rows * row_bytes, 4);
+            // Storage bindings are whole words; the quantized kernels read
+            // 16-byte vectors.
+            const size = std.mem.alignForward(u64, rows * gpu_row, 16);
             const buf = try u.rec.createBuffer(u.gpa, size, .{ .storage = true, .copy_dst = true });
+            const raw_size = std.mem.alignForward(u64, rows * file_row, 4);
+            const raw = if (repad) try u.rec.createBuffer(u.gpa, raw_size, .{ .storage = true, .copy_dst = true }) else buf;
             // Copy the parts' rows that fall in [row0, row0 + rows) of the run.
             var part_row0: u64 = 0;
             for (spans) |span| {
                 const lo = @max(row0, part_row0);
                 const hi = @min(row0 + rows, part_row0 + span.rows);
                 if (lo < hi) {
-                    try u.rec.writeFile(u.gpa, buf, (lo - row0) * row_bytes, span.offset + (lo - part_row0) * row_bytes, (hi - lo) * row_bytes);
+                    try u.rec.writeFile(u.gpa, raw, (lo - row0) * file_row, span.offset + (lo - part_row0) * file_row, (hi - lo) * file_row);
                 }
                 part_row0 += span.rows;
+            }
+            if (repad) {
+                const blocks = rows * blocks_per_row;
+                const launcher: kernels.Launcher = .{ .gpa = u.gpa, .arena = u.arena, .rec = u.rec, .set = u.set };
+                try launcher.launch(.repad, P.Repad{ .blocks = @intCast(blocks), .src_bytes = l.block_bytes, .dst_bytes = @intCast(stride) }, &.{
+                    .{ .buffer = raw, .size = raw_size },
+                    .{ .buffer = buf, .size = size },
+                }, kernels.Launcher.elementwise(blocks * stride / 4));
+                try u.rec.submit(u.gpa, 0);
+                try u.rec.destroy(u.gpa, .buffer, @backingInt(raw));
             }
             try chunks.append(u.arena, .{ .arg = .{ .buffer = buf, .size = size }, .row0 = @intCast(run_row0 + row0), .rows = @intCast(rows), .type = t });
         }
@@ -782,7 +805,7 @@ const Mm = struct {
                 x,                       ch.arg, out,
                 // Unread without the norm; the weight is a read-only stand-in.
                 fuse.norm orelse ch.arg,
-            }, .{ .rows_y = std.math.divCeil(u32, n, kernels.matvec_rows) catch unreachable });
+            }, .{ .rows_y = std.math.divCeil(u32, n, if (ch.type == .bf16) kernels.matvec_rows else kernels.matvec_quant_rows) catch unreachable });
         }
         return list;
     }
