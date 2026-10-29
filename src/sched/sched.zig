@@ -2,6 +2,7 @@
 //! each, and their results into tokens and text. It never blocks; the host
 //! drives it:
 //!
+//!     calibrate twice: run engine.calibration(), then engine.calibrated(ns, warm)
 //!     try engine.start(request);
 //!     while (true) switch (try engine.next()) {
 //!         .submit => |words| { execute words; try engine.complete(elapsed_ns); },
@@ -11,8 +12,9 @@
 //!
 //! Prefill chunks are the largest token count whose predicted cost fits the
 //! submission budget. The prediction is linear, fixed + per_token · m: the
-//! fixed part is measured on one-token steps (decode, and each prompt's last
-//! token), the per-token part on longer prefill steps. They also end
+//! fixed part is measured on one-token steps (calibration before the first
+//! request, decode, and each prompt's last token), the per-token part on
+//! longer prefill steps. They also end
 //! at checkpoint positions: every `state.checkpoint_interval` tokens and just
 //! before the prompt's last token, which then runs as its own step and is
 //! sampled. That checkpoint lets a later request with the same prompt, or one
@@ -31,7 +33,7 @@ const Stream = @import("../tokenizer/stream.zig").Stream;
 
 /// Target GPU time per submission (spec §8).
 pub const budget_ns = 150 * std.time.ns_per_ms;
-/// First prefill chunk, before any step has been measured.
+/// Prefill chunk once the fixed cost is known but the per-token cost is not.
 pub const first_chunk = 64;
 
 pub const Request = struct {
@@ -83,8 +85,11 @@ pub const Engine = struct {
     phase: Phase = .idle,
     /// Measured cost of a one-token step (the fixed part), 0 until seen.
     step_ns: u64 = 0,
-    /// Measured cost per additional prefill token, 0 until seen.
+    /// Cost per additional token on the latest prefill step, 0 until seen.
+    /// It grows with position (attention), so the latest is the best guess.
     token_ns: u64 = 0,
+    /// Tokens in the step `token_ns` was measured on.
+    rate_tokens: u32 = 0,
     submits: u32 = 0,
 
     // Per request.
@@ -121,6 +126,31 @@ pub const Engine = struct {
     pub fn resident(e: *const Engine) []const u32 {
         return e.seq.tokens.items;
     }
+
+    /// One calibration step: a single token processed on a zeroed state,
+    /// which is zeroed again after, dropping the resident sequence. The host
+    /// runs it twice before the first request, passing each run's time to
+    /// `calibrated`: the first warms up the pipelines and is discarded, the
+    /// second measures the fixed cost of a step, which the prefill cost
+    /// model needs from the start. The batch is valid until `calibrated`.
+    pub fn calibration(e: *Engine) Error![]const u32 {
+        if (e.pending != null or (e.phase != .idle and e.phase != .done)) return error.Busy;
+        e.forget();
+        e.rec.clear();
+        try e.program.recordReset(e.gpa, &e.rec);
+        try e.program.recordStep(e.gpa, &e.rec, .{ .pos0 = 0, .tokens = &calibration_token });
+        try e.program.recordReset(e.gpa, &e.rec);
+        e.submits += 1;
+        try e.rec.submit(e.gpa, e.submits);
+        return e.rec.batch();
+    }
+
+    pub fn calibrated(e: *Engine, elapsed_ns: u64, warm: bool) void {
+        e.rec.clear();
+        if (warm) e.step_ns = elapsed_ns;
+    }
+
+    const calibration_token = [_]u32{0};
 
     /// `req` and the memory it points to must stay valid until `.done`.
     pub fn start(e: *Engine, req: Request) Error!void {
@@ -189,8 +219,10 @@ pub const Engine = struct {
         }
         if (p.tokens == 1) {
             e.step_ns = ema(e.step_ns, elapsed_ns);
-        } else {
-            e.token_ns = ema(e.token_ns, @max(1, (elapsed_ns -| e.step_ns) / p.tokens));
+        } else if (e.step_ns != 0 and elapsed_ns > e.step_ns) {
+            // A step faster than the fixed estimate is noise, not a rate.
+            e.token_ns = (elapsed_ns - e.step_ns) / p.tokens;
+            e.rate_tokens = p.tokens;
         }
         if (!p.samples) return;
 
@@ -210,14 +242,23 @@ pub const Engine = struct {
     }
 
     /// Tokens for the next prefill step: as many as the budget allows, up to
-    /// the next checkpoint position and the end of the prompt.
+    /// the next checkpoint position and the end of the prompt. The target is
+    /// 90% of the budget, as the cost per token keeps growing with position.
+    /// Where a one-token step already takes more than half of it (a slow
+    /// GPU), smaller chunks would only add steps that each pay that fixed
+    /// cost, so the target becomes twice the fixed cost instead. A chunk
+    /// grows at most 4× past the step its rate was measured on, since the
+    /// rate rises with the chunk size too.
     fn chunkSize(e: *const Engine) u32 {
         const pos = e.prefill_pos;
         const left: u32 = @intCast(e.req.prompt.len - pos);
-        var m: u32 = first_chunk;
+        // Without calibration, measure the fixed cost first.
+        var m: u32 = if (e.step_ns == 0) 1 else first_chunk;
         if (e.token_ns != 0) {
-            const fixed: u64 = @min(e.step_ns, budget_ns / 2);
-            m = @intCast(@max(1, @min(std.math.maxInt(u32), (budget_ns - fixed) / e.token_ns)));
+            const target: u64 = @max(budget_ns / 10 * 9, 2 * e.step_ns);
+            const fit = (target -| e.step_ns) / e.token_ns;
+            const ramp = 4 * @as(u64, @max(e.rate_tokens, first_chunk));
+            m = @intCast(@max(1, @min(fit, ramp)));
         }
         m = @min(m, e.program.cfg.max_tokens, left);
         const boundary = (pos / state.checkpoint_interval + 1) * state.checkpoint_interval;

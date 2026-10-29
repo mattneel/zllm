@@ -169,6 +169,11 @@ pub const Runtime = struct {
         try rec.submit(gpa, 0);
         try rt.execute(rec.batch());
         rt.engine = try .init(gpa, &rt.program, &rt.tok);
+        for ([_]bool{ false, true }) |warm| {
+            const t0 = Io.Timestamp.now(io, .awake);
+            try rt.execute(try rt.engine.calibration());
+            rt.engine.calibrated(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()), warm);
+        }
 
         if (rt.tok.ids.get("<|im_end|>")) |id| try rt.stop_tokens.append(gpa, id);
         if (rt.tok.eos) |id| if (std.mem.indexOfScalar(u32, rt.stop_tokens.items, id) == null) try rt.stop_tokens.append(gpa, id);
