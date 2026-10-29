@@ -32,14 +32,17 @@ fn head(row_byte: u32, u: u32) -> Head {
     return Head(b + 64u * n + 32u * (c % 2u), b + 128u + 32u * n, 4u * (c / 2u), 2u * c, d * f32(sbyte16(sv, si)), d * f32(sbyte16(sv, si + 1u)));
 }
 
-fn quad(h: Head, i0: u32) -> array<vec4f, 4> {
+const ACT_BLOCK: u32 = 256u;
+const HAS_MIN: bool = false;
+
+fn scales(h: Head) -> vec3f {
+    return vec3f(h.ds0, h.ds1, 0.0);
+}
+
+fn quad_i8(h: Head, i0: u32) -> vec4u {
     let lv = w[(h.ql + 4u * i0) >> 4u];
     let hv = w[(h.qh + 4u * i0) >> 4u];
-    let ds = select(h.ds0, h.ds1, i0 >= 4u);
-    var r: array<vec4f, 4>;
-    for (var e = 0u; e < 4u; e++) {
-        let q = ((lv[e] >> h.low_shift) & 0x0f0f0f0fu) | (((hv[e] >> h.high_shift) & 0x03030303u) << 4u);
-        r[e] = ds * (vec4f(unpack4xU8(q)) - 32.0);
-    }
-    return r;
+    // q (0..63) per byte, then minus 32 per byte without borrows.
+    let q = ((lv >> vec4u(h.low_shift)) & vec4u(0x0f0f0f0fu)) | (((hv >> vec4u(h.high_shift)) & vec4u(0x03030303u)) << vec4u(4u));
+    return (q + vec4u(0x60606060u)) ^ vec4u(0x80808080u);
 }

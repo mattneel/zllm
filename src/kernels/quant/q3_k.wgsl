@@ -39,15 +39,22 @@ fn head(row_byte: u32, u: u32) -> Head {
                 d_all * f32(scale3(sv.xyz, 8u * n + 2u * j)), d_all * f32(scale3(sv.xyz, 8u * n + 2u * j + 1u)));
 }
 
-fn quad(h: Head, i0: u32) -> array<vec4f, 4> {
+const ACT_BLOCK: u32 = 256u;
+const HAS_MIN: bool = false;
+
+fn scales(h: Head) -> vec3f {
+    return vec3f(h.dl0, h.dl1, 0.0);
+}
+
+fn quad_i8(h: Head, i0: u32) -> vec4u {
     let qv = w[(h.qs + 4u * i0) >> 4u];
     let hv = w[(h.hm + 4u * i0) >> 4u];
-    let dl = select(h.dl0, h.dl1, i0 >= 4u);
-    var r: array<vec4f, 4>;
+    var r: vec4u;
     for (var e = 0u; e < 4u; e++) {
-        // q + 4·hbit for four positions at once, one byte each.
+        // q + 4·hbit for four positions at once, one byte each (0..7), then
+        // minus 4 per byte without borrows.
         let c = ((qv[e] >> h.shift) & 0x03030303u) | (((hv[e] >> h.bit) & 0x01010101u) << 2u);
-        r[e] = dl * (vec4f(unpack4xU8(c)) - 4.0);
+        r[e] = (c + 0x7c7c7c7cu) ^ 0x80808080u;
     }
     return r;
 }

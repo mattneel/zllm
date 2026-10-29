@@ -13,6 +13,7 @@ const sampler = @import("../sampler/sampler.zig");
 const P = kernels.params;
 const gguf = @import("../gguf/gguf.zig");
 const ref_tensor = @import("../ref/tensor.zig");
+const ref_matmul = @import("../ref/matmul.zig");
 
 pub const Result = struct {
     name: []const u8,
@@ -47,7 +48,7 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
         Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,
         Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul,
         Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantTiles,
-        checkQuantSiluPair,
+        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -378,6 +379,52 @@ fn gpuWeights(c: *Ctx, t: gguf.TensorType, raw: []const u8) !kernels.Arg {
     return out;
 }
 
+const Act = struct { qx: kernels.Arg, dx: kernels.Arg };
+
+/// x (rows × k) rounded to the 8-bit blocks the prefill multiply takes for
+/// weights of type `t` (quantize_q8).
+fn quantizeX(c: *Ctx, t: gguf.TensorType, x: kernels.Arg, rows: u32, k: u32) !Act {
+    const block = kernels.actBlock(t);
+    const act: Act = .{ .qx = try c.output(rows * k / 4), .dx = try c.output(rows * k / block) };
+    try c.launcher().launch(.quantize_q8, P.QuantizeQ8{ .k = k, .block = block }, &.{ x, act.qx, act.dx }, .{ k / 256, rows, 1 });
+    return act;
+}
+
+/// quantize_q8 against the reference's rounding (roundLikeLlama), value
+/// for value: rows of random values, one whose largest magnitude is
+/// negative, one with a tie between +amax and −amax, and a zero row.
+fn checkQuantize(c: *Ctx, t: gguf.TensorType, name: []const u8) !Result {
+    const rows = 6;
+    const k = 512;
+    const x = try c.random(rows * k, 3);
+    x[2 * k + 77] = -9.5;
+    x[3 * k + 5] = -7.25;
+    x[3 * k + 40] = 7.25;
+    @memset(x[4 * k ..][0..k], 0);
+    const act = try quantizeX(c, t, try c.upload(x), rows, k);
+    const words = try c.read(act.qx);
+    const d = try c.read(act.dx);
+    const want = try c.arena.dupe(f32, x);
+    for (0..rows) |r| ref_matmul.roundLikeLlama(t, want[r * k ..][0..k]);
+    const block = kernels.actBlock(t);
+    var worst: f64 = 0;
+    for (want, 0..) |v, i| {
+        const word: u32 = @bitCast(words[i / 4]);
+        const q: i8 = @bitCast(@as(u8, @truncate(word >> @intCast(8 * (i % 4)))));
+        const got = @as(f32, @floatFromInt(q)) * d[i / block];
+        worst = @max(worst, @abs(@as(f64, got) - v) / @max(@abs(@as(f64, v)), 1e-30));
+    }
+    return .{ .name = name, .err = worst, .tolerance = 0 };
+}
+
+fn checkQuantizeQ8K(c: *Ctx) !Result {
+    return checkQuantize(c, .q4_k, "quantize_q8 Q8_K (256)");
+}
+
+fn checkQuantizeQ80(c: *Ctx) !Result {
+    return checkQuantize(c, .q8_0, "quantize_q8 Q8_0 (32)");
+}
+
 /// The quantized kernels for type `t`: the decode multiply with its norm
 /// prologue and accumulate epilogue, the prefill multiply accumulating, and
 /// the embedding gather over two table chunks.
@@ -389,7 +436,7 @@ fn Quant(comptime t: gguf.TensorType) type {
 
         /// The prefill multiply accumulating, over more than one tile each
         /// way: whole, and split over k into partials that matmul_reduce
-        /// adds up (kernels.matmulSlices).
+        /// adds up (kernels.matmulSlices), on x rounded by quantize_q8.
         fn matmul(c: *Ctx) !Result {
             const rows = 70;
             const n = 150;
@@ -397,7 +444,11 @@ fn Quant(comptime t: gguf.TensorType) type {
             const s = kernels.matmulSlices(n, k);
             std.debug.assert(s.count > 1);
             const x = try c.upload(try c.random(rows * k, 1));
+            // The multiply sees x rounded to 8-bit blocks, as the
+            // reference's llama.cpp mode rounds it.
             const xs = try c.read(x);
+            for (0..rows) |r| ref_matmul.roundLikeLlama(t, xs[r * k ..][0..k]);
+            const act = try quantizeX(c, t, x, rows, k);
             const w = try quantRows(c, t, n, k);
             const wa = try gpuWeights(c, t, w.bytes);
             const init = try c.random(rows * n, 4);
@@ -407,8 +458,8 @@ fn Quant(comptime t: gguf.TensorType) type {
             const grid: [3]u32 = .{ std.math.divCeil(u32, n, kernels.matmul_quant_tile_n) catch unreachable, std.math.divCeil(u32, rows, kernels.matmul_quant_tile_t) catch unreachable, 1 };
             const l = c.launcher();
             const kernel = kernels.Kernel.quant(.matmul, t).?;
-            try l.launch(kernel, P.MatmulQuant{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .accumulate = 1, .k_slice = k }, &.{ x, wa, whole }, grid);
-            try l.launch(kernel, P.MatmulQuant{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .k_slice = s.k_slice, .slice_stride = rows * n }, &.{ x, wa, partials }, .{ grid[0], grid[1], s.count });
+            try l.launch(kernel, P.MatmulQuant{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .accumulate = 1, .k_slice = k }, &.{ act.qx, wa, whole, act.dx }, grid);
+            try l.launch(kernel, P.MatmulQuant{ .rows = rows, .n = n, .k = k, .col0 = 0, .out_stride = n, .k_slice = s.k_slice, .slice_stride = rows * n }, &.{ act.qx, wa, partials, act.dx }, .{ grid[0], grid[1], s.count });
             try l.launch(.matmul_reduce, P.MatmulReduce{ .rows = rows, .n = n, .slices = s.count, .col0 = 0, .out_stride = n, .accumulate = 1, .slice_stride = rows * n }, &.{ partials, split }, kernels.Launcher.elementwise(rows * n));
             const want = try c.arena.alloc(f64, rows * n);
             for (0..rows) |tk| for (0..n) |j| {

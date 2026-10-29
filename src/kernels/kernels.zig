@@ -34,6 +34,7 @@ pub const Kernel = enum {
     mark_tokens,
     sample,
     repad,
+    quantize_q8,
     // Quantized weights: matvec_quant.wgsl, matmul_quant.wgsl and
     // embed_quant.wgsl, each composed with its type's decoder.
     matvec_q8_0,
@@ -120,6 +121,14 @@ pub fn matmulSlices(n: u32, k: u32) Slices {
     const count = std.math.clamp(want, 1, @max(1, k / matmul_min_slice));
     const k_slice = std.mem.alignForward(u32, std.math.divCeil(u32, k, count) catch unreachable, 32);
     return .{ .count = std.math.divCeil(u32, k, k_slice) catch unreachable, .k_slice = k_slice };
+}
+
+/// Values per activation block the quantized prefill multiply rounds x to
+/// for weights of type `t`, as llama.cpp's CPU backend does (vec_dot_type):
+/// Q8_0 blocks of 32 for Q8_0, Q8_K blocks of 256 for the K-quants
+/// (quantize_q8.wgsl).
+pub fn actBlock(t: gguf.TensorType) u32 {
+    return if (t == .q8_0) 32 else 256;
 }
 
 /// Tile sizes (outputs, tokens) of the prefill multiply for weights of type `t`.
@@ -214,6 +223,7 @@ pub const params = struct {
             _: u29 = 0,
         };
     };
+    pub const QuantizeQ8 = extern struct { k: u32, block: u32, _pad: [2]u32 = @splat(0) };
     pub const Repad = extern struct { blocks: u32, src_bytes: u32, dst_bytes: u32, _pad: u32 = 0 };
     pub const SiluMul = extern struct { count: u32, width: u32, _pad: [2]u32 = @splat(0) };
     pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };

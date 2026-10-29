@@ -13,11 +13,14 @@ fn head(row_byte: u32, u: u32) -> Head {
     return Head(b + 2u, whalf(b));
 }
 
-fn quad(h: Head, i0: u32) -> array<vec4f, 4> {
-    var r: array<vec4f, 4>;
-    for (var e = 0u; e < 4u; e++) {
-        let q = bitcast<vec4i>(vec4u(w32(h.qs + 4u * (i0 + e))) << vec4u(24u, 16u, 8u, 0u)) >> vec4u(24u);
-        r[e] = vec4f(q) * h.d;
-    }
-    return r;
+// Activations round to Q8_0 blocks for these weights.
+const ACT_BLOCK: u32 = 32u;
+const HAS_MIN: bool = false;
+
+fn scales(h: Head) -> vec3f {
+    return vec3f(h.d, h.d, 0.0);
+}
+
+fn quad_i8(h: Head, i0: u32) -> vec4u {
+    return vec4u(w32(h.qs + 4u * i0), w32(h.qs + 4u * i0 + 4u), w32(h.qs + 4u * i0 + 8u), w32(h.qs + 4u * i0 + 12u));
 }

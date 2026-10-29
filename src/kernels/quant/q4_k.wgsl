@@ -30,11 +30,13 @@ fn head(row_byte: u32, u: u32) -> Head {
     return Head(b + 16u + 32u * (s / 2u), 4u * (s % 2u), dm.x * f32(sm.x), dm.y * f32(sm.y));
 }
 
-fn quad(h: Head, i0: u32) -> array<vec4f, 4> {
-    let qv = w[(h.qs + 4u * i0) >> 4u];
-    var r: array<vec4f, 4>;
-    for (var e = 0u; e < 4u; e++) {
-        r[e] = h.d1 * vec4f(unpack4xU8((qv[e] >> h.shift) & 0x0f0f0f0fu)) - h.m1;
-    }
-    return r;
+const ACT_BLOCK: u32 = 256u;
+const HAS_MIN: bool = true;
+
+fn scales(h: Head) -> vec3f {
+    return vec3f(h.d1, h.d1, h.m1);
+}
+
+fn quad_i8(h: Head, i0: u32) -> vec4u {
+    return (w[(h.qs + 4u * i0) >> 4u] >> vec4u(h.shift)) & vec4u(0x0f0f0f0fu);
 }

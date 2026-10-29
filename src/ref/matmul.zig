@@ -198,7 +198,7 @@ pub fn matmul(pool: *Pool, out: []f32, x_in: []const f32, w: *const Matrix, rows
 /// dot product with weights of type `t` (quantize_row_q8_0_ref,
 /// quantize_row_q8_K_ref, GGML_FP32_TO_BF16, f16), back to f32; f32
 /// weights take f32 activations.
-fn roundLikeLlama(t: gguf.TensorType, x: []f32) void {
+pub fn roundLikeLlama(t: gguf.TensorType, x: []f32) void {
     switch (t) {
         .q8_0 => {
             var b: usize = 0;

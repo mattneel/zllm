@@ -13,9 +13,12 @@ state, on the same GGUF:
   G   `zllm gpu-forward`: the prefill kernels in PREFILL_STEP-token steps (a
       27B step must stay well under Windows' 2 s GPU watchdog), and the
       decode kernels in 1-token steps over the first DECODE_TOKENS positions.
+      The quantized prefill multiplies round their input as llama.cpp does
+      (8-bit dot products), so that path is another implementation of RL;
+      the decode multiplies keep their input f32, so that one implements R.
 
 Pass criteria (docs/src/validation.md):
-  * GPU = reference: G against R, both kernel paths, top-1 agreement 100%,
+  * GPU = reference, decode kernels: G against R, top-1 agreement 100%,
     and at every position:
       - the first layer's output: relative L2 <= GPU_FIRST_LAYER_MAX (the
         kernels agree up to f32 summation order);
@@ -32,6 +35,13 @@ Pass criteria (docs/src/validation.md):
         own response to that rounding. A semantic difference (a wrong head
         mapping, norm or rotation) adds a gap the rounding cannot explain,
         from the first layer of the affected kind on.
+  * GPU = reference up to rounding, prefill kernels: G against RL and R by
+    the two bounds above, as llama.cpp. Rounding to 8 bits is discontinuous:
+    the GPU's f32 activations differ from the reference's by summation
+    order, about 1e-7, and a value that close to a rounding boundary rounds
+    the other way and moves by a whole step. So positions differ by a few
+    such ties, and the bounds take medians over positions. Each kernel is
+    checked exactly by gpu-check.
     The spec's bounds against llama.cpp (cosine >= 0.999, top-1 >= 99%)
     are reported, not enforced: on the 27B, R and RL alone already miss
     them.
@@ -62,7 +72,7 @@ GPU_REL_L2_MAX = 1e-3
 FIRST_LAYER_MAX = 1e-4
 SENSITIVITY_RATIO = 1.5
 DECODE_TOKENS = 40
-PREFILL_STEP = 8
+PREFILL_STEP = 32
 
 
 def layer_names(records: dict) -> list[str]:
@@ -87,14 +97,32 @@ def main() -> int:
 
     fail = Failures()
     report: dict = {"model": model.name, "sequences": []}
-    gpu_agree = {"prefill": 0, "decode": 0}
-    gpu_total = {"prefill": 0, "decode": 0}
-    gpu_worst = {"prefill": [1.0, 0.0], "decode": [1.0, 0.0]}
-    gpu_first = {"prefill": 0.0, "decode": 0.0}
+    gpu_agree = {"decode": 0}
+    gpu_total = {"decode": 0}
+    gpu_worst = {"decode": [1.0, 0.0]}
+    gpu_first = {"decode": 0.0}
+    gpu_rounded = {"ratio": 0.0, "first": 0.0, "agree": 0, "total": 0}
     llama_agree = llama_total = 0
     llama_min_cos = 1.0
     worst_ratio = 0.0
     worst_first = 0.0
+
+    def rounded_vs_ref(label: str, other: dict, r: dict, rl: dict) -> tuple[float, float, int]:
+        """An implementation of the rounded activations, `other`, against RL:
+        the first layer's median gap, and at every layer the median gap to R
+        within SENSITIVITY_RATIO of RL's own. Returns the worst ratio, the
+        first-layer gap and top-1 agreement with RL."""
+        worst = 0.0
+        for name in [*layer_names(r), "result_norm"]:
+            gap = float(np.median(row_stats(r[name], other[name])[1]))
+            own = float(np.median(row_stats(r[name], rl[name])[1]))
+            ratio = gap / own if own > 0 else float("inf")
+            worst = max(worst, ratio)
+            fail.expect(f"{label}: {name} gap vs rounding sensitivity", ratio <= SENSITIVITY_RATIO, f"{gap:.2e} / {own:.2e} = {ratio:.2f} > {SENSITIVITY_RATIO}")
+        first = float(np.median(row_stats(rl["l_out-0"], other["l_out-0"])[1]))
+        fail.expect(f"{label}: first layer against the rounded reference", first <= FIRST_LAYER_MAX, f"median rel L2 {first:.2e} > {FIRST_LAYER_MAX}")
+        top = int((other["result_output"].argmax(axis=1) == rl["result_output"].argmax(axis=1)).sum())
+        return worst, first, top
 
     def gpu_vs_ref(label: str, path: str, g: dict, r: dict, rows: int) -> None:
         _, first, _ = row_stats(g["l_out-0"][:rows], r["l_out-0"][:rows])
@@ -132,8 +160,13 @@ def main() -> int:
             rec = {k: read_records(p) for k, p in out.items()}
             r, rl, ll = rec["R"], rec["RL"], rec["L"]
 
-            gpu_vs_ref(ev["name"], "prefill", rec["G"], r, n)
             gpu_vs_ref(f"{ev['name']} (decode)", "decode", rec["G1"], r, DECODE_TOKENS)
+            g_ratio, g_first, g_top = rounded_vs_ref(f"{ev['name']}: GPU prefill", rec["G"], r, rl)
+            gpu_rounded["ratio"] = max(gpu_rounded["ratio"], g_ratio)
+            gpu_rounded["first"] = max(gpu_rounded["first"], g_first)
+            gpu_rounded["agree"] += g_top
+            gpu_rounded["total"] += n
+            print(f"  GPU prefill vs reference with llama.cpp's rounding: top-1 {g_top}/{n}; first layer median rel L2 {g_first:.2e}; worst gap / rounding sensitivity {g_ratio:.2f}")
 
             layers = []
             print(f"  {'tensor':<14} {'R vs L':>10} {'R vs RL':>10} {'ratio':>6}   (median rel L2)")
@@ -160,12 +193,15 @@ def main() -> int:
             report["sequences"].append({"name": ev["name"], "tokens": n, "first_layer_emulated": first, "layers": layers, "top1_vs_llama": top, "top1_vs_rounded": own_top})
 
     print()
-    for path in ("prefill", "decode"):
-        c, rel = gpu_worst[path]
-        print(f"{args.host}, GPU vs reference, {path} kernels: top-1 {gpu_agree[path]}/{gpu_total[path]}; first layer max rel L2 {gpu_first[path]:.2e} (max {GPU_FIRST_LAYER_MAX}); min cosine {c:.7f} (min {GPU_COSINE_MIN}); max rel L2 {rel:.2e} (max {GPU_REL_L2_MAX})")
+    c, rel = gpu_worst["decode"]
+    print(f"{args.host}, GPU vs reference, decode kernels: top-1 {gpu_agree['decode']}/{gpu_total['decode']}; first layer max rel L2 {gpu_first['decode']:.2e} (max {GPU_FIRST_LAYER_MAX}); min cosine {c:.7f} (min {GPU_COSINE_MIN}); max rel L2 {rel:.2e} (max {GPU_REL_L2_MAX})")
+    print(
+        f"{args.host}, GPU vs reference with llama.cpp's rounding, prefill kernels: top-1 {gpu_rounded['agree']}/{gpu_rounded['total']} (reported); "
+        f"first layer worst median rel L2 {gpu_rounded['first']:.2e} (max {FIRST_LAYER_MAX}); worst gap / rounding sensitivity {gpu_rounded['ratio']:.2f} (max {SENSITIVITY_RATIO})"
+    )
     print(f"reference vs llama.cpp: first layer with its rounding, worst median rel L2 {worst_first:.2e} (max {FIRST_LAYER_MAX}); worst gap / rounding sensitivity {worst_ratio:.2f} (max {SENSITIVITY_RATIO})")
     print(f"reference vs llama.cpp, spec §12 (reported): top-1 {llama_agree}/{llama_total} = {llama_agree / llama_total:.4f}; final hidden min cosine {llama_min_cos:.6f}")
-    report.update({"gpu": gpu_worst, "worst_ratio": worst_ratio, "worst_first_layer": worst_first, "top1_vs_llama": llama_agree / llama_total, "min_cos_vs_llama": llama_min_cos})
+    report.update({"gpu": gpu_worst, "gpu_rounded": gpu_rounded, "worst_ratio": worst_ratio, "worst_first_layer": worst_first, "top1_vs_llama": llama_agree / llama_total, "min_cos_vs_llama": llama_min_cos})
     report_path = paths.root / "reports" / f"{model.stem}.json"
     report_path.parent.mkdir(exist_ok=True)
     report_path.write_text(json.dumps(report, indent=1))
