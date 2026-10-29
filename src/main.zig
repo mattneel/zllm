@@ -20,6 +20,8 @@ const usage =
     \\                                       run the CPU f32 reference on little-endian int32
     \\                                       token ids; write activation records (format in
     \\                                       tools/llama-dump/dump.cpp)
+    \\  dequant <type> <in.bin> <out.f32>  decode raw blocks of a GGML type (q8_0, q3_k, q4_k,
+    \\                                       q5_k, q6_k, f16, bf16) to little-endian f32
     \\  chat-render <cases.jsonl>           for each {"name", "messages", "options"} line, print
     \\                                       {"name": ..., "text": ...}: the prompt in the fixed Qwen
     \\                                       chat template
@@ -111,6 +113,17 @@ pub fn main(init: std.process.Init) !void {
         } else {
             try gen.generate(rt, args[3], opts, out);
         }
+    } else if (std.mem.eql(u8, cmd, "dequant")) {
+        if (args.len != 5) return fail(usage);
+        const t = std.meta.stringToEnum(zllm.gguf.TensorType, args[2]) orelse return fail(usage);
+        const layout = t.layout() orelse return fail(usage);
+        const in = try Io.Dir.cwd().readFileAlloc(io, args[3], gpa, .unlimited);
+        defer gpa.free(in);
+        if (in.len % layout.block_bytes != 0) return fail(usage);
+        const values = try gpa.alloc(f32, in.len / layout.block_bytes * layout.block_elems);
+        defer gpa.free(values);
+        try zllm.ref.tensor.dequantize(t, in, values);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = args[4], .data = std.mem.sliceAsBytes(values) });
     } else if (std.mem.eql(u8, cmd, "chat-render")) {
         if (args.len != 3) return fail(usage);
         const cases = try Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .unlimited);

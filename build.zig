@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
     _ = addCheck(b, check_exe, fixtures, "check-tokenizer", "Compare tokenization with Hugging Face tokenizers", "check_tokenizer.py");
     _ = addCheck(b, check_exe, fixtures, "check-chat", "Compare chat prompts with the pinned Jinja template", "check_chat.py");
     _ = addCheck(b, check_exe, fixtures, "check-forward", "Compare the reference forward pass with llama.cpp", "check_forward.py");
+    _ = addCheck(b, check_exe, fixtures, "check-dequant", "Compare CPU dequantization with ggml's, bit for bit", "check_dequant.py");
 
     // GPU checks run on a Dawn host: `native` is this build on whatever
     // adapter Dawn finds (llvmpipe in CI); `d3d12` is the Windows build run
