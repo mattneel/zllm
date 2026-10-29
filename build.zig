@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
         b.path(".fixtures");
     _ = addCheck(b, check_exe, fixtures, "check-gguf", "Compare the GGUF index with llama.cpp gguf-dump", "check_gguf.py");
     _ = addCheck(b, check_exe, fixtures, "check-tokenizer", "Compare tokenization with Hugging Face tokenizers", "check_tokenizer.py");
+    _ = addCheck(b, check_exe, fixtures, "check-chat", "Compare chat prompts with the pinned Jinja template", "check_chat.py");
     _ = addCheck(b, check_exe, fixtures, "check-forward", "Compare the reference forward pass with llama.cpp", "check_forward.py");
 
     // GPU checks run on a Dawn host: `native` is this build on whatever

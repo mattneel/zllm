@@ -11,6 +11,7 @@ from pathlib import Path
 GGUF_FILE = "Qwen3.5-0.8B-BF16.gguf"
 HEADER_FILE = "Qwen3.5-0.8B-BF16.header.gguf"
 HF_DIR = "hf/Qwen3.5-0.8B"
+CHAT_TEMPLATE = "hf/Qwen-Fixed-Chat-Templates/chat_template.jinja"
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,10 @@ class FixturePaths:
     @property
     def hf_tokenizer(self) -> Path:
         return self.root / HF_DIR / "tokenizer.json"
+
+    @property
+    def chat_template(self) -> Path:
+        return self.root / CHAT_TEMPLATE
 
     @property
     def llama_bin(self) -> Path:

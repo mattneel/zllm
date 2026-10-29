@@ -29,6 +29,11 @@ hf_files=(
 	"config.json b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
 	"chat_template.jinja 273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
 )
+# The chat format zllm's native chat uses (src/chat/chat.zig).
+chat_repo="froggeric/Qwen-Fixed-Chat-Templates"
+chat_rev="855bffc49448e299789730ff92c9b8d834d6cc14"
+chat_file="chat_template.jinja"
+chat_sha256="e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
 
 llama_url="https://github.com/ggml-org/llama.cpp.git"
 llama_rev="e09a78a25dec3f42175ad59ecc540a54bed0b9b2"
@@ -75,7 +80,7 @@ fetch() {
 	verify "$path" "$want"
 }
 
-# Small fixtures: tokenizer parity (CI runs this mode).
+# Small fixtures: tokenizer and chat-template parity (CI runs this mode).
 vocab() {
 	local path="$dir/models/$header_file"
 	if [[ ! -f "$path" ]] || ! verify "$path" "$header_sha256"; then
@@ -92,6 +97,8 @@ vocab() {
 		fetch "https://huggingface.co/$hf_repo/resolve/$hf_rev/$name" \
 			"$dir/hf/Qwen3.5-0.8B/$name" "$sha"
 	done
+	fetch "https://huggingface.co/$chat_repo/resolve/$chat_rev/$chat_file" \
+		"$dir/hf/Qwen-Fixed-Chat-Templates/$chat_file" "$chat_sha256"
 }
 
 # The full model: GGUF index and forward-pass parity.

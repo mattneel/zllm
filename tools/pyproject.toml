@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "Parity harness: compares zllm against pinned llama.cpp and Hugging Face references"
 requires-python = ">=3.12"
 dependencies = [
+    "jinja2>=3.1",
     "numpy>=2.3",
     "tokenizers==0.23.3",
     # gguf-py itself is imported from the pinned llama.cpp checkout; these are its runtime deps.

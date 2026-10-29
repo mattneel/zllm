@@ -17,6 +17,9 @@ const usage =
     \\                                       run the CPU f32 reference on little-endian int32
     \\                                       token ids; write activation records (format in
     \\                                       tools/llama-dump/dump.cpp)
+    \\  chat-render <cases.jsonl>           for each {"name", "messages", "options"} line, print
+    \\                                       {"name": ..., "text": ...}: the prompt in the fixed Qwen
+    \\                                       chat template
     \\  gpu-info                            open Dawn and print the adapter and limits as JSON
     \\  gpu-check                           check every GPU kernel against a CPU computation
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
@@ -63,6 +66,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "forward")) {
         if (args.len != 5) return fail(usage);
         try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4]);
+    } else if (std.mem.eql(u8, cmd, "chat-render")) {
+        if (args.len != 3) return fail(usage);
+        const cases = try Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .unlimited);
+        defer gpa.free(cases);
+        try chatRender(gpa, cases, out);
     } else if (std.mem.eql(u8, cmd, "gpu-info")) {
         if (args.len != 2) return fail(usage);
         try gpuInfo(gpa, init.environ_map, out);
@@ -102,6 +110,27 @@ fn tokenizeLines(gpa: std.mem.Allocator, tok: *const zllm.tokenizer.Tokenizer, t
         try s.objectField("decoded");
         try s.write(decoded.items);
         try s.endObject();
+        try out.writeByte('\n');
+    }
+}
+
+fn chatRender(gpa: std.mem.Allocator, cases: []const u8, out: *Io.Writer) !void {
+    const Case = struct {
+        name: []const u8,
+        messages: []const zllm.chat.Message,
+        options: zllm.chat.Options = .{},
+    };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var lines = std.mem.splitScalar(u8, cases, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(Case, gpa, line, .{});
+        defer parsed.deinit();
+        text.clearRetainingCapacity();
+        try zllm.chat.render(gpa, parsed.value.messages, parsed.value.options, &text);
+        var s: std.json.Stringify = .{ .writer = out };
+        try s.write(.{ .name = parsed.value.name, .text = text.items });
         try out.writeByte('\n');
     }
 }
