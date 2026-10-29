@@ -131,21 +131,27 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     }
     workgroupBarrier();
 
-    // Σ exp · v: thread over (head, dim) pairs.
+    // Σ exp · v: thread d reads each V element once for the whole group.
     let n = min(BLOCK, keys - min(keys, k0));
-    for (var o = lid; o < group * hd; o += WG) {
-        let h = o / hd;
-        let d = o % hd;
-        var acc = 0.0;
-        for (var i = 0u; i < n; i++) {
-            acc += sc[h * BLOCK + i] * v_at((k0 + i) * kv_stride + g * hd + d);
+    for (var d = lid; d < hd; d += WG) {
+        var acc: array<f32, MAX_GROUP>;
+        for (var h = 0u; h < MAX_GROUP; h++) {
+            acc[h] = 0.0;
         }
-        let head = g * group + h;
-        let base = ((t * p.heads + head) * p.max_blocks + b) * (hd + 2u);
-        part[base + 2u + d] = acc;
-        if (d == 0u) {
-            part[base] = stat[2u * h];
-            part[base + 1u] = stat[2u * h + 1u];
+        for (var i = 0u; i < n; i++) {
+            let v = v_at((k0 + i) * kv_stride + g * hd + d);
+            for (var h = 0u; h < group; h++) {
+                acc[h] += sc[h * BLOCK + i] * v;
+            }
+        }
+        for (var h = 0u; h < group; h++) {
+            let head = g * group + h;
+            let base = ((t * p.heads + head) * p.max_blocks + b) * (hd + 2u);
+            part[base + 2u + d] = acc[h];
+            if (d == 0u) {
+                part[base] = stat[2u * h];
+                part[base + 1u] = stat[2u * h + 1u];
+            }
         }
     }
 }
