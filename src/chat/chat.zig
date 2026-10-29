@@ -1,8 +1,16 @@
 //! Chat prompts in the fixed Qwen template: froggeric/Qwen-Fixed-Chat-Templates
 //! @855bffc49448e299789730ff92c9b8d834d6cc14, chat_template.jinja
-//! ("qwen3.8-froggeric-v22.5"), transcribed for text conversations without
-//! tools or images. tools/check_chat.py checks it against the Jinja template
+//! ("qwen3.8-froggeric-v22.5"), transcribed for text conversations with its
+//! default options: tools are offered and called in its XML format, and
+//! neither tool calls nor tool responses are truncated. Images are not
+//! supported. tools/check_chat.py checks it against the Jinja template
 //! rendered as Hugging Face transformers renders it.
+//!
+//! Tools and tool-call arguments are JSON values written as transformers'
+//! `tojson` writes them (Python's json.dumps, keys in order, non-ASCII
+//! kept). Numbers are written as given (parse with `.parse_numbers =
+//! false`), which matches Python except for spellings Python normalizes,
+//! such as 1E2 or 1.50.
 //!
 //! Earlier assistant turns keep their reasoning (preserve_thinking defaults
 //! to true), so each new prompt extends the previous one token for token and
@@ -11,15 +19,26 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const Role = enum { system, developer, user, assistant };
+pub const Role = enum { system, developer, user, assistant, tool };
+
+/// A call an assistant turn made, as in the OpenAI and transformers formats.
+pub const ToolCall = struct {
+    function: struct {
+        name: []const u8,
+        /// An object: each member becomes a parameter.
+        arguments: ?std.json.Value = null,
+    },
+};
 
 pub const Message = struct {
     role: Role,
-    content: []const u8,
+    content: []const u8 = "",
     /// An assistant turn's reasoning, if kept apart from `content`
     /// (reasoning_content). Otherwise a `<think>` block inside `content` is
     /// split off.
     reasoning: ?[]const u8 = null,
+    /// An assistant turn's calls.
+    tool_calls: []const ToolCall = &.{},
 };
 
 pub const Options = struct {
@@ -28,6 +47,9 @@ pub const Options = struct {
     reasoning_effort: ?[]const u8 = null,
     preserve_thinking: bool = true,
     add_generation_prompt: bool = true,
+    /// The functions offered, each as the JSON the template lists, e.g.
+    /// {"type": "function", "function": {"name": ..., "parameters": ...}}.
+    tools: []const std.json.Value = &.{},
 };
 
 pub const Error = Allocator.Error || error{NoMessages};
@@ -60,7 +82,7 @@ pub fn render(gpa: Allocator, messages: []const Message, opts: Options, out: *st
         }
     }
     for (messages) |m| {
-        if (m.role == .assistant) continue;
+        if (!(isSystem(m.role) or m.role == .user)) continue;
         const c = m.content;
         if (has(c, "<|think_off|>")) {
             thinking = false;
@@ -93,7 +115,27 @@ pub fn render(gpa: Allocator, messages: []const Message, opts: Options, out: *st
         if (system.items.len > 0) try system.appendSlice(arena, "\n\n");
         try system.appendSlice(arena, part);
     }
-    if (system.items.len > 0) {
+    if (opts.tools.len > 0) {
+        try out.appendSlice(gpa, "<|im_start|>system\n");
+        if (instructions.len > 0) try out.print(gpa, "{s}\n\n", .{instructions});
+        try out.appendSlice(gpa, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for (opts.tools) |t| {
+            try out.append(gpa, '\n');
+            try writeJson(gpa, out, t);
+        }
+        try out.appendSlice(gpa, "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n");
+        if (thinking) try out.appendSlice(gpa, "<think>\nBrief explanation of tool call\n</think>\n");
+        try out.appendSlice(gpa, "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n");
+        if (thinking) try out.appendSlice(gpa, "- You can use the <think></think> block to plan your next tool call OR to synthesize data and formulate your final response to the user.\n- ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.\n");
+        try out.appendSlice(gpa, "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.\n");
+        try out.appendSlice(gpa, if (thinking)
+            "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after thinking, with NO conversational text before it.\n"
+        else
+            "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY, with NO conversational text before it.\n");
+        try out.appendSlice(gpa, "- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO spaces or indentation before them.\n- To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.\n- If you have all necessary data, provide your final answer directly to the user without any tool call.\n</IMPORTANT>");
+        if (system.items.len > 0) try out.print(gpa, "\n\n{s}", .{system.items});
+        try out.appendSlice(gpa, "<|im_end|>\n");
+    } else if (system.items.len > 0) {
         try out.appendSlice(gpa, "<|im_start|>system\n");
         if (instructions.len > 0) try out.print(gpa, "{s}\n\n", .{instructions});
         try out.print(gpa, "{s}<|im_end|>\n", .{system.items});
@@ -102,8 +144,8 @@ pub fn render(gpa: Allocator, messages: []const Message, opts: Options, out: *st
     }
 
     const rest = messages[head..];
-    // Assistant reasoning after the last real user query is always kept.
-    // Without tools every user message is a real query.
+    // Assistant reasoning after the last real user query is always kept. A
+    // user message that is only a tool response is not a real query.
     const last_index: usize = if (rest.len > 0) rest.len - 1 else 0;
     var last_query: usize = if (last_index > 50) last_index else 0;
     var i = rest.len;
@@ -118,6 +160,7 @@ pub fn render(gpa: Allocator, messages: []const Message, opts: Options, out: *st
         }
     }
 
+    var failures: u32 = 0;
     for (rest, 0..) |m, index| {
         var content = trim(m.content);
         switch (m.role) {
@@ -126,6 +169,7 @@ pub fn render(gpa: Allocator, messages: []const Message, opts: Options, out: *st
                 try out.print(gpa, "<|im_start|>system\n{s}<|im_end|>\n", .{content});
             },
             .user => {
+                failures = 0;
                 content = try stripTags(arena, content);
                 try out.print(gpa, "<|im_start|>user\n{s}<|im_end|>\n", .{content});
             },
@@ -176,7 +220,33 @@ pub fn render(gpa: Allocator, messages: []const Message, opts: Options, out: *st
                 } else {
                     try out.print(gpa, "<|im_start|>assistant\n{s}", .{content});
                 }
+                for (m.tool_calls, 0..) |call, ci| {
+                    const lead: []const u8 = if (ci > 0) "\n" else if (trim(content).len > 0) "\n\n" else "";
+                    try out.print(gpa, "{s}<tool_call>\n<function={s}>\n", .{ lead, call.function.name });
+                    if (call.function.arguments) |args| switch (args) {
+                        .object => |o| for (o.keys(), o.values()) |k, v| {
+                            try out.print(gpa, "<parameter={s}>\n", .{k});
+                            if (v == .string) try out.appendSlice(gpa, v.string) else try writeJson(gpa, out, v);
+                            try out.appendSlice(gpa, "\n</parameter>\n");
+                        },
+                        .string => |s| try out.appendSlice(gpa, s),
+                        else => try writeJson(gpa, out, args),
+                    };
+                    try out.appendSlice(gpa, "</function>\n</tool_call>");
+                }
                 try out.appendSlice(gpa, "<|im_end|>\n");
+            },
+            .tool => {
+                failures = if (try looksFailed(arena, content)) failures + 1 else 0;
+                if (index == 0 or rest[index - 1].role != .tool) try out.appendSlice(gpa, "<|im_start|>user");
+                try out.print(gpa, "\n<tool_response>\n{s}", .{content});
+                if (failures >= 2) {
+                    try out.print(gpa, "\n\n⚠️ SYSTEM WARNING: {d} consecutive tool errors detected. Your previous approach is incorrect. You MUST use a fundamentally different approach or corrected arguments.", .{failures});
+                } else if (failures == 1) {
+                    try out.appendSlice(gpa, "\n\n⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.");
+                }
+                try out.appendSlice(gpa, "\n</tool_response>");
+                if (index + 1 == rest.len or rest[index + 1].role != .tool) try out.appendSlice(gpa, "<|im_end|>\n");
             },
         }
     }
@@ -185,6 +255,80 @@ pub fn render(gpa: Allocator, messages: []const Message, opts: Options, out: *st
         try out.appendSlice(gpa, "<|im_start|>assistant\n");
         try out.appendSlice(gpa, if (thinking) "<think>\n" else "<think>\n\n</think>\n\n");
     }
+}
+
+/// The template's guess that a tool response reports an error: a strong
+/// sign, or a weak one in a short response without command output, unless
+/// it reads as code (which mentions errors without being one). It looks at
+/// the content lowercased, and mostly at its first 120 characters.
+/// (Lowercasing here is ASCII; Python's also maps a few non-ASCII letters,
+/// such as the Kelvin sign, to ASCII ones.)
+fn looksFailed(arena: Allocator, content: []const u8) Allocator.Error!bool {
+    const all = try std.ascii.allocLowerString(arena, content);
+    var end: usize = 0;
+    var chars: usize = 0;
+    while (end < all.len and chars < 120) : (chars += 1) end += std.unicode.utf8ByteSequenceLength(all[end]) catch 1;
+    const head = all[0..@min(end, all.len)];
+    const code = has(all, "throw new ") or has(all, "throw error") or has(all, "console.error") or
+        has(all, "logger.error") or has(all, "logging.error") or
+        has(head, "import ") or has(head, "def ") or has(head, "function ");
+    const exit_zero = has(head, "exit code: 0") or has(head, "process exited with code 0");
+    const error_ok = has(head, "\"error\": null") or has(head, "\"error\":null") or has(head, "\"error\": false") or
+        has(head, "\"error\":false") or has(head, "\"error\": \"\"") or has(head, "\"error\":\"\"");
+    const strong = (has(head, "\"error\":") and !error_ok) or has(head, "\"status\": \"error\"") or has(head, "\"status\":\"error\"") or
+        has(head, "traceback (most recent call last):") or has(head, "command not found") or has(head, "invalid syntax") or
+        has(head, "fatal:") or ((has(head, "exit code: ") or has(head, "process exited with code")) and !exit_zero) or
+        std.mem.startsWith(u8, head, "exception:") or std.mem.startsWith(u8, head, "failed to ");
+    const weak = has(head, "error:") or has(head, "err!");
+    const suppressed = has(head, "$ ") or has(head, "took ") or (std.unicode.utf8CountCodepoints(content) catch content.len) >= 600;
+    return !code and (strong or (weak and !suppressed));
+}
+
+/// `v` as transformers' `tojson` writes it: Python's json.dumps with
+/// ensure_ascii=False and the default ", " and ": " separators.
+pub fn writeJson(gpa: Allocator, out: *std.ArrayList(u8), v: std.json.Value) Allocator.Error!void {
+    switch (v) {
+        .null => try out.appendSlice(gpa, "null"),
+        .bool => |b| try out.appendSlice(gpa, if (b) "true" else "false"),
+        .integer => |i| try out.print(gpa, "{d}", .{i}),
+        .float => |f| try out.print(gpa, "{d}", .{f}),
+        .number_string => |s| try out.appendSlice(gpa, s),
+        .string => |s| try writeJsonString(gpa, out, s),
+        .array => |a| {
+            try out.append(gpa, '[');
+            for (a.items, 0..) |item, i| {
+                if (i > 0) try out.appendSlice(gpa, ", ");
+                try writeJson(gpa, out, item);
+            }
+            try out.append(gpa, ']');
+        },
+        .object => |o| {
+            try out.append(gpa, '{');
+            for (o.keys(), o.values(), 0..) |k, item, i| {
+                if (i > 0) try out.appendSlice(gpa, ", ");
+                try writeJsonString(gpa, out, k);
+                try out.appendSlice(gpa, ": ");
+                try writeJson(gpa, out, item);
+            }
+            try out.append(gpa, '}');
+        },
+    }
+}
+
+fn writeJsonString(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
+    try out.append(gpa, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        0x08 => try out.appendSlice(gpa, "\\b"),
+        0x0c => try out.appendSlice(gpa, "\\f"),
+        0...0x07, 0x0b, 0x0e...0x1f => try out.print(gpa, "\\u{x:0>4}", .{c}),
+        else => try out.append(gpa, c),
+    };
+    try out.append(gpa, '"');
 }
 
 fn isSystem(r: Role) bool {

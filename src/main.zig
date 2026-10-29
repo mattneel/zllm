@@ -189,7 +189,8 @@ fn chatRender(gpa: std.mem.Allocator, cases: []const u8, out: *Io.Writer) !void 
     var lines = std.mem.splitScalar(u8, cases, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        const parsed = try std.json.parseFromSlice(Case, gpa, line, .{});
+        // Numbers stay as written, as the template's tojson writes them.
+        const parsed = try std.json.parseFromSlice(Case, gpa, line, .{ .ignore_unknown_fields = true, .parse_numbers = false });
         defer parsed.deinit();
         text.clearRetainingCapacity();
         try zllm.chat.render(gpa, parsed.value.messages, parsed.value.options, &text);

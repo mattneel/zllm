@@ -29,9 +29,11 @@ def raise_exception(message: str):
 def render(template, case: dict) -> str:
     messages = []
     for m in case["messages"]:
-        msg = {"role": m["role"], "content": m["content"]}
+        msg = {"role": m["role"], "content": m.get("content", "")}
         if "reasoning" in m:
             msg["reasoning_content"] = m["reasoning"]
+        if "tool_calls" in m:
+            msg["tool_calls"] = m["tool_calls"]
         messages.append(msg)
     options = dict(case.get("options", {}))
     add_generation_prompt = options.pop("add_generation_prompt", True)
