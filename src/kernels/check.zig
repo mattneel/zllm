@@ -37,18 +37,18 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,         checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair, checkMatmulF16,      checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,        checkEmbed,          checkRopeAppendF32,  checkRopeAppendF16,     checkAttentionF32,
-        checkAttentionF16,   checkAttnDecode,     checkDeltaPrep,      checkDeltaKeep,         checkDeltaRule,
-        checkDraft,          checkGyroMatvec,     checkMoeRoute,       checkRotate128,         checkMoeCombine,
-        checkHc,             checkPle,            checkSampleGreedy,   checkSampleTopKTopP,    checkSampleMinP,
-        checkSampleTopP,     checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK,   checkSampleTopKSkipped,
-        checkSampleVocab,    Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,     Quant(.q3_k).matvec,
-        Quant(.q3_k).matmul, Quant(.q3_k).embed,  Quant(.q4_k).matvec, Quant(.q4_k).matmul,    Quant(.q4_k).embed,
-        Quant(.q5_k).matvec, Quant(.q5_k).matmul, Quant(.q5_k).embed,  Quant(.q6_k).matvec,    Quant(.q6_k).matmul,
-        Quant(.q6_k).embed,  checkQuantTiles,     checkQuantSiluPair,  checkQuantizeQ8K,       checkQuantizeQ80,
-        checkQuantizeNorm,   checkQuantizeSilu,
+        checkRmsNorm,           checkMatmul,         checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair,    checkMatmulF16,      checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,           checkEmbed,          checkRopeAppendF32,  checkRopeAppendF16,     checkAttentionF32,
+        checkAttentionF16,      checkAttnDecode,     checkDeltaPrep,      checkDeltaKeep,         checkDeltaRule,
+        checkGatedNormSigmoid,  checkDraft,          checkGyroMatvec,     checkMoeRoute,          checkRotate128,
+        checkMoeCombine,        checkHc,             checkPle,            checkSampleGreedy,      checkSampleTopKTopP,
+        checkSampleMinP,        checkSampleTopP,     checkSamplePlain,    checkSampleTopK1,       checkSampleLargeTopK,
+        checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec, Quant(.q8_0).matmul,    Quant(.q8_0).embed,
+        Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,  Quant(.q4_k).matvec,    Quant(.q4_k).matmul,
+        Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul, Quant(.q5_k).embed,     Quant(.q6_k).matvec,
+        Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantTiles,     checkQuantSiluPair,     checkQuantizeQ8K,
+        checkQuantizeQ80,       checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -1500,6 +1500,31 @@ fn checkPle(c: *Ctx) !Result {
         want[t * n + ch] = hidden0[t * n + ch] + gated_all[t * n + ch] + acc * sigmoid64(acc);
     };
     return .{ .name = "ple_mix + ple_conv (steps of 5 and 3)", .err = relErr(got, want), .tolerance = 1e-5 };
+}
+
+/// gated_norm's sigmoid gate (Qwen4Exp's DeltaNet): 3 tokens of 4 heads.
+fn checkGatedNormSigmoid(c: *Ctx) !Result {
+    const hv = 4;
+    const d = 128;
+    const tokens = 3;
+    const eps = 1e-6;
+    const z_off = 16;
+    const z_row = z_off + hv * d + 8;
+    const o = try c.random(tokens * hv * d, 2);
+    const zp = try c.random(tokens * z_row, 3);
+    const w = try c.random(d, 1);
+    const oa = try c.upload(o);
+    try c.launcher().launch(.gated_norm, P.GatedNorm{ .v_heads = hv, .dim = d, .eps = eps, .z_row = z_row, .z_off = z_off, .sigmoid = 1 }, &.{ oa, try c.upload(zp), try c.upload(w) }, .{ hv, tokens, 1 });
+    const got = try c.read(oa);
+    const want = try c.arena.alloc(f64, tokens * hv * d);
+    for (0..tokens) |t| for (0..hv) |j| {
+        const head = o[(t * hv + j) * d ..][0..d];
+        var ss: f64 = 0;
+        for (head) |v| ss += @as(f64, v) * v;
+        const r = 1 / @sqrt(ss / d + eps);
+        for (0..d) |b| want[(t * hv + j) * d + b] = head[b] * r * w[b] * sigmoid64(zp[t * z_row + z_off + j * d + b]);
+    };
+    return .{ .name = "gated_norm, sigmoid gate", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 fn checkSampleGreedy(c: *Ctx) !Result {

@@ -422,7 +422,9 @@ pub const params = struct {
         eps: f32,
         z_row: u32,
         z_off: u32,
-        _pad: [3]u32 = @splat(0),
+        /// 1: gate by sigmoid(z) (Qwen4Exp), not silu(z).
+        sigmoid: u32 = 0,
+        _pad: [2]u32 = @splat(0),
     };
     /// Per-request sampler parameters (`sample` and `mark_tokens`).
     pub const Sample = extern struct {
