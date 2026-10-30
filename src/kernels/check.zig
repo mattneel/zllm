@@ -574,10 +574,6 @@ fn Quant(comptime t: gguf.TensorType) type {
             for (tokens, 0..) |tok, i| for (0..dim) |e| {
                 want[i * dim + e] = table.values[tok * dim + e];
             };
-            if (t == .q3_k) std.debug.print("got {any}\nwant {any}\n", .{ got[0..40], want[0..40] });
-            if (t == .q3_k) std.debug.print("got {any}\nwant {any}\n", .{ got[0..40], want[0..40] });
-            if (t == .q3_k) std.debug.print("got {any}\nwant {any}\n", .{ got[0..40], want[0..40] });
-            if (t == .q3_k) std.debug.print("bytes {any}\ngot {any}\nwant {any}\n", .{ table.bytes[0..110], got[0..4], want[0..4] });
             return .{ .name = "embed " ++ @tagName(t) ++ " (2 chunks)", .err = relErr(got, want), .tolerance = 1e-6 };
         }
     };
