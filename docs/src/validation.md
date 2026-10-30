@@ -157,7 +157,10 @@ hit every tile and chunk remainder:
   (`attn_split_wide`).
 - **`rope_append`** is checked over the whole projection, including the
   gates, K and V it must leave untouched, and over the cache, including the
-  positions before the step, which must stay zero.
+  positions before the step, which must stay zero. Its f16 cache must hold
+  exactly its f32 cache's values rounded to nearest, ties to even, over
+  random values at exponents −28 to 17 and planted ties, subnormals,
+  overflow, ±inf and NaN.
 - **Fused multiplies** start from a random output, so an accumulate that
   overwrites fails.
 
@@ -172,14 +175,20 @@ errors to within a factor of 2.
 | silu_mul | 1.4e-7 | 1e-6 |
 | embed_bf16, embed_f16 | 0 | 0 |
 | rope_append, f32 cache | 9.3e-8 | 1e-5 |
-| rope_append, f16 cache | 5.6e-4 | 1e-3 (one f16 step) |
+| rope_append, f16 cache | 2.4e-4 | 5e-4 (half an f16 step) |
+| rope_append's f16 rounding, 65,536 values | 0 differ | 0 |
 | attention in 3 chunks, f32 and f16 cache; groups of 12 | 3.6e-7 | 1e-5 |
 | attn_split + attn_combine; groups of 12 | 3.2e-7 | 1e-5 |
 | delta_prep (4 steps) | 4.0e-8 | 1e-5 |
 | delta_rule + gated_norm (2 steps) | 2.5e-7 | 1e-5 |
 
-D3D12 rounds `pack2x16float` toward zero and llvmpipe to nearest (3.7e-4),
-so the f16 bound is one step, not half. Dropping the attention output gate
+WGSL lets `pack2x16float` round either way: llvmpipe rounds to nearest,
+D3D12 toward zero, half the values a step low, biasing every cached K and V
+toward zero. `rope_append` rounds to nearest itself, as llama.cpp's cache
+does. Truncation fails the rounding check on D3D12 (half the values
+differ), as do ties rounded up, normal or subnormal. On the Gyro-Coder the
+truncated cache had put the logits 3.7e-3 (median relative L2) from the
+reference; rounded, 1.9e-5. Dropping the attention output gate
 makes `gpu-check` fail with error 1.0. Mutations of the fused kernels each
 fail their check:
 
@@ -363,7 +372,7 @@ RTX 5090 (D3D12):
 |---|---|---|---|
 | Prefill | 818/818 | 1.2e-5 | bitwise identical |
 | Decode | 200/200 | 1.1e-5 | bitwise identical |
-| Prefill, f16 cache | 818/818 | min cosine 0.9999939 | |
+| Prefill, f16 cache | 818/818 | min cosine 0.9999984 | |
 
 Each fusion commit passed this check on its own.
 

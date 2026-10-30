@@ -10,8 +10,12 @@
 //
 // RoPE rotates pairs (i, i + n_rot/2) by the angle of position pos0 + t,
 // read as (cos, sin) from a host-built table: WGSL sin/cos are only accurate
-// near [−π, π]. The cache stores f16 pairs (pack2x16float) when f16 != 0,
-// else f32 bits, `kv_heads · head_dim` values per position. head_dim ≤ WG.
+// near [−π, π]. The cache stores f16 pairs when f16 != 0, else f32 bits,
+// `kv_heads · head_dim` values per position. head_dim ≤ WG.
+//
+// The f16 values are rounded to nearest, ties to even, as llama.cpp's cache
+// rounds: WGSL lets pack2x16float round either way, and D3D12 truncates,
+// which biases every cached value toward zero.
 
 struct Params {
     heads: u32,
@@ -47,6 +51,41 @@ struct Step {
 const WG: u32 = 256u;
 var<workgroup> partial: array<f32, WG>;
 var<workgroup> vals: array<f32, WG>;
+
+// f32 → f16 bits, rounded to nearest even; overflow to ±inf, NaN kept.
+fn f16_bits(x: f32) -> u32 {
+    let b = bitcast<u32>(x);
+    let sign = (b >> 16u) & 0x8000u;
+    let mag = b & 0x7fffffffu;
+    if (mag > 0x7f800000u) {
+        return sign | 0x7e00u;
+    }
+    let e = i32(mag >> 23u) - 112;
+    if (e >= 31) {
+        return sign | 0x7c00u;
+    }
+    if (e > 0) {
+        // Normal: drop 13 mantissa bits; a carry moves into the exponent
+        // (up to inf).
+        let v = (u32(e) << 23u) | (mag & 0x7fffffu);
+        return sign | ((v + 0xfffu + ((v >> 13u) & 1u)) >> 13u);
+    }
+    if (e < -10) {
+        return sign;
+    }
+    // Subnormal: the significand in units of 2^-24.
+    let s = (mag & 0x7fffffu) | 0x800000u;
+    let k = u32(14 - e);
+    let q = s >> k;
+    let rem = s & ((1u << k) - 1u);
+    let half = 1u << (k - 1u);
+    let up = rem > half || (rem == half && (q & 1u) == 1u);
+    return sign | (q + select(0u, 1u, up));
+}
+
+fn pack_f16(v: vec2f) -> u32 {
+    return f16_bits(v.x) | (f16_bits(v.y) << 16u);
+}
 
 @compute @workgroup_size(WG)
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: vec3u) {
@@ -103,8 +142,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
         let v0 = qkv[vb + 2u * i];
         let v1 = qkv[vb + 2u * i + 1u];
         if (p.f16 != 0u) {
-            kc[e / 2u + i] = pack2x16float(vec2f(k0, k1));
-            vc[e / 2u + i] = pack2x16float(vec2f(v0, v1));
+            kc[e / 2u + i] = pack_f16(vec2f(k0, k1));
+            vc[e / 2u + i] = pack_f16(vec2f(v0, v1));
         } else {
             kc[e + 2u * i] = bitcast<u32>(k0);
             kc[e + 2u * i + 1u] = bitcast<u32>(k1);

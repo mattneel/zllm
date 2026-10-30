@@ -37,18 +37,19 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair, checkMatmulF16,       checkMatvecNormF16,     checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,        checkEmbed,           checkRopeAppendF32,     checkRopeAppendF16,     checkAttentionF32,
-        checkAttentionF16,   checkAttentionWide,   checkAttnDecode,        checkAttnDecodeWide,    checkDeltaPrep,
-        checkDeltaKeep,      checkDeltaRule,       checkGatedNormSigmoid,  checkDraft,             checkGyroMatvec,
-        checkMoeRoute,       checkRotate128,       checkMoeCombine,        checkHc,                checkPle,
-        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,        checkSamplePlain,
-        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,       Quant(.q8_0).matvec,
-        Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,    Quant(.q3_k).embed,
-        Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,    Quant(.q5_k).matmul,
-        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,     checkQuantTiles,
-        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,      checkQuantizeSilu,
+        checkRmsNorm,        checkMatmul,         checkMatmulChunked,   checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair, checkMatmulF16,      checkMatvecNormF16,   checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,        checkEmbed,          checkRopeAppendF32,   checkRopeAppendF16,     checkRopeAppendRounding,
+        checkAttentionF32,   checkAttentionF16,   checkAttentionWide,   checkAttnDecode,        checkAttnDecodeWide,
+        checkDeltaPrep,      checkDeltaKeep,      checkDeltaRule,       checkGatedNormSigmoid,  checkDraft,
+        checkGyroMatvec,     checkMoeRoute,       checkRotate128,       checkMoeCombine,        checkHc,
+        checkPle,            checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
+        checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
+        Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,
+        Quant(.q3_k).embed,  Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,
+        Quant(.q5_k).matmul, Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,
+        checkQuantTiles,     checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,
+        checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -749,8 +750,9 @@ fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool) !Result {
         for (0..kv) |g| normRope(kd[g * hd ..][0..hd], kw, pos0 + t, n_rot, base, eps);
     }
     // The table is f32 from the reference formula, so angles carry f32
-    // error; the f16 cache rounds to 2^-11 relative.
-    return .{ .name = name, .err = relErr(got, want), .tolerance = if (half) 1e-3 else 1e-5 };
+    // error; the f16 cache rounds to nearest, half a step: at most 2^-11
+    // relative.
+    return .{ .name = name, .err = relErr(got, want), .tolerance = if (half) 5e-4 else 1e-5 };
 }
 
 fn checkRopeAppendF32(c: *Ctx) !Result {
@@ -759,6 +761,57 @@ fn checkRopeAppendF32(c: *Ctx) !Result {
 
 fn checkRopeAppendF16(c: *Ctx) !Result {
     return ropeAppendCase(c, "rope_append (f16 cache)", true);
+}
+
+/// The f16 cache must hold the f32 cache's values rounded to nearest, ties
+/// to even, as llama.cpp's cache does (the reference); WGSL lets
+/// pack2x16float round either way. Both caches from one input, whose V
+/// (copied as it is) holds ties, subnormals, overflow and non-finite values
+/// and random values over exponents −28 to 17; err is the fraction of the
+/// f16 cache's values that differ.
+fn checkRopeAppendRounding(c: *Ctx) !Result {
+    const tokens = 64;
+    const kv = 2;
+    const hd = 256;
+    const width = kv * hd;
+    const row = 2 * width + 2 * hd;
+    const x = try c.random(tokens * row, 2);
+    const inf = std.math.inf(f32);
+    const edges = [_]f32{
+        1 + 0x1p-11,       1 + 3 * 0x1p-11, -(1 + 0x1p-11), 0x1p-25,  3 * 0x1p-25, 0x1p-24, 0x1.8p-24, 0x1p-14 - 0x1p-25,
+        0x1p-14 - 0x1p-24, 65504,           65519,          65520,    65536,       inf,     -inf,      std.math.nan(f32),
+        -0.0,              0,               0x1p-30,        -0x1p-20,
+    };
+    for (0..tokens) |t| for (x[t * row + 2 * hd + width ..][0..width], 0..) |*v, j| {
+        v.* = if (j < edges.len) edges[j] else std.math.ldexp(v.*, @as(i32, @intCast((j + t) % 46)) - 28);
+    };
+    const ones = try c.arena.alloc(f32, hd);
+    @memset(ones, 1);
+    const table = try kernels.ropeTable(c.arena, tokens, 64, 1e7);
+    const params: P.RopeAppend = .{ .heads = 1, .kv_heads = kv, .head_dim = hd, .n_rot = 64, .row = row, .k_off = 2 * hd, .v_off = 2 * hd + width, .f16 = 0, .eps = 1e-6 };
+    var words: [2][]const u32 = undefined;
+    for (&words, [_]u32{ 0, 1 }) |*out, half| {
+        var p = params;
+        p.f16 = half;
+        const n: u32 = if (half == 1) width / 2 else width;
+        const kc = try c.output(tokens * n);
+        const vc = try c.output(tokens * n);
+        try c.launcher().launch(.rope_append, p, &.{ try c.upload(x), try c.upload(ones), try c.upload(ones), try c.upload(table), kc, vc, try c.step(tokens, 0, 0) }, .{ 1 + kv, tokens, 1 });
+        const kw = try c.readWords(kc);
+        const vw = try c.readWords(vc);
+        out.* = try std.mem.concat(c.arena, u32, &.{ kw, vw });
+    }
+    const exact: []const f32 = @ptrCast(words[0]);
+    var differ: usize = 0;
+    for (words[1], 0..) |w, i| {
+        for ([_]u16{ @truncate(w), @truncate(w >> 16) }, 0..) |got, j| {
+            const value: f16 = @floatCast(exact[2 * i + j]);
+            const want: u16 = @bitCast(value);
+            const nans = std.math.isNan(value) and std.math.isNan(@as(f16, @bitCast(got)));
+            differ += @intFromBool(got != want and !nans);
+        }
+    }
+    return .{ .name = "rope_append f16 rounds to nearest", .err = @as(f64, @floatFromInt(differ)) / @as(f64, @floatFromInt(exact.len)), .tolerance = 0 };
 }
 
 /// A cache of random values for `total` positions, as the kernels store it:
