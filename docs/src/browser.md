@@ -190,12 +190,14 @@ stays in the file, and each step reads its tokens' 16 rows apiece through
 
 | Phase | Chrome | Native CLI |
 |---|---|---|
-| Load from a local file (weights 20 GB) | 19.4 s | 16–20 s, with 5 s of tuning |
-| Decode, greedy | 9.4–11.5 tok/s | 11–13 tok/s |
-| Prefill, 26–32 tokens | 19–22 tok/s | 27–32 tok/s |
+| Load from a local file (weights 20 GB) | 19.4–21.4 s | 22 s, with 2–7 s of tuning |
+| Decode, greedy | 21.4–22.2 tok/s | 35–38 tok/s |
 
-The host must know each token before its step, to read its rows, so the
-shim keeps one batch in flight here, not two
+Chrome's queued writes don't pile up during the load: its shared GPU
+memory stays at 0.14 GB. Every decode step still pays for recording its
+1,100 dispatches in JavaScript and a mapped readback. The host must know
+each token before its step, to read its rows, so the shim keeps one batch
+in flight here, not two
 ([Generation](generation.md#scheduling)). Greedy, from the reference
 runtime's prompt, Chrome gives that runtime's 40 tokens; from a chat
 prompt, the same 128 tokens as `zllm generate`.
