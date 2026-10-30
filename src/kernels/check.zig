@@ -37,17 +37,17 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,         checkMatmulChunked,   checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair, checkMatmulF16,      checkMatvecNormF16,   checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,        checkEmbed,          checkRopeAppendF32,   checkRopeAppendF16,     checkAttentionF32,
-        checkAttentionF16,   checkAttnDecode,     checkDeltaPrep,       checkDeltaKeep,         checkDeltaRule,
-        checkDraft,          checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
-        checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
-        Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,
-        Quant(.q3_k).embed,  Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,
-        Quant(.q5_k).matmul, Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,
-        checkQuantTiles,     checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,
-        checkQuantizeSilu,
+        checkRmsNorm,        checkMatmul,         checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair, checkMatmulF16,      checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,        checkEmbed,          checkRopeAppendF32,  checkRopeAppendF16,     checkAttentionF32,
+        checkAttentionF16,   checkAttnDecode,     checkDeltaPrep,      checkDeltaKeep,         checkDeltaRule,
+        checkDraft,          checkGyroMatvec,     checkSampleGreedy,   checkSampleTopKTopP,    checkSampleMinP,
+        checkSampleTopP,     checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK,   checkSampleTopKSkipped,
+        checkSampleVocab,    Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,     Quant(.q3_k).matvec,
+        Quant(.q3_k).matmul, Quant(.q3_k).embed,  Quant(.q4_k).matvec, Quant(.q4_k).matmul,    Quant(.q4_k).embed,
+        Quant(.q5_k).matvec, Quant(.q5_k).matmul, Quant(.q5_k).embed,  Quant(.q6_k).matvec,    Quant(.q6_k).matmul,
+        Quant(.q6_k).embed,  checkQuantTiles,     checkQuantSiluPair,  checkQuantizeQ8K,       checkQuantizeQ80,
+        checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -1223,6 +1223,55 @@ fn checkDraft(c: *Ctx) !Result {
     try c.launcher().launch(.draft, P.Draft{ .vocab = vocab, .row = vocab, .slot = 1 }, &.{ try c.upload(logits), out }, .{ 1, 1, 1 });
     const got = (try c.readWords(out))[1];
     return .{ .name = "draft (argmax, ties to the lower id)", .err = @floatFromInt(@intFromBool(got != 700)), .tolerance = 0 };
+}
+
+/// Routed-expert products on TQ2_T weights: 3 experts of 80 rows (a
+/// partial row group), 2 tokens routed to 2 experts each. Gate and up
+/// (2,560 inputs, both projections in one dispatch, x per token), then down
+/// (640 inputs, x per slot), against the CPU reference's row decoder.
+fn checkGyroMatvec(c: *Ctx) !Result {
+    const q4 = @import("../ref/qwen4exp/kernels.zig");
+    const book = try c.upload(@import("../ref/gyro/gyro.zig").codebook_bytes);
+    const rows = 80;
+    const n_expert = 3;
+    const tokens = 2;
+    const used = 2;
+    const ids = [_]u32{ 2, 0, 1, 2 };
+    var worst: f64 = 0;
+    for ([_]u32{ 2560, 640 }, [_]u32{ 2, 1 }) |cols, projections| {
+        var w: [2][]u8 = undefined;
+        for (&w) |*bytes| {
+            const n_blocks = n_expert * rows * cols / 128;
+            bytes.* = try c.arena.alloc(u8, std.mem.alignForward(usize, n_blocks * 34, 4));
+            c.rand.bytes(bytes.*);
+            for (0..n_blocks) |b| std.mem.writeInt(u16, bytes.*[b * 34 ..][0..2], @bitCast(@as(f16, @floatCast((c.rand.float(f32) * 2 - 1) * 0.05))), .little);
+        }
+        const per_slot = projections == 1;
+        const x_rows: usize = if (per_slot) tokens * used else tokens;
+        const x = try c.random(x_rows * cols, 1);
+        const out = try c.output(tokens * used * 2 * rows);
+        try c.launcher().launch(.gyro_matvec, P.GyroMatvec{
+            .rows = rows,
+            .cols = cols,
+            .n_used = used,
+            .x_per_slot = @intFromBool(per_slot),
+            .x_stride = cols,
+            .out_stride = 2 * rows,
+            .out_z = rows,
+        }, &.{ try c.upload(w[0]), try c.upload(w[1]), try c.upload(x), out, try c.upload(&ids), book }, .{ std.math.divCeil(u32, rows, 8) catch unreachable, tokens * used, projections });
+        const got = try c.read(out);
+        const want = try c.arena.alloc(f64, got.len);
+        @memset(want, 0);
+        const row_bytes = cols / 128 * 34;
+        for (0..tokens * used) |slot| for (0..projections) |z| for (0..rows) |j| {
+            const xr = x[(if (per_slot) slot else slot / used) * cols ..][0..cols];
+            const off = (ids[slot] * rows + j) * row_bytes;
+            want[slot * 2 * rows + z * rows + j] = q4.dotRow(.tq2_t, w[z][off..][0..row_bytes], xr);
+        };
+        // Unwritten up rows of the down pass stay 0 on both sides.
+        worst = @max(worst, relErr(got, want));
+    }
+    return .{ .name = "gyro_matvec tq2_t (routed, gate+up, down)", .err = worst, .tolerance = 1e-5 };
 }
 
 fn checkSampleGreedy(c: *Ctx) !Result {

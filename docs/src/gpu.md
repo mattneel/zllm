@@ -110,6 +110,7 @@ unit decodes from one load (128 bytes per block).
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling). One more phase undoes the last draw's output count (a rejected speculative round's second sample) |
 | `draft` | The speculative draft: the first index of the maximum of a row of logits, into the next step's token input | One workgroup |
+| `gyro_matvec` | Routed-expert products on Gyro TQ2_T weights (Gyro-Coder) | Lifted from gyro-dx: the expert comes from a GPU buffer the router wrote, no readback; a lane per trellis step decodes four weights from the 2,048-pair codebook; gate and up in one dispatch |
 
 These are plain WGSL. M4 makes them templates tuned per GPU; the decode
 kernels above are its first part, measured with `zllm bench`

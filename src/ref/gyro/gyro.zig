@@ -17,7 +17,7 @@ pub const block_weights = 128;
 pub const state_bits = 15;
 
 /// 2,048 pairs of binary16 values, little-endian (SHA-256 ee481f15…e588).
-const codebook_bytes = @embedFile("codebook.f16");
+pub const codebook_bytes = @embedFile("codebook.f16");
 
 /// The codebook as f32, 4,096 values.
 pub const codebook: [4096]f32 = blk: {

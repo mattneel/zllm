@@ -39,6 +39,7 @@ pub const Kernel = enum {
     mark_tokens,
     sample,
     draft,
+    gyro_matvec,
     repad,
     repack_q3_k,
     quantize_q8,
@@ -386,6 +387,16 @@ pub const params = struct {
         _pad: u32 = 0,
     };
     pub const Draft = extern struct { vocab: u32, row: u32, slot: u32, _pad: u32 = 0 };
+    pub const GyroMatvec = extern struct {
+        rows: u32,
+        cols: u32,
+        n_used: u32,
+        x_per_slot: u32,
+        x_stride: u32,
+        out_stride: u32,
+        out_z: u32,
+        _pad: u32 = 0,
+    };
     /// Which phase of `sample` a launch runs.
     pub const SamplePhase = extern struct { phase: u32, round: u32 = 0, _pad: [2]u32 = @splat(0) };
     pub const GatedNorm = extern struct {
