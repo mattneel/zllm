@@ -4,6 +4,7 @@
 #   scripts/fixtures.sh          everything below
 #   scripts/fixtures.sh vocab    GGUF header (one range read) + Hugging Face tokenizer files
 #   scripts/fixtures.sh model    the full 0.8B BF16 GGUF (1.5 GB)
+#   scripts/fixtures.sh dense    the dense models' full GGUFs (Qwen 3, Llama 3.2, Granite 4.2; 11 GB)
 #   scripts/fixtures.sh llama    llama.cpp at the pinned commit, built for CPU
 #   scripts/fixtures.sh dawn     Dawn (webgpu.h) as libwebgpu_dawn.so; under WSL with
 #                                Visual Studio, also webgpu_dawn.dll staged with DXC
@@ -41,6 +42,17 @@ chat_repo="froggeric/Qwen-Fixed-Chat-Templates"
 chat_rev="855bffc49448e299789730ff92c9b8d834d6cc14"
 chat_file="chat_template.jinja"
 chat_sha256="e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+
+# The dense models, one per architecture (M7), all BF16: compared position by
+# position with llama.cpp, whose activation rounding for quantized weights is
+# discontinuous (see check-quant). Fields: name, GGUF repo,
+# revision, file, SHA-256, header bytes and SHA-256 (the vocab mode's range
+# read), and the upstream tokenizer.json's repo, revision and SHA-256.
+dense_models=(
+	"qwen3 unsloth/Qwen3-0.6B-GGUF 50968a4468ef4233ed78cd7c3de230dd1d61a56b Qwen3-0.6B-BF16.gguf f9c9f1d3c1e21755b82d4e165f88dbbbd4355646d632fb5d6cef7c66ed4ee04e 5951936 6514e3e1284deac8d90fd4f60cabe22891f474c0119979987120d601a33bedf2 Qwen/Qwen3-0.6B c1899de289a04d12100db370d81485cdf75e47ca aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+	"llama unsloth/Llama-3.2-1B-Instruct-GGUF b69aef112e9f895e6f98d7ae0949f72ff09aa401 Llama-3.2-1B-Instruct-BF16.gguf f5d05e90d179fa27c01a049be1574a0201bdc09ba0b345eb85e1dbf3b87610f3 7831168 64144078721b3282c53519e75df603be3f3c976f7d431ca896191aa0a449d03e unsloth/Llama-3.2-1B-Instruct 5a8abab4a5d6f164389b1079fb721cfab8d7126c 6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b"
+	"granite ibm-granite/granite-4.2-3b-GGUF c40945d71cd90f249a56985e8155551a9188dc30 granite-4.2-3b-bf16.gguf 8aad15f38ab5796190c9701b1913fd8f0bef01968a42cd16ffe469831564ef47 3571232 d97b0939ca1a7b4ae9c2d275ecd005c1582367b05e7b392d126befdf02563c3a ibm-granite/granite-4.2-3b 4e9c275e232f10211ec88644d106a1f6a1b60e06 883975314d58743726347caaf2c32ac89afd5ad57222cffbc4f052f2ab27b2d7"
+)
 
 llama_url="https://github.com/ggml-org/llama.cpp.git"
 llama_rev="e09a78a25dec3f42175ad59ecc540a54bed0b9b2"
@@ -87,18 +99,31 @@ fetch() {
 	verify "$path" "$want"
 }
 
+# A GGUF's header (metadata + tensor index) with one HTTP range read.
+fetch_header() {
+	local url="$1" path="$2" bytes="$3" want="$4"
+	if [[ -f "$path" ]] && verify "$path" "$want"; then
+		return 0
+	fi
+	log "range-reading GGUF header ($bytes bytes)"
+	mkdir -p "$(dirname "$path")"
+	curl --fail --location --retry 3 --range "0-$((bytes - 1))" --output "$path.part" "$url"
+	mv "$path.part" "$path"
+	verify "$path" "$want"
+}
+
 # Small fixtures: tokenizer and chat-template parity (CI runs this mode).
 vocab() {
-	local path="$dir/models/$header_file"
-	if [[ ! -f "$path" ]] || ! verify "$path" "$header_sha256"; then
-		log "range-reading GGUF header ($header_bytes bytes)"
-		mkdir -p "$dir/models"
-		curl --fail --location --retry 3 --range "0-$((header_bytes - 1))" --output "$path.part" \
-			"https://huggingface.co/$gguf_repo/resolve/$gguf_rev/$gguf_file"
-		mv "$path.part" "$path"
-		verify "$path" "$header_sha256"
-	fi
-	local entry name sha
+	fetch_header "https://huggingface.co/$gguf_repo/resolve/$gguf_rev/$gguf_file" \
+		"$dir/models/$header_file" "$header_bytes" "$header_sha256"
+	local entry name sha repo rev file file_sha bytes bytes_sha hf hf_rev tok_sha
+	for entry in "${dense_models[@]}"; do
+		read -r name repo rev file file_sha bytes bytes_sha hf hf_rev tok_sha <<<"$entry"
+		fetch_header "https://huggingface.co/$repo/resolve/$rev/$file" \
+			"$dir/models/${file%.gguf}.header.gguf" "$bytes" "$bytes_sha"
+		fetch "https://huggingface.co/$hf/resolve/$hf_rev/tokenizer.json" \
+			"$dir/hf/$name/tokenizer.json" "$tok_sha"
+	done
 	for entry in "${hf_files[@]}"; do
 		read -r name sha <<<"$entry"
 		fetch "https://huggingface.co/$hf_repo/resolve/$hf_rev/$name" \
@@ -112,6 +137,14 @@ vocab() {
 model() {
 	fetch "https://huggingface.co/$gguf_repo/resolve/$gguf_rev/$gguf_file" \
 		"$dir/models/$gguf_file" "$gguf_sha256"
+}
+
+dense() {
+	local entry name repo rev file file_sha rest
+	for entry in "${dense_models[@]}"; do
+		read -r name repo rev file file_sha rest <<<"$entry"
+		fetch "https://huggingface.co/$repo/resolve/$rev/$file" "$dir/models/$file" "$file_sha"
+	done
 }
 
 model27b() {
@@ -212,17 +245,19 @@ dawn() {
 case "${1:-all}" in
 vocab) vocab ;;
 model) model ;;
+dense) dense ;;
 model27b) model27b ;;
 llama) llama ;;
 dawn) dawn ;;
 all)
 	vocab
 	model
+	dense
 	llama
 	dawn
 	;;
 *)
-	log "usage: $0 [all|vocab|model|model27b|llama|dawn]"
+	log "usage: $0 [all|vocab|model|dense|model27b|llama|dawn]"
 	exit 2
 	;;
 esac

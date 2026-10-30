@@ -4,10 +4,12 @@
 //!
 //! 1. Split out added tokens (GGUF token types CONTROL and USER_DEFINED),
 //!    leftmost-longest, on the raw text.
-//! 2. NFC-normalize the remaining segments.
+//! 2. NFC-normalize the remaining segments, for the models whose tokenizer
+//!    declares it (`pretokenize.Kind.nfc`).
 //! 3. Split each segment with the model's pre-tokenizer regex.
 //! 4. Map each piece's bytes to the GPT-2 byte alphabet and apply BPE merges
-//!    in rank order, leftmost first on ties.
+//!    in rank order, leftmost first on ties; with `ignore_merges` (Llama 3),
+//!    a piece that is itself a token is taken whole.
 //!
 //! Token strings borrow from the GGUF bytes, which must outlive the tokenizer.
 
@@ -174,13 +176,24 @@ pub const Tokenizer = struct {
 
     fn encodeSegment(t: *const Tokenizer, gpa: Allocator, raw: []const u8, out: *std.ArrayList(Id)) EncodeError!void {
         if (raw.len == 0) return;
-        const text = try unicode.nfc(gpa, raw);
-        defer gpa.free(text);
+        const normalized = if (t.pre.nfc()) try unicode.nfc(gpa, raw) else null;
+        defer if (normalized) |n| gpa.free(n);
+        const text = normalized orelse raw;
 
         var symbols: std.ArrayList(Id) = .empty;
         defer symbols.deinit(gpa);
+        var mapped: std.ArrayList(u8) = .empty;
+        defer mapped.deinit(gpa);
         var pieces = pretokenize.iterator(t.pre, text);
         while (pieces.next()) |piece| {
+            if (t.pre.ignoresMerges()) {
+                mapped.clearRetainingCapacity();
+                for (piece) |b| try mapped.appendSlice(gpa, t.tokens[t.byte_token[b]]);
+                if (t.ids.get(mapped.items)) |id| {
+                    try out.append(gpa, id);
+                    continue;
+                }
+            }
             symbols.clearRetainingCapacity();
             try symbols.ensureTotalCapacity(gpa, piece.len);
             for (piece) |b| symbols.appendAssumeCapacity(t.byte_token[b]);

@@ -17,6 +17,31 @@ CHAT_TEMPLATE = "hf/Qwen-Fixed-Chat-Templates/chat_template.jinja"
 
 
 @dataclass(frozen=True)
+class DenseModel:
+    """One of scripts/fixtures.sh's dense_models."""
+
+    name: str
+    file: str
+
+    def gguf(self, root: Path) -> Path:
+        return root / "models" / self.file
+
+    def gguf_header(self, root: Path) -> Path:
+        return root / "models" / self.file.replace(".gguf", ".header.gguf")
+
+    def hf_tokenizer(self, root: Path) -> Path:
+        return root / "hf" / self.name / "tokenizer.json"
+
+
+# Mirrors dense_models in scripts/fixtures.sh.
+DENSE_MODELS = (
+    DenseModel("qwen3", "Qwen3-0.6B-BF16.gguf"),
+    DenseModel("llama", "Llama-3.2-1B-Instruct-BF16.gguf"),
+    DenseModel("granite", "granite-4.2-3b-bf16.gguf"),
+)
+
+
+@dataclass(frozen=True)
 class FixturePaths:
     root: Path
 
