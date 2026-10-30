@@ -246,9 +246,6 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
     defer file.deinit(gpa);
     const pool = try zllm.ref.Pool.init(gpa, io, threads);
     defer pool.deinit();
-    var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped.bytes);
-    defer model.deinit();
-
     const tokens = try readTokens(gpa, io, tokens_path);
     defer gpa.free(tokens);
 
@@ -258,8 +255,47 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
     var fw: Io.File.Writer = .init(out_file, io, &buf);
     var rec: RecordWriter = .{ .w = &fw.interface };
 
-    try model.forward(gpa, tokens, pool, .{ .ctx = &rec, .emit = RecordWriter.emit }, act, mtp);
+    const arch = file.get("general.architecture") orelse return error.MissingMetadata;
+    if (arch == .string and std.mem.eql(u8, arch.string, zllm.ref.qwen4exp.model.arch)) {
+        try forwardQwen4exp(gpa, pool, file, mapped.bytes, tokens, &rec);
+    } else {
+        var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped.bytes);
+        defer model.deinit();
+        try model.forward(gpa, tokens, pool, .{ .ctx = &rec, .emit = RecordWriter.emit }, act, mtp);
+    }
     try fw.interface.flush();
+}
+
+/// The Qwen4Exp reference over `tokens` in one step: its graph's
+/// intermediate tensors as records named `<name>-<layer>` (or `<name>`),
+/// as the reference runtime's dump tool names them, then the logits of
+/// every position as `result_output`.
+fn forwardQwen4exp(gpa: std.mem.Allocator, pool: *zllm.ref.Pool, file: zllm.gguf.File, bytes: []const u8, tokens: []const u32, rec: *RecordWriter) !void {
+    const q = zllm.ref.qwen4exp;
+    var model = try q.Model.load(gpa, file, bytes);
+    defer model.deinit();
+    var session = try q.Session.init(gpa, &model, pool, @intCast(tokens.len));
+    defer session.deinit();
+    const Dump = struct {
+        rec: *RecordWriter,
+        err: ?anyerror = null,
+        fn emit(ctx: *anyopaque, name: []const u8, layer: i32, values: []const f32, n: usize) void {
+            const d: *@This() = @ptrCast(@alignCast(ctx));
+            if (d.err != null) return;
+            var name_buf: [64]u8 = undefined;
+            const full = if (layer < 0) name else std.fmt.bufPrint(&name_buf, "{s}-{d}", .{ name, layer }) catch name;
+            RecordWriter.emit(d.rec, full, values, values.len / n, n) catch |e| {
+                d.err = e;
+            };
+        }
+    };
+    var dump: Dump = .{ .rec = rec };
+    session.observer = .{ .ctx = &dump, .func = Dump.emit };
+    const logits = try gpa.alloc(f32, tokens.len * model.h.vocab);
+    defer gpa.free(logits);
+    try session.forward(tokens, logits, true);
+    if (dump.err) |e| return e;
+    try RecordWriter.emit(rec, "result_output", logits, model.h.vocab, tokens.len);
 }
 
 /// Little-endian int32 token ids.

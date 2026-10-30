@@ -427,6 +427,34 @@ instead of with the rejected round's second draw, fails the sampled
 speculation scenario; leaving the discarded sample counted fails the one
 with penalties.
 
+## Qwen3.8-Flash-Next (Gyro-Coder)
+
+[`agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF`](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)
+@ `b7d23f5036e9134b3b84e20e7040ba47bc5e0b4c`, file
+`Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf` (75.8 GB, `qwen4exp`), is a
+125B mixture-of-experts model with 256 experts a layer, stored in the Gyro
+trellis formats. Stock llama.cpp cannot load it; the authority is
+AgentionAI's fork,
+[`agentionai-group/llama.cpp`](https://gitlab.com/agentionai-group/llama.cpp)
+@ `9aa51ce4fdd3435a91531ffe16a17414ccc6dc6f`. The format decoder, the PLE
+row hash and the CPU graph were lifted from gyro-dx, a native D3D12 engine
+for the same model whose CPU and GPU paths had reproduced that runtime's
+greedy tokens.
+
+| Check | Result |
+|---|---|
+| Gyro decoder and rotation vs the upstream C reference (`zig build test`) | 512 blocks over all eight types, and rotations at widths 640 and 2,560: bit for bit |
+| PLE rows vs a C oracle of the upstream hash | 8 token histories and a 64-bit wrap: identical |
+| CPU reference (`zllm forward`), 26 prompt tokens and the reference runtime's 40 greedy tokens, teacher-forced | argmax at each of the 40 positions is the runtime's greedy token: 40/40 |
+| The same vs gyro-dx's CPU engine | every layer's expert routing identical; layer outputs within 3.4e-5 relative L2; PLE rows exact |
+| The same vs the reference runtime's dumps | 1.5% relative L2 after layer 0, growing to 25% at layer 47 |
+
+The last row is the reference runtime's own rounding: it computes its
+multiplies from activations rounded to 8-bit blocks, and through 48 layers
+of hyper-connected streams the difference grows, as it did for the 27B
+before the reference learned that rounding ([The 27B](#the-27b)). The
+routing and the greedy tokens are unaffected.
+
 ## GPU safety
 
 The spec allows no submission over 250 ms and no device hang in a soak

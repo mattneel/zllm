@@ -23,6 +23,9 @@ test {
     _ = ref.ops;
     _ = ref.tensor;
     _ = ref.gyro;
+    _ = ref.qwen4exp.ple;
+    _ = ref.qwen4exp.kernels;
+    _ = ref.qwen4exp.engine;
     _ = @import("ref/pool.zig");
     _ = ref.matmul;
     _ = gpu.cmd;
