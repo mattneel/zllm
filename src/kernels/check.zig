@@ -1484,7 +1484,9 @@ fn checkMoeCombine(c: *Ctx) !Result {
 
 /// The hyper-connection mixer's own kernels for 3 tokens of 4 streams:
 /// the streams' norms (rmsnorm with a weight row per stream), the low-rank
-/// activation, the mix, and the combine into the residual streams.
+/// activation, the mix, and the combine into the residual streams. The
+/// activation and the combine read the down projection's rows as the
+/// stacked multiply leaves them: the rank columns, then the inject's.
 fn checkHc(c: *Ctx) !Result {
     const hc = 4;
     const e = 256;
@@ -1493,19 +1495,20 @@ fn checkHc(c: *Ctx) !Result {
     const eps = 1e-6;
     const res = try c.random(tokens * hc * e, 2);
     const wn = try c.random(hc * e, 1);
-    const lo = try c.random(tokens * rank, 3);
+    const stride = rank + hc;
+    const down = try c.random(tokens * stride, 3);
     const gate = try c.random(tokens * hc * e, 3);
     const block = try c.random(tokens * e, 1);
-    const inject = try c.random(tokens * hc, 4);
     const xn = try c.output(tokens * hc * e);
-    const lo_a = try c.upload(lo);
+    const down_a = try c.upload(down);
+    const lo_a = try c.output(tokens * rank);
     const mixed = try c.output(tokens * e);
     const res_a = try c.upload(res);
     const l = c.launcher();
     try l.launch(.rmsnorm, P.RmsNorm{ .rows = tokens * hc, .dim = e, .eps = eps, .w_rows = hc }, &.{ res_a, try c.upload(wn), xn }, .{ tokens * hc, 1, 1 });
-    try l.launch(.hc_act, P.HcAct{ .count = tokens * rank, .hc = hc }, &.{lo_a}, .{ 1, 1, 1 });
+    try l.launch(.hc_act, P.HcAct{ .count = tokens * rank, .hc = hc, .rank = rank, .stride = stride }, &.{ down_a, lo_a }, .{ 1, 1, 1 });
     try l.launch(.hc_mix, P.Hc{ .dim = e, .hc = hc }, &.{ xn, try c.upload(gate), mixed }, .{ 1, tokens, 1 });
-    try l.launch(.hc_combine, P.Hc{ .dim = e, .hc = hc }, &.{ try c.upload(block), try c.upload(inject), res_a }, .{ 1, tokens, 1 });
+    try l.launch(.hc_combine, P.HcCombine{ .dim = e, .hc = hc, .stride = stride, .offset = rank }, &.{ try c.upload(block), down_a, res_a }, .{ 1, tokens, 1 });
     const got = .{ try c.read(xn), try c.read(lo_a), try c.read(mixed), try c.read(res_a) };
     const want_xn = try c.arena.alloc(f64, tokens * hc * e);
     const want_lo = try c.arena.alloc(f64, tokens * rank);
@@ -1517,15 +1520,15 @@ fn checkHc(c: *Ctx) !Result {
         const s = 1 / @sqrt(ss / e + eps);
         for (0..e) |i| want_xn[r * e + i] = res[r * e + i] * s * wn[(r % hc) * e + i];
     }
-    for (want_lo, lo) |*w, v| {
-        const a = @as(f64, v) / hc;
+    for (want_lo, 0..) |*w, i| {
+        const a = @as(f64, down[i / rank * stride + i % rank]) / hc;
         w.* = a * sigmoid64(a);
     }
     for (0..tokens) |t| for (0..e) |i| {
         var acc: f64 = 0;
         for (0..hc) |ch| acc += want_xn[(t * hc + ch) * e + i] * sigmoid64(gate[(t * hc + ch) * e + i]);
         want_mix[t * e + i] = acc / hc;
-        for (0..hc) |ch| want_res[(t * hc + ch) * e + i] = res[(t * hc + ch) * e + i] + block[t * e + i] * 2 * sigmoid64(inject[t * hc + ch] / hc);
+        for (0..hc) |ch| want_res[(t * hc + ch) * e + i] = res[(t * hc + ch) * e + i] + block[t * e + i] * 2 * sigmoid64(down[t * stride + rank + ch] / hc);
     };
     const err = @max(@max(relErr(got[0], want_xn), relErr(got[1], want_lo)), @max(relErr(got[2], want_mix), relErr(got[3], want_res)));
     return .{ .name = "hyper-connection norm, act, mix, combine", .err = err, .tolerance = 1e-6 };

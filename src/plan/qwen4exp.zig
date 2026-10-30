@@ -37,11 +37,12 @@ pub const max_context = 2048;
 /// PLE rows a token reads.
 pub const ple_heads = ple.heads;
 
+/// A hyper-connection mixer. `down` also holds the stream weights' rows
+/// (inject) after its rank rows, where the mixer has them: one multiply.
 const Hc = struct {
     norm: Arg,
     down: Matrix,
     up: Matrix,
-    inject: ?Matrix,
 };
 
 const Linear = struct {
@@ -131,7 +132,6 @@ pub const Model = struct {
     fn eachHc(h: *const Hc, context: anytype, comptime f: fn (@TypeOf(context), *const Matrix) void) void {
         f(context, &h.down);
         f(context, &h.up);
-        if (h.inject) |*i| f(context, i);
     }
 
     /// Records the upload of every weight but the PLE table. Only TQ2_T
@@ -197,7 +197,6 @@ pub const Model = struct {
                 .norm = try u.vector("output_hc_norm.weight", null, hd),
                 .down = try u.matrix("output_hc_down.weight", null, hd, hp.hc_rank),
                 .up = try u.matrix("output_hc_up.weight", null, hp.hc_rank, hd),
-                .inject = null,
             },
             .layers = layers,
             .signs_embd = try upload32(gpa, rec, signs.embd),
@@ -236,9 +235,11 @@ fn uploadHc(u: *Upload, hp: Hparams, i: usize, comptime which: []const u8) Model
     const hd: u64 = hp.hcDim();
     return .{
         .norm = try u.vector("blk.{d}.hc_" ++ which ++ "_norm.weight", i, hd),
-        .down = try u.matrix("blk.{d}.hc_" ++ which ++ "_down.weight", i, hd, hp.hc_rank),
+        .down = try u.stacked(i, hd, &.{
+            .{ "blk.{d}.hc_" ++ which ++ "_down.weight", hp.hc_rank },
+            .{ "blk.{d}.hc_" ++ which ++ "_inject.weight", hp.hc },
+        }),
         .up = try u.matrix("blk.{d}.hc_" ++ which ++ "_up.weight", i, hp.hc_rank, hd),
-        .inject = try u.matrix("blk.{d}.hc_" ++ which ++ "_inject.weight", i, hd, hp.hc),
     };
 }
 
@@ -374,8 +375,9 @@ pub const Program = struct {
         const cur = try a.storage(cap * e);
         const xn = try a.storage(cap * hd);
         const lo = try a.storage(cap * @as(u64, hp.hc_rank));
+        // The mixers' down projections with their inject columns.
+        const hc_down = try a.storage(cap * (@as(u64, hp.hc_rank) + hp.hc));
         const gate = try a.storage(cap * hd);
-        const inject = try a.storage(cap * @as(u64, hp.hc));
         const block = try a.storage(cap * e);
         const logits = try a.storage(cap * @as(u64, hp.vocab));
         // Linear attention.
@@ -473,21 +475,23 @@ pub const Program = struct {
         // (recordStep copies each token's embedding into its hc streams.)
         const embed_end = body.items.len;
 
-        const hcn: P.Hc = .{ .dim = hp.n_embd, .hc = hp.hc };
         const col_groups: u32 = std.math.divCeil(u32, hp.n_embd, 256) catch unreachable;
         const Mix = struct {
-            /// The streams' norms, the low-rank gate, the mix into `cur`,
-            /// and (with an inject matrix) the stream weights.
+            /// The streams' norms, the down projection (with the stream
+            /// weights, where the mixer has them), the low-rank gate, and the
+            /// mix into `cur`.
             fn build(list: *std.ArrayList(Item), bb: *kernels.Builder, m_: Mm, al_: Allocator, h: *const Hc, hp_: Hparams, bufs: anytype) Program.BuildError!void {
                 try list.append(al_, .{ .launch = try bb.add(.rmsnorm, P.RmsNorm{ .rows = 0, .dim = hp_.n_embd, .eps = hp_.eps, .w_rows = hp_.hc }, &.{ bufs.res, h.norm, bufs.xn }, .rows_x), .mul = hp_.hc });
-                try add(list, al_, try m_.vector(bufs.lo, bufs.xn, &h.down, .{}));
-                try list.append(al_, .{ .launch = try bb.add(.hc_act, P.HcAct{ .count = kernels.decode_max_rows * hp_.hc_rank, .hc = hp_.hc }, &.{bufs.lo}, .{ .elems = hp_.hc_rank }) });
+                try add(list, al_, try m_.vector(bufs.down, bufs.xn, &h.down, .{}));
+                const silu: P.HcAct = .{ .count = kernels.decode_max_rows * hp_.hc_rank, .hc = hp_.hc, .rank = hp_.hc_rank, .stride = @intCast(h.down.n) };
+                try list.append(al_, .{ .launch = try bb.add(.hc_act, silu, &.{ bufs.down, bufs.lo }, .{ .elems = hp_.hc_rank }) });
                 try add(list, al_, try m_.vector(bufs.gate, bufs.lo, &h.up, .{}));
                 try list.append(al_, .{ .launch = try bb.add(.hc_mix, P.Hc{ .dim = hp_.n_embd, .hc = hp_.hc }, &.{ bufs.xn, bufs.gate, bufs.cur }, .{ .rows_y = bufs.col_groups }) });
-                if (h.inject) |*inj| try add(list, al_, try m_.vector(bufs.inject, bufs.xn, inj, .{}));
             }
         };
-        const bufs = .{ .res = res, .xn = xn, .lo = lo, .gate = gate, .cur = cur, .inject = inject, .col_groups = col_groups };
+        const bufs = .{ .res = res, .xn = xn, .down = hc_down, .lo = lo, .gate = gate, .cur = cur, .col_groups = col_groups };
+        // hc_combine reads the inject weights the last mix left in `down`.
+        const combine: P.HcCombine = .{ .dim = hp.n_embd, .hc = hp.hc, .stride = hp.hc_rank + hp.hc, .offset = hp.hc_rank };
 
         var lin_i: u64 = 0;
         const route_end = try arena.alloc(usize, hp.n_layer);
@@ -571,7 +575,7 @@ pub const Program = struct {
                     try add(&body, arena, try mm.vector(block, att, &w.wo, .{}));
                 },
             }
-            try body.append(arena, .{ .launch = try b.add(.hc_combine, hcn, &.{ block, inject, res }, .{ .rows_y = col_groups }) });
+            try body.append(arena, .{ .launch = try b.add(.hc_combine, combine, &.{ block, hc_down, res }, .{ .rows_y = col_groups }) });
 
             // The experts.
             try Mix.build(&body, &b, mm, arena, &layer.hc_ffn, hp, bufs);
@@ -602,7 +606,7 @@ pub const Program = struct {
             try add(&body, arena, try mm.vector(sh_act, cur, &layer.sh_gu, .{ .silu_pair = hp.n_ff_shexp }));
             try add(&body, arena, try mm.vector(sh_out, sh_act, &layer.sh_down, .{}));
             try body.append(arena, .{ .launch = try b.add(.moe_combine, P.MoeCombine{ .n_used = hp.n_expert_used, .dim = hp.n_embd }, &.{ down, weights, sh_out, shared_logit, block }, .{ .rows_y = col_groups }) });
-            try body.append(arena, .{ .launch = try b.add(.hc_combine, hcn, &.{ block, inject, res }, .{ .rows_y = col_groups }) });
+            try body.append(arena, .{ .launch = try b.add(.hc_combine, combine, &.{ block, hc_down, res }, .{ .rows_y = col_groups }) });
             le.* = body.items.len;
         }
 

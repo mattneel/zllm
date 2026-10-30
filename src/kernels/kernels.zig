@@ -417,9 +417,11 @@ pub const params = struct {
     pub const MoeRoute = extern struct { n_expert: u32, n_used: u32, cols: u32, x_stride: u32, scale: f32 = 0, _pad: [3]u32 = @splat(0) };
     pub const Rotate128 = extern struct { width: u32, x_stride: u32, y_stride: u32, silu_pair: u32 = 0 };
     pub const MoeCombine = extern struct { n_used: u32, dim: u32, _pad: [2]u32 = @splat(0) };
-    pub const HcAct = extern struct { count: u32, hc: u32, _pad: [2]u32 = @splat(0) };
-    /// hc_mix and hc_combine.
+    /// `count` = rows · rank; the down rows are `stride` wide.
+    pub const HcAct = extern struct { count: u32, hc: u32, rank: u32, stride: u32 };
     pub const Hc = extern struct { dim: u32, hc: u32, _pad: [2]u32 = @splat(0) };
+    /// The inject weights at row t's `offset + c`, rows `stride` apart.
+    pub const HcCombine = extern struct { dim: u32, hc: u32, stride: u32, offset: u32 };
     pub const PleMix = extern struct { dim: u32, hc: u32, eps: f32, _pad: u32 = 0 };
     pub const PleConv = extern struct { channels: u32, taps: u32, dilation: u32, _pad: u32 = 0 };
     pub const GyroMatvec = extern struct {

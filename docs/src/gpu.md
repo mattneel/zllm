@@ -277,6 +277,13 @@ computes the same thing.
   experts, `rotate128` of their SiLU pair, the down experts, the shared
   expert, `moe_combine`, `hc_combine`.
 
-On the RTX 5090 Laptop, `zllm generate` loads it warm in 16 to 20 s
-(weights 11 to 14 s, tuning 5 s), prefills at 56 tok/s and decodes at 29
-tok/s, one step per batch.
+On the RTX 5090 Laptop, `zllm generate` loads it warm in 16 to 24 s
+(weights 11 to 15 s, tuning 5 to 7 s), prefills at 73 to 77 tok/s and
+decodes at 35 to 37 tok/s, one step per batch. The model takes about 21 of
+the card's 24 GB: with another 20 GB process on the GPU (a second copy of
+the model in a browser), Windows moved buffers into shared system memory
+and decoding fell to 6 tok/s.
+
+Each hyper-connection mixer's down projection carries the stream weights'
+(inject) rows: 324 rows in one multiply instead of 320, then 4 rows of
+10,240 in a single workgroup (38 µs, 96 times a step, 3.7 ms).
