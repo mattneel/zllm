@@ -40,16 +40,17 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair, checkMatmulF16,       checkMatvecNormF16,     checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,        checkEmbed,           checkRopeAppendF32,     checkRopeAppendF16,     checkAttentionF32,
-        checkAttentionF16,   checkAttnDecode,      checkDeltaPrep,         checkDeltaKeep,         checkDeltaRule,
-        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,        checkSamplePlain,
-        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,       Quant(.q8_0).matvec,
-        Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,    Quant(.q3_k).embed,
-        Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,    Quant(.q5_k).matmul,
-        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,     checkQuantTiles,
-        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,      checkQuantizeSilu,
+        checkRmsNorm,        checkMatmul,         checkMatmulChunked,   checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair, checkMatmulF16,      checkMatvecNormF16,   checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,        checkEmbed,          checkRopeAppendF32,   checkRopeAppendF16,     checkAttentionF32,
+        checkAttentionF16,   checkAttnDecode,     checkDeltaPrep,       checkDeltaKeep,         checkDeltaRule,
+        checkDraft,          checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
+        checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
+        Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,
+        Quant(.q3_k).embed,  Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,
+        Quant(.q5_k).matmul, Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,
+        checkQuantTiles,     checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,
+        checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -1199,6 +1200,23 @@ fn sampleCase(c: *Ctx, name: []const u8, vocab: u32, p: sampler.Params, trials: 
 const draw_tolerance = 1e-6;
 
 const test_bias = [_]sampler.Bias{ .{ .token = 3, .bias = 9 }, .{ .token = 17, .bias = -50 }, .{ .token = 900, .bias = 4.5 } };
+
+/// The draft: the first index of the maximum of the second of two rows of
+/// the Qwen vocabulary, written to slot 1; the maximum is planted twice, so
+/// the lower index must win.
+fn checkDraft(c: *Ctx) !Result {
+    const vocab = 248320;
+    const logits = try c.random(2 * vocab, 4);
+    const row = logits[vocab..];
+    for (row) |*v| v.* = @min(v.*, 10);
+    row[700] = 11;
+    row[123456] = 11;
+    logits[5] = 99; // the other row's maximum
+    const out = try c.output(2);
+    try c.launcher().launch(.draft, P.Draft{ .vocab = vocab, .row = vocab, .slot = 1 }, &.{ try c.upload(logits), out }, .{ 1, 1, 1 });
+    const got = (try c.readWords(out))[1];
+    return .{ .name = "draft (argmax, ties to the lower id)", .err = @floatFromInt(@intFromBool(got != 700)), .tolerance = 0 };
+}
 
 fn checkSampleGreedy(c: *Ctx) !Result {
     return sampleCase(c, "sample greedy+penalties", 32000, .{

@@ -36,6 +36,9 @@
 //
 // The token goes to st[0] (st[1] = 1 if it is a stop token) and to next[0],
 // the embedding input of the next step; its output count is bumped.
+//
+//   unbump     undoes the last draw's count: a speculative step's second
+//              sample, discarded with its rejected draft
 
 struct Phase {
     phase: u32,
@@ -90,6 +93,7 @@ const PICK: u32 = 7u;
 const BISECT_INIT: u32 = 8u;
 const BISECT_MASS: u32 = 9u;
 const BISECT_STEP: u32 = 10u;
+const UNBUMP: u32 = 11u;
 
 const WG: u32 = 256u;
 const PER: u32 = 4u;
@@ -527,6 +531,11 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
                     }
                     sto(S_TAU, ld(S_LO));
                 }
+            }
+        }
+        case UNBUMP: {
+            if (lid == 0u) {
+                counts[ld(S_TOKEN)] -= 1u;
             }
         }
         case PICK: {

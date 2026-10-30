@@ -108,7 +108,8 @@ unit decodes from one load (128 bytes per block).
 | `matmul_reduce` | Adds up a quantized prefill multiply split over k | A matrix with too few column tiles to fill the GPU (a 5,120-row projection has 40) splits k into slices, aiming at 256 workgroups; each slice writes partial sums, and this adds them into the output |
 | `repad`, `repack_q3_k` | Lay out Q6_K (padded) and Q3_K (repacked) blocks at load | Each chunk's rows go to a staging buffer, freed after the chunk's own submit |
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
-| `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling) |
+| `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling). One more phase undoes the last draw's output count (a rejected speculative round's second sample) |
+| `draft` | The speculative draft: the first index of the maximum of a row of logits, into the next step's token input | One workgroup |
 
 These are plain WGSL. M4 makes them templates tuned per GPU; the decode
 kernels above are its first part, measured with `zllm bench`

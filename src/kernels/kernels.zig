@@ -37,6 +37,7 @@ pub const Kernel = enum {
     gated_norm,
     mark_tokens,
     sample,
+    draft,
     repad,
     repack_q3_k,
     quantize_q8,
@@ -323,6 +324,7 @@ pub const params = struct {
         kept_hist: u32 = 0,
         _pad: u32 = 0,
     };
+    pub const Draft = extern struct { vocab: u32, row: u32, slot: u32, _pad: u32 = 0 };
     /// Which phase of `sample` a launch runs.
     pub const SamplePhase = extern struct { phase: u32, round: u32 = 0, _pad: [2]u32 = @splat(0) };
     pub const GatedNorm = extern struct {
@@ -364,6 +366,8 @@ pub const SamplePhase = enum(u32) {
     bisect_init,
     bisect_mass,
     bisect_step,
+    /// Not part of a draw: undoes the last draw's output count.
+    unbump,
 
     /// Whether the phase runs one workgroup per `sample_span` tokens.
     pub fn wide(ph: SamplePhase) bool {
