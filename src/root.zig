@@ -34,4 +34,5 @@ test {
     _ = ref.matmul;
     _ = gpu.cmd;
     _ = @import("tokenizer/stream.zig");
+    _ = @import("chat/jinja.zig");
 }

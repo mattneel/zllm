@@ -70,6 +70,47 @@ class FixturePaths:
         return self.root / "llama.cpp" / "gguf-py"
 
 
+def gguf_metadata(path: Path) -> dict:
+    """A GGUF's metadata (key → value), from its header alone (gguf-py's reader maps tensor data too)."""
+    import struct
+
+    data = path.read_bytes()
+    pos = 0
+    scalars = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+
+    def read(fmt: str):
+        nonlocal pos
+        (v,) = struct.unpack_from(fmt, data, pos)
+        pos += struct.calcsize(fmt)
+        return v
+
+    def string() -> str:
+        nonlocal pos
+        n = read("<Q")
+        s = data[pos : pos + n].decode("utf-8", "surrogateescape")
+        pos += n
+        return s
+
+    def value(t: int):
+        if t == 8:
+            return string()
+        if t == 9:
+            et, n = read("<I"), read("<Q")
+            return [value(et) for _ in range(n)]
+        return read(scalars[t])
+
+    if data[:4] != b"GGUF":
+        raise SystemExit(f"{path} is not a GGUF file")
+    pos = 8
+    read("<Q")
+    n_kv = read("<Q")
+    meta = {}
+    for _ in range(n_kv):
+        key = string()
+        meta[key] = value(read("<I"))
+    return meta
+
+
 def import_pinned_gguf(paths: FixturePaths):
     """gguf-py from the pinned llama.cpp checkout, not whatever is on PyPI."""
     if not paths.gguf_py.is_dir():

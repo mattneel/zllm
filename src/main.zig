@@ -29,9 +29,11 @@ const usage =
     \\                                       token i + 2 at each position
     \\  dequant <type> <in.bin> <out.f32>  decode raw blocks of a GGML type (q8_0, q3_k, q4_k,
     \\                                       q5_k, q6_k, f16, bf16) to little-endian f32
-    \\  chat-render <cases.jsonl>           for each {"name", "messages", "options"} line, print
+    \\  chat-render <cases.jsonl> [<model.gguf> --now <unix seconds>]
+    \\                                       for each {"name", "messages", "options"} line, print
     \\                                       {"name": ..., "text": ...}: the prompt in the fixed Qwen
-    \\                                       chat template
+    \\                                       chat template, or with the model's own template (options
+    \\                                       as its keyword arguments; {"name", "error"} where it fails)
     \\  gpu-info                            open Dawn and print the adapter and limits as JSON
     \\  gpu-check                           check every GPU kernel against a CPU computation
     \\  bench <model.gguf> [tokens]          time decode steps after a context of `tokens` (default
@@ -172,10 +174,16 @@ pub fn main(init: std.process.Init) !void {
         try zllm.ref.tensor.dequantize(t, in, values);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = args[4], .data = std.mem.sliceAsBytes(values) });
     } else if (std.mem.eql(u8, cmd, "chat-render")) {
-        if (args.len != 3) return fail(usage);
+        if (args.len != 3 and args.len != 6) return fail(usage);
         const cases = try Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .unlimited);
         defer gpa.free(cases);
-        try chatRender(gpa, cases, out);
+        if (args.len == 3) {
+            try chatRender(gpa, cases, out);
+        } else {
+            if (!std.mem.eql(u8, args[4], "--now")) return fail(usage);
+            const now = std.fmt.parseInt(i64, args[5], 10) catch return fail(usage);
+            try chatRenderTemplate(gpa, io, cases, args[3], zllm.chat.jinja.Date.fromUnix(now), out);
+        }
     } else if (std.mem.eql(u8, cmd, "gpu-info")) {
         if (args.len != 2) return fail(usage);
         try gpuInfo(gpa, init.environ_map, out);
@@ -237,6 +245,52 @@ fn chatRender(gpa: std.mem.Allocator, cases: []const u8, out: *Io.Writer) !void 
         try zllm.chat.render(gpa, parsed.value.messages, parsed.value.options, &text);
         var s: std.json.Stringify = .{ .writer = out };
         try s.write(.{ .name = parsed.value.name, .text = text.items });
+        try out.writeByte('\n');
+    }
+}
+
+/// chat-render with a model's own template: each case's messages, and its
+/// options as the template's keyword arguments (tools among them), at
+/// time `now`. A case the template refuses prints its error instead.
+fn chatRenderTemplate(gpa: std.mem.Allocator, io: Io, cases: []const u8, model_path: []const u8, now: zllm.chat.jinja.Date, out: *Io.Writer) !void {
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, model_path, gpa, .unlimited);
+    defer gpa.free(bytes);
+    var file = try zllm.gguf.parse(gpa, bytes, false);
+    defer file.deinit(gpa);
+    var tok = try zllm.tokenizer.Tokenizer.load(gpa, file);
+    defer tok.deinit(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tmpl = try zllm.chat.Template.fromGguf(arena, file, &tok) orelse return error.NoChatTemplate;
+
+    var lines = std.mem.splitScalar(u8, cases, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, line, .{ .parse_numbers = false });
+        const case = parsed.value.object;
+        var kwargs = if (case.get("options")) |o| try o.object.clone(arena) else std.json.ObjectMap.empty;
+        const tools = kwargs.get("tools");
+        _ = kwargs.orderedRemove("tools");
+        const gen_prompt = kwargs.get("add_generation_prompt");
+        _ = kwargs.orderedRemove("add_generation_prompt");
+        var text: std.ArrayList(u8) = .empty;
+        var raised: ?[]const u8 = null;
+        const name = case.get("name").?.string;
+        var s: std.json.Stringify = .{ .writer = out };
+        if (tmpl.render(arena, .{
+            .messages = case.get("messages").?,
+            .tools = tools,
+            .add_generation_prompt = if (gen_prompt) |g| g.bool else true,
+            .kwargs = kwargs,
+            .now = now,
+        }, &text, &raised)) |_| {
+            try s.write(.{ .name = name, .text = text.items });
+        } else |err| switch (err) {
+            error.Raised => try s.write(.{ .name = name, .@"error" = raised.? }),
+            error.TemplateError, error.TemplateSyntax => try s.write(.{ .name = name, .@"error" = @errorName(err) }),
+            else => return err,
+        }
         try out.writeByte('\n');
     }
 }

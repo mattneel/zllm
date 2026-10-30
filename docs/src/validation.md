@@ -115,6 +115,25 @@ don't parse.
 
 Joining merged system messages with one newline instead of two fails it.
 
+The other models chat in their own GGUF template (`tokenizer.chat_template`),
+which zllm renders with its Jinja interpreter (`src/chat/jinja.zig`).
+`check-chat` renders the same 44 conversations with each dense model's
+template, through zllm and through jinja2 set up as transformers sets it up
+(its `tojson`, `raise_exception` and `strftime_now`, the clock fixed on both
+sides), and requires byte-identical prompts, or both refusing:
+
+| Template | Match | Refused by both |
+|---|---|---|
+| Qwen3-0.6B | 44 | 0 |
+| Llama-3.2-1B-Instruct | 43 | 1 (more than one tool call in a turn) |
+| Granite 4.2 3B | 44 | 0 |
+
+Dropping `trim_blocks`' newline fails all 44 of Granite's, dropping
+`lstrip_blocks` 23, `tojson` without its space after commas 20 across the
+three, and strings not counting as iterable 6 of Llama's. The interpreter's
+unit tests pin the rest of its Python semantics: `str()` of values, floor
+division, code-point indexing and slicing, scopes, macros.
+
 ## Reference forward pass
 
 `check-forward` runs `zllm forward` and `llama-dump`

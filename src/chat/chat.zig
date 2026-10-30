@@ -18,6 +18,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+pub const jinja = @import("jinja.zig");
+const gguf = @import("../gguf/gguf.zig");
+const tokenizer = @import("../tokenizer/tokenizer.zig");
 
 /// Whether `render` writes the prompt format of models of GGUF
 /// architecture `arch`: Qwen 3.5–3.8 and the Gyro-Coder use this template;
@@ -25,6 +28,65 @@ const Allocator = std.mem.Allocator;
 pub fn supports(arch: []const u8) bool {
     return std.mem.eql(u8, arch, "qwen35") or std.mem.eql(u8, arch, "qwen4exp");
 }
+
+/// A model's own chat template (GGUF `tokenizer.chat_template`), rendered by
+/// zllm.chat.jinja as transformers' apply_chat_template renders it. For the
+/// models `supports` does not cover.
+pub const Template = struct {
+    tmpl: jinja.Template,
+    bos: ?[]const u8,
+    eos: ?[]const u8,
+
+    /// Parses `source`, which the template borrows, from `arena`. `bos` and
+    /// `eos` are the special tokens' text (transformers' bos_token, eos_token).
+    pub fn parse(arena: Allocator, source: []const u8, bos: ?[]const u8, eos: ?[]const u8) jinja.Error!Template {
+        return .{ .tmpl = try jinja.Template.parse(arena, source), .bos = bos, .eos = eos };
+    }
+
+    pub const Input = struct {
+        /// The messages as the request gives them (a JSON array).
+        messages: std.json.Value,
+        /// The functions offered (a JSON array), or null.
+        tools: ?std.json.Value = null,
+        add_generation_prompt: bool = true,
+        /// More keyword arguments for the template (enable_thinking,
+        /// reasoning_effort, date_string, ...), as vLLM's chat_template_kwargs.
+        kwargs: ?std.json.ObjectMap = null,
+        /// The time strftime_now formats; null leaves it undefined.
+        now: ?jinja.Date = null,
+    };
+
+    /// The template `file` carries (copied into `arena`: the header may not
+    /// outlive the load), with `tok`'s special tokens; null if it has none.
+    pub fn fromGguf(arena: Allocator, file: gguf.File, tok: *const tokenizer.Tokenizer) jinja.Error!?Template {
+        const src = file.get("tokenizer.chat_template") orelse return null;
+        if (src != .string) return null;
+        return try parse(
+            arena,
+            try arena.dupe(u8, src.string),
+            if (tok.bos) |id| tok.tokens[id] else null,
+            if (tok.eos) |id| tok.tokens[id] else null,
+        );
+    }
+
+    /// Renders `in` into `out`, from `arena`. On error.Raised, `raised` has
+    /// the template's raise_exception message.
+    pub fn render(t: Template, arena: Allocator, in: Input, out: *std.ArrayList(u8), raised: *?[]const u8) jinja.Error!void {
+        var globals: std.ArrayList(jinja.Template.Global) = .empty;
+        try globals.append(arena, .{ .name = "messages", .value = try jinja.fromJson(arena, in.messages) });
+        // transformers always passes tools and documents, None when absent.
+        try globals.append(arena, .{ .name = "tools", .value = if (in.tools) |v| try jinja.fromJson(arena, v) else .none });
+        try globals.append(arena, .{ .name = "documents", .value = .none });
+        try globals.append(arena, .{ .name = "add_generation_prompt", .value = .{ .boolean = in.add_generation_prompt } });
+        if (t.bos) |s| try globals.append(arena, .{ .name = "bos_token", .value = .{ .string = s } });
+        if (t.eos) |s| try globals.append(arena, .{ .name = "eos_token", .value = .{ .string = s } });
+        if (in.kwargs) |kw| {
+            var it = kw.iterator();
+            while (it.next()) |e| try globals.append(arena, .{ .name = e.key_ptr.*, .value = try jinja.fromJson(arena, e.value_ptr.*) });
+        }
+        try t.tmpl.render(arena, globals.items, in.now, out, raised);
+    }
+};
 
 pub const Role = enum { system, developer, user, assistant, tool };
 
