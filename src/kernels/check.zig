@@ -37,17 +37,18 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair, checkMatmulF16,       checkMatvecNormF16,     checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,        checkEmbed,           checkRopeAppendF32,     checkRopeAppendF16,     checkAttentionF32,
-        checkAttentionF16,   checkAttnDecode,      checkDeltaPrep,         checkDeltaKeep,         checkDeltaRule,
-        checkDraft,          checkGyroMatvec,      checkMoeRoute,          checkRotate128,         checkMoeCombine,
-        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,        checkSamplePlain,
-        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,       Quant(.q8_0).matvec,
-        Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,    Quant(.q3_k).embed,
-        Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,    Quant(.q5_k).matmul,
-        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,     checkQuantTiles,
-        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,      checkQuantizeSilu,
+        checkRmsNorm,        checkMatmul,         checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair, checkMatmulF16,      checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,        checkEmbed,          checkRopeAppendF32,  checkRopeAppendF16,     checkAttentionF32,
+        checkAttentionF16,   checkAttnDecode,     checkDeltaPrep,      checkDeltaKeep,         checkDeltaRule,
+        checkDraft,          checkGyroMatvec,     checkMoeRoute,       checkRotate128,         checkMoeCombine,
+        checkHc,             checkPle,            checkSampleGreedy,   checkSampleTopKTopP,    checkSampleMinP,
+        checkSampleTopP,     checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK,   checkSampleTopKSkipped,
+        checkSampleVocab,    Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,     Quant(.q3_k).matvec,
+        Quant(.q3_k).matmul, Quant(.q3_k).embed,  Quant(.q4_k).matvec, Quant(.q4_k).matmul,    Quant(.q4_k).embed,
+        Quant(.q5_k).matvec, Quant(.q5_k).matmul, Quant(.q5_k).embed,  Quant(.q6_k).matvec,    Quant(.q6_k).matmul,
+        Quant(.q6_k).embed,  checkQuantTiles,     checkQuantSiluPair,  checkQuantizeQ8K,       checkQuantizeQ80,
+        checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -1378,6 +1379,127 @@ fn checkMoeCombine(c: *Ctx) !Result {
         want[t * dim + i] = acc + sigmoid64(logit[t]) * shared[t * dim + i];
     };
     return .{ .name = "moe_combine", .err = relErr(got, want), .tolerance = 1e-6 };
+}
+
+/// The hyper-connection mixer's own kernels for 3 tokens of 4 streams:
+/// the streams' norms (rmsnorm with a weight row per stream), the low-rank
+/// activation, the mix, and the combine into the residual streams.
+fn checkHc(c: *Ctx) !Result {
+    const hc = 4;
+    const e = 256;
+    const tokens = 3;
+    const rank = 32;
+    const eps = 1e-6;
+    const res = try c.random(tokens * hc * e, 2);
+    const wn = try c.random(hc * e, 1);
+    const lo = try c.random(tokens * rank, 3);
+    const gate = try c.random(tokens * hc * e, 3);
+    const block = try c.random(tokens * e, 1);
+    const inject = try c.random(tokens * hc, 4);
+    const xn = try c.output(tokens * hc * e);
+    const lo_a = try c.upload(lo);
+    const mixed = try c.output(tokens * e);
+    const res_a = try c.upload(res);
+    const l = c.launcher();
+    try l.launch(.rmsnorm, P.RmsNorm{ .rows = tokens * hc, .dim = e, .eps = eps, .w_rows = hc }, &.{ res_a, try c.upload(wn), xn }, .{ tokens * hc, 1, 1 });
+    try l.launch(.hc_act, P.HcAct{ .count = tokens * rank, .hc = hc }, &.{lo_a}, .{ 1, 1, 1 });
+    try l.launch(.hc_mix, P.Hc{ .dim = e, .hc = hc }, &.{ xn, try c.upload(gate), mixed }, .{ 1, tokens, 1 });
+    try l.launch(.hc_combine, P.Hc{ .dim = e, .hc = hc }, &.{ try c.upload(block), try c.upload(inject), res_a }, .{ 1, tokens, 1 });
+    const got = .{ try c.read(xn), try c.read(lo_a), try c.read(mixed), try c.read(res_a) };
+    const want_xn = try c.arena.alloc(f64, tokens * hc * e);
+    const want_lo = try c.arena.alloc(f64, tokens * rank);
+    const want_mix = try c.arena.alloc(f64, tokens * e);
+    const want_res = try c.arena.alloc(f64, tokens * hc * e);
+    for (0..tokens * hc) |r| {
+        var ss: f64 = 0;
+        for (res[r * e ..][0..e]) |v| ss += @as(f64, v) * v;
+        const s = 1 / @sqrt(ss / e + eps);
+        for (0..e) |i| want_xn[r * e + i] = res[r * e + i] * s * wn[(r % hc) * e + i];
+    }
+    for (want_lo, lo) |*w, v| {
+        const a = @as(f64, v) / hc;
+        w.* = a * sigmoid64(a);
+    }
+    for (0..tokens) |t| for (0..e) |i| {
+        var acc: f64 = 0;
+        for (0..hc) |ch| acc += want_xn[(t * hc + ch) * e + i] * sigmoid64(gate[(t * hc + ch) * e + i]);
+        want_mix[t * e + i] = acc / hc;
+        for (0..hc) |ch| want_res[(t * hc + ch) * e + i] = res[(t * hc + ch) * e + i] + block[t * e + i] * 2 * sigmoid64(inject[t * hc + ch] / hc);
+    };
+    const err = @max(@max(relErr(got[0], want_xn), relErr(got[1], want_lo)), @max(relErr(got[2], want_mix), relErr(got[3], want_res)));
+    return .{ .name = "hyper-connection norm, act, mix, combine", .err = err, .tolerance = 1e-6 };
+}
+
+/// The PLE block's gate and convolution for 8 tokens of 4 streams, in steps
+/// of 5 and 3: the second step's taps reach into the history the first left.
+fn checkPle(c: *Ctx) !Result {
+    const hc = 4;
+    const e = 128;
+    const n = hc * e;
+    const taps = 4;
+    const dil = 3;
+    const eps = 1e-6;
+    const tokens = 8;
+    const key = try c.random(tokens * n, 2);
+    const hidden0 = try c.random(tokens * n, 2);
+    const value = try c.random(tokens * e, 1);
+    const wk = try c.random(n, 1);
+    const wq = try c.random(n, 1);
+    const wc = try c.random(n, 1);
+    const conv = try c.random(n * taps, 1);
+    const hist = try c.output((taps - 1) * dil * n);
+    const got = try c.arena.alloc(f32, tokens * n);
+    var t0: u32 = 0;
+    for ([_]u32{ 5, 3 }) |m| {
+        const gated = try c.output(m * n);
+        const normed = try c.output(m * n);
+        const hid = try c.upload(hidden0[t0 * n ..][0 .. m * n]);
+        const l = c.launcher();
+        try l.launch(.ple_mix, P.PleMix{ .dim = e, .hc = hc, .eps = eps }, &.{
+            try c.upload(key[t0 * n ..][0 .. m * n]), hid,              try c.upload(value[t0 * e ..][0 .. m * e]),
+            try c.upload(wk),                         try c.upload(wq), try c.upload(wc),
+            gated,                                    normed,
+        }, .{ hc, m, 1 });
+        try l.launch(.ple_conv, P.PleConv{ .channels = n, .taps = taps, .dilation = dil }, &.{ gated, normed, try c.upload(conv), hist, hid, try c.step(m, t0, 0) }, .{ n / 256, 1, 1 });
+        @memcpy(got[t0 * n ..][0 .. m * n], try c.read(hid));
+        t0 += m;
+    }
+    const want = try c.arena.alloc(f64, tokens * n);
+    const normed_all = try c.arena.alloc(f64, tokens * n);
+    const gated_all = try c.arena.alloc(f64, tokens * n);
+    for (0..tokens) |t| for (0..hc) |ch| {
+        const seg = (t * hc + ch) * e;
+        var sk: f64 = 0;
+        var sh: f64 = 0;
+        for (0..e) |i| {
+            sk += @as(f64, key[seg + i]) * key[seg + i];
+            sh += @as(f64, hidden0[seg + i]) * hidden0[seg + i];
+        }
+        sk = 1 / @sqrt(sk / e + eps);
+        sh = 1 / @sqrt(sh / e + eps);
+        var d: f64 = 0;
+        for (0..e) |i| d += key[seg + i] * sk * wk[ch * e + i] * hidden0[seg + i] * sh * wq[ch * e + i];
+        const s = d / @sqrt(@as(f64, e));
+        const sgn: f64 = if (s > 0) 1 else if (s < 0) -1 else 0;
+        const gate = sigmoid64(sgn * @sqrt(@max(@abs(s), 1e-6)));
+        var sv: f64 = 0;
+        for (0..e) |i| {
+            const g = value[t * e + i] * gate;
+            gated_all[seg + i] = g;
+            sv += g * g;
+        }
+        const sg = 1 / @sqrt(sv / e + eps);
+        for (0..e) |i| normed_all[seg + i] = gated_all[seg + i] * sg * wc[ch * e + i];
+    };
+    for (0..tokens) |t| for (0..n) |ch| {
+        var acc: f64 = 0;
+        for (0..taps) |k| {
+            const back = (taps - 1 - k) * dil;
+            if (t >= back) acc += conv[ch * taps + k] * normed_all[(t - back) * n + ch];
+        }
+        want[t * n + ch] = hidden0[t * n + ch] + gated_all[t * n + ch] + acc * sigmoid64(acc);
+    };
+    return .{ .name = "ple_mix + ple_conv (steps of 5 and 3)", .err = relErr(got, want), .tolerance = 1e-5 };
 }
 
 fn checkSampleGreedy(c: *Ctx) !Result {

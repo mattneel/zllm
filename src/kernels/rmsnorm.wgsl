@@ -1,11 +1,12 @@
 // y[r] = x[r] / sqrt(mean(x[r]²) + eps) * w for rows of `dim`, one
-// workgroup per row.
+// workgroup per row. With w_rows > 1, row r takes weight row r mod w_rows
+// (the hyper-connection streams' own norms); 0 or 1: one weight row.
 
 struct Params {
     rows: u32,
     dim: u32,
     eps: f32,
-    _pad: u32,
+    w_rows: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -34,7 +35,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
         workgroupBarrier();
     }
     let scale = 1.0 / sqrt(partial[0] / f32(p.dim) + p.eps);
+    let wb = (r % max(p.w_rows, 1u)) * p.dim;
     for (var i = lid.x; i < p.dim; i += WG) {
-        y[base + i] = x[base + i] * scale * w[i];
+        y[base + i] = x[base + i] * scale * w[wb + i];
     }
 }

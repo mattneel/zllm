@@ -43,6 +43,11 @@ pub const Kernel = enum {
     moe_route,
     rotate128,
     moe_combine,
+    hc_act,
+    hc_mix,
+    hc_combine,
+    ple_mix,
+    ple_conv,
     repad,
     repack_q3_k,
     quantize_q8,
@@ -276,7 +281,8 @@ pub const params = struct {
     /// `keep`: 0, or 1 + the row after which delta_rule saves the DeltaNet
     /// state and conv history to its kept binding (for a rollback to it).
     pub const Step = extern struct { m: u32, pos0: u32, u: f32, keep: u32 = 0 };
-    pub const RmsNorm = extern struct { rows: u32, dim: u32, eps: f32, _pad: u32 = 0 };
+    /// `w_rows` > 1: row r takes weight row r mod w_rows.
+    pub const RmsNorm = extern struct { rows: u32, dim: u32, eps: f32, w_rows: u32 = 0 };
     pub const MatmulBf16 = extern struct {
         rows: u32,
         n: u32,
@@ -393,6 +399,11 @@ pub const params = struct {
     pub const MoeRoute = extern struct { n_expert: u32, n_used: u32, cols: u32, x_stride: u32, scale: f32 = 0, _pad: [3]u32 = @splat(0) };
     pub const Rotate128 = extern struct { width: u32, x_stride: u32, y_stride: u32, silu_pair: u32 = 0 };
     pub const MoeCombine = extern struct { n_used: u32, dim: u32, _pad: [2]u32 = @splat(0) };
+    pub const HcAct = extern struct { count: u32, hc: u32, _pad: [2]u32 = @splat(0) };
+    /// hc_mix and hc_combine.
+    pub const Hc = extern struct { dim: u32, hc: u32, _pad: [2]u32 = @splat(0) };
+    pub const PleMix = extern struct { dim: u32, hc: u32, eps: f32, _pad: u32 = 0 };
+    pub const PleConv = extern struct { channels: u32, taps: u32, dilation: u32, _pad: u32 = 0 };
     pub const GyroMatvec = extern struct {
         rows: u32,
         cols: u32,

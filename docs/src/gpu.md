@@ -114,6 +114,8 @@ unit decodes from one load (128 bytes per block).
 | `moe_route` | Expert routing, a token per workgroup: router · x (f32), softmax, top-k (ties to the lower index), normalized weights; and the shared expert's gate logit | Router rows read coalesced, a lane group per row |
 | `rotate128` | H₁₂₈ · (signs · x) per 128-value block: the basis Gyro expert weights are stored in. Optionally of silu(gate) · up | 64 butterflies a stage in workgroup memory |
 | `moe_combine` | The expert block's output: the routed experts' weighted sum plus the gated shared expert | |
+| `hc_act`, `hc_mix`, `hc_combine` | The hyper-connection mixer around Q8_0 down, up and inject products: silu(lo / hc); the streams' gated mean into a block's input; a block's output added to each stream, weighted 2·sigmoid(inject / hc) | The streams' norms are `rmsnorm` with a weight row per stream |
+| `ple_mix`, `ple_conv` | The PLE block: per stream, the signed-root sigmoid gate of normed key · query, the gated value and its norm; then the causal dilated convolution (4 taps, dilation 3) into the residual streams | The convolution runs a step's tokens in order against a 9-row history, which it advances as `delta_rule` does the conv history |
 
 These are plain WGSL. M4 makes them templates tuned per GPU; the decode
 kernels above are its first part, measured with `zllm bench`
