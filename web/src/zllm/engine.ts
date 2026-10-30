@@ -5,6 +5,7 @@
 import { Event, type Exports, FINISH, type FinishReason, NEED_MORE, Out } from "./abi";
 import { type Cached, loadPlan, openCached, storePlan } from "./cache";
 import { Executor, type LoadProgress, planLimits, requestDevice } from "./gpu";
+import { ReasoningSplitter } from "./reasoning";
 import { fileSource, type ModelSource, urlSource } from "./source";
 import { argumentsValue, type Tool, type ToolCall, ToolCallSplitter } from "./tools";
 
@@ -574,10 +575,14 @@ export class Engine {
     }
   }
 
-  /** Queues a request and streams it. */
+  /**
+   * Queues a request and streams it. `started` learns whether the chat
+   * prompt left the reply inside an open `<think>` block.
+   */
   async *#request(
     body: RequestJson,
     signal: AbortSignal | undefined,
+    started?: (insideThink: boolean) => void,
   ): AsyncGenerator<GenerateChunk> {
     this.#live();
     const { promise: turn, resolve: release } = Promise.withResolvers<void>();
@@ -593,7 +598,8 @@ export class Engine {
       signal?.throwIfAborted();
       signal?.addEventListener("abort", onAbort);
       body.seed ??= Math.floor(Math.random() * 2 ** 53);
-      callJson(this.#x, this.#x.zllm_start, body);
+      const inside = callJson(this.#x, this.#x.zllm_start, body);
+      started?.(inside === 1);
       let finished = false;
       try {
         for await (const chunk of this.drive()) {
@@ -670,7 +676,7 @@ export class Engine {
       choices: [{ index: 0, delta, finish_reason: finish }],
     });
     yield chunk({ role: "assistant", content: "" }, null);
-    const split = new ReasoningSplitter(req.enable_thinking ?? true);
+    const split = new ReasoningSplitter();
     // Content passes through the tool-call splitter when tools are offered.
     const calls = offersTools(req) ? new ToolCallSplitter(req.tools ?? []) : null;
     function* parts(
@@ -686,7 +692,9 @@ export class Engine {
         }
       }
     }
-    for await (const c of this.#request(this.#chatBody(req), req.signal)) {
+    for await (const c of this.#request(this.#chatBody(req), req.signal, (inside) =>
+      split.start(inside),
+    )) {
       const out = [...parts(split.push(c.text))];
       if (c.logprob !== undefined) {
         // The token's logprobs ride on its first chunk, or on an empty one
@@ -802,71 +810,6 @@ export class Engine {
   }
 }
 
-/**
- * Splits a Qwen thinking reply into reasoning (up to `</think>`) and
- * content, as vLLM's Qwen3 reasoning parser does. The chat template opens
- * the `<think>` block in the prompt, so the reply starts inside it.
- */
-class ReasoningSplitter {
-  static readonly END = "</think>";
-  #inReasoning: boolean;
-  #held = "";
-  #contentStarted = false;
-
-  constructor(thinking: boolean) {
-    this.#inReasoning = thinking;
-  }
-
-  *push(text: string): Generator<{ content?: string; reasoning_content?: string }> {
-    if (!this.#inReasoning) {
-      yield* this.#content(text);
-      return;
-    }
-    this.#held += text;
-    const end = this.#held.indexOf(ReasoningSplitter.END);
-    if (end >= 0) {
-      const reasoning = this.#held.slice(0, end);
-      const rest = this.#held.slice(end + ReasoningSplitter.END.length);
-      this.#held = "";
-      this.#inReasoning = false;
-      if (reasoning !== "") {
-        yield { reasoning_content: reasoning };
-      }
-      yield* this.#content(rest);
-      return;
-    }
-    // Hold back a tail that could start "</think>".
-    let keep = 0;
-    for (let n = Math.min(ReasoningSplitter.END.length - 1, this.#held.length); n > 0; n--) {
-      if (ReasoningSplitter.END.startsWith(this.#held.slice(-n))) {
-        keep = n;
-        break;
-      }
-    }
-    const ready = this.#held.slice(0, this.#held.length - keep);
-    this.#held = this.#held.slice(this.#held.length - keep);
-    if (ready !== "") {
-      yield { reasoning_content: ready };
-    }
-  }
-
-  *flush(): Generator<{ content?: string; reasoning_content?: string }> {
-    if (this.#held !== "") {
-      yield this.#inReasoning ? { reasoning_content: this.#held } : { content: this.#held };
-      this.#held = "";
-    }
-  }
-
-  /** Content, without the blank lines the template puts after `</think>`. */
-  *#content(text: string): Generator<{ content?: string }> {
-    const out = this.#contentStarted ? text : text.replace(/^\n+/, "");
-    if (out !== "") {
-      this.#contentStarted = true;
-      yield { content: out };
-    }
-  }
-}
-
 /** Whether the request offers tools to the model. */
 function offersTools(req: ChatRequest): boolean {
   return (req.tools?.length ?? 0) > 0 && req.tool_choice !== "none";
@@ -901,7 +844,7 @@ function openaiUsage(u: Usage): OpenAIUsage {
 }
 
 /** Calls a JSON-taking export with `value` encoded into core memory. */
-function callJson(x: Exports, f: (ptr: number, len: number) => number, value: unknown): void {
+function callJson(x: Exports, f: (ptr: number, len: number) => number, value: unknown): number {
   const bytes = new TextEncoder().encode(JSON.stringify(value));
   const ptr = x.zllm_alloc(Math.max(bytes.length, 1));
   if (ptr === 0) {
@@ -909,7 +852,9 @@ function callJson(x: Exports, f: (ptr: number, len: number) => number, value: un
   }
   new Uint8Array(x.memory.buffer, ptr, bytes.length).set(bytes);
   try {
-    check(x, f(ptr, bytes.length));
+    const r = f(ptr, bytes.length);
+    check(x, r);
+    return r;
   } finally {
     x.zllm_free(ptr, Math.max(bytes.length, 1));
   }

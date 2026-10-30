@@ -52,8 +52,11 @@ await zllm.cacheUsage(); await zllm.clearCache();
   `zllm generate` do ([Generation](generation.md#sampling)); `stats().model.sampling`
   lists them.
 - **Chat** renders the fixed Qwen template inside the core, the template
-  `check-chat` pins. Each reply is split into `reasoning_content` and
-  `content`, as vLLM's Qwen3 reasoning parser does. An assistant turn sent
+  `check-chat` pins, or the model's own ([Dense transformers](dense.md#chat)).
+  Each reply is split into `reasoning_content` and `content`, as vLLM's
+  Qwen3 reasoning parser does: from inside the `<think>` block where the
+  prompt opens one (the core reports it), from a `<think>` the reply opens
+  itself (Qwen 3), else all content (Llama). An assistant turn sent
   back with its `reasoning_content` re-renders exactly as generated, so the
   whole conversation stays resident and a new turn prefills only its new
   message.

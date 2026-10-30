@@ -196,10 +196,12 @@ export fn zllm_complete(elapsed_ms: f64) i32 {
     return 0;
 }
 
+/// 1 if the chat prompt leaves the reply inside an open <think> block,
+/// else 0; negative on error.
 export fn zllm_start(ptr: [*]const u8, len: usize) i32 {
     const rt = runtime orelse return fail("start", error.NotLoaded);
-    rt.start(ptr[0..len]) catch |err| return fail("request", err);
-    return 0;
+    const inside = rt.start(ptr[0..len]) catch |err| return fail("request", err);
+    return @intFromBool(inside);
 }
 
 export fn zllm_cancel() void {
@@ -464,7 +466,8 @@ const Runtime = struct {
         return rt.submit(rt.setup.batch());
     }
 
-    fn start(rt: *Runtime, json: []const u8) !void {
+    /// Starts a request; whether its chat prompt ends inside <think>.
+    fn start(rt: *Runtime, json: []const u8) !bool {
         if (rt.phase != .ready) return error.Loading;
         if (rt.running) return error.Busy;
         _ = rt.request_arena.reset(.retain_capacity);
@@ -474,6 +477,7 @@ const Runtime = struct {
 
         var prompt: std.ArrayList(u32) = .empty;
         var defaults = rt.defaults.raw;
+        var inside_think = false;
         if (r.messages) |messages| {
             var text: std.ArrayList(u8) = .empty;
             if (zllm.chat.supports(rt.program.architecture())) {
@@ -500,6 +504,7 @@ const Runtime = struct {
                 };
             }
             try rt.tok.encode(arena, text.items, &prompt);
+            inside_think = opensThink(text.items);
             defaults = rt.defaults.chat(r.enable_thinking);
         } else if (r.tokens) |ids| {
             try prompt.appendSlice(arena, ids);
@@ -529,8 +534,15 @@ const Runtime = struct {
             .speculate = r.speculate,
         });
         rt.running = true;
+        return inside_think;
     }
 };
+
+/// Whether a chat prompt ends inside an open <think> block.
+fn opensThink(prompt: []const u8) bool {
+    const open = std.mem.lastIndexOf(u8, prompt, "<think>") orelse return false;
+    return std.mem.indexOfPos(u8, prompt, open, "</think>") == null;
+}
 
 fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
