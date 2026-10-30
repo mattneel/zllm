@@ -248,9 +248,10 @@ A decode layer is 7 dispatches. A decode step is 182, down from 441.
 
 `src/plan/qwen4exp.zig` is the Gyro-Coder's step program. It is built from
 the parts it shares with Qwen 3.5's (`src/plan/common.zig`: weight upload,
-buffers, the multiplies' launches). It runs the decode kernels only, in
-steps of up to 4 tokens, and caps the context at 2,048. Up to 2,051 visible
-cells the sparse attention's indexer selects every cell, so dense attention
+buffers, the multiplies' launches, the sampler). The engine drives either
+through `plan.Program`. This program runs the decode kernels only, in steps
+of up to 4 tokens, and caps the context at 2,048. Up to 2,051 visible cells
+the sparse attention's indexer selects every cell, so dense attention
 computes the same thing.
 
 - **Weights:** the dense Q8_0 matrices as Qwen 3.5 uploads them, stacked
@@ -269,7 +270,6 @@ computes the same thing.
   save it with the recurrent state.
 - **State:** every DeltaNet layer's recurrent state and conv history, and
   the PLE convolution's history, in one buffer that checkpoints copy.
-- **Sampling:** the sampler's launches as Qwen 3.5's program records them.
 - **A layer:** the four streams' norms and the low-rank mix into the
   block's input (`hc_act`, `hc_mix`), the mixer (DeltaNet with a sigmoid
   gate, or attention with `attn_split_wide`), `hc_combine` back into the
@@ -277,7 +277,6 @@ computes the same thing.
   experts, `rotate128` of their SiLU pair, the down experts, the shared
   expert, `moe_combine`, `hc_combine`.
 
-Through `zllm gpu-forward` on the RTX 5090 Laptop, a warm load takes 14 to
-20 s, and a token through all 48 layers about 90 ms. Each step there is its
-own synchronous submission, with 96 readbacks for the checks
-([Validation](validation.md#qwen38-flash-next-gyro-coder)).
+On the RTX 5090 Laptop, `zllm generate` loads it warm in 16 to 20 s
+(weights 11 to 14 s, tuning 5 s), prefills at 27 tok/s and decodes at 11 to
+13 tok/s, one step per batch.

@@ -418,7 +418,10 @@ relative L2.
 
 The pipelined run completes each batch only when the engine asks for it
 (`wait`), so every decode step is recorded before the previous token is
-known, as in the browser ([Generation](generation.md#engine)). The cancelled
+known, as in the browser ([Generation](generation.md#engine)). A program
+that cannot chain samples (Qwen3.8-Flash-Next) keeps one batch in flight,
+so no step processes the stop token: the scenario then wants it not
+resident. The cancelled
 decode's follow-up sits closest to the cross-path bound, at 8.8e-5 of 1e-4:
 two of its reused positions went through the decode kernels.
 
@@ -463,6 +466,8 @@ greedy tokens.
 | The same vs the reference runtime's dumps | 1.5% relative L2 after layer 0, growing to 25% at layer 47 |
 | GPU (`zllm gpu-forward`, D3D12, f16 cache) vs the CPU reference, the same 66 tokens | every layer's expert sets identical; streams within 1.3e-4 relative L2 (median 1.8e-5 at the last layer); logits median 1.9e-5, max 1.5e-4; top-1 66/66, so greedy 40/40 |
 | GPU in 1-token vs 4-token steps | bitwise identical |
+| `zllm generate`, greedy, on the same prompt, tuned and untuned | the reference runtime's 40 tokens; the text is identical |
+| `zllm engine-check` | every reuse scenario bitwise identical to a fresh run (one kernel path, so the cross-path cases too), and the asynchronous stop, the cancellations and logprobs pass; no speculation (no MTP block) |
 
 The last row is the reference runtime's own rounding: it computes its
 multiplies from activations rounded to 8-bit blocks, and through 48 layers

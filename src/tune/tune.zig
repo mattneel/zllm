@@ -15,7 +15,6 @@ const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
 const gguf = @import("../gguf/gguf.zig");
 const kernels = @import("../kernels/kernels.zig");
-const plan = @import("../plan/qwen35.zig");
 const plan_common = @import("../plan/common.zig");
 
 const P = kernels.params;
@@ -72,9 +71,10 @@ pub const Sweep = struct {
     dropped: u32 = 0,
 
     /// A sweep over `m`'s quantized decode multiplies, `tokens` per step (1,
-    /// or 2 where decoding speculates). Records the scratch buffers' creation
-    /// into `rec`, for the first batch.
-    pub fn init(gpa: Allocator, arena: Allocator, rec: *cmd.Recorder, set: *kernels.Set, m: *const plan.Model, d: kernels.DeviceLimits, tokens: u32) !Sweep {
+    /// or 2 where decoding speculates): `m` is any model with `eachMatrix`
+    /// (plan.Model, or one architecture's). Records the scratch buffers'
+    /// creation into `rec`, for the first batch.
+    pub fn init(gpa: Allocator, arena: Allocator, rec: *cmd.Recorder, set: *kernels.Set, m: anytype, d: kernels.DeviceLimits, tokens: u32) !Sweep {
         std.debug.assert(tokens >= 1 and tokens <= kernels.decode_max_rows);
         const Collect = struct {
             arena: Allocator,

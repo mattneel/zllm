@@ -82,9 +82,10 @@ budget:
 - **Checkpoint boundaries:** chunks also end at multiples of 512 and just
   before the prompt's last token. That token then runs as its own step, which
   measures the fixed cost and produces the logits to sample.
-- **Alignment:** otherwise chunks end only at multiples of 8. The alignment
-  was 64 until the 27B: its 64-token steps alone took seconds, past
-  Windows' 2 s GPU watchdog.
+- **Alignment:** otherwise chunks end only at multiples of 8, or of the
+  program's longest step where that is shorter (4 for Qwen3.8-Flash-Next).
+  The alignment was 64 until the 27B: its 64-token steps alone took
+  seconds, past Windows' 2 s GPU watchdog.
 - **Kernels:** every prefill chunk runs the prefill kernels, however few
   tokens it has, and only the prompt's last token takes the decode kernels,
   which round differently ([GPU backend](gpu.md#two-kernel-paths)). The
@@ -96,7 +97,11 @@ budget:
   boundary.
 - **Decode:** one token per step. The sampler writes the token straight into
   the next step's input on the GPU, so the CPU only reads back the token id
-  and its stop flag.
+  and its stop flag. Qwen3.8-Flash-Next cannot work that way: the host picks
+  each token's per-layer embedding rows from the file
+  ([GPU backend](gpu.md#qwen38-flash-next)), so it must know the token
+  before the step. Its decode steps run one batch at a time, each processing
+  the token read back (`plan.Program.chainsSamples`).
 
 ## Speculative decoding
 

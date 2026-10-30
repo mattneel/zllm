@@ -57,7 +57,7 @@ const Check = struct {
     }
 
     fn decode(c: *Check, prompt: []const u32, o: Decode) !Run {
-        const vocab = c.rt.program.hp.vocab;
+        const vocab = c.rt.program.vocab();
         const logits = try c.arena.alloc(f32, @as(usize, o.n) * vocab);
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(c.rt.gpa);
@@ -99,7 +99,7 @@ const Check = struct {
     /// sequence length.
     fn pipelined(c: *Check, prompt: []const u32, stop: u32) !struct { run: Run, finish: zllm.sched.Finish, resident: u32 } {
         const e = &c.rt.engine;
-        const vocab = c.rt.program.hp.vocab;
+        const vocab = c.rt.program.vocab();
         const logits = try c.arena.alloc(f32, n_gen * vocab);
         var ids: std.ArrayList(u32) = .empty;
         try e.start(.{
@@ -130,7 +130,10 @@ const Check = struct {
             .token => |t| try ids.append(c.arena, t.id),
             .done => |d| break d,
         };
-        if (most != zllm.sched.max_in_flight) return error.NotPipelined;
+        // A program that cannot chain samples keeps one batch in flight
+        // (plan.Program.chainsSamples); the driver is still asynchronous.
+        const depth: usize = if (c.rt.program.chainsSamples()) zllm.sched.max_in_flight else 1;
+        if (most != depth) return error.NotPipelined;
         return .{
             .run = .{ .tokens = ids.items, .logits = logits, .cached = d.usage.cached_tokens, .usage = d.usage },
             .finish = d.finish,
@@ -182,7 +185,7 @@ const Check = struct {
         const reused = try c.run(prompt);
         c.rt.engine.forget();
         const fresh = try c.run(prompt);
-        const vocab = c.rt.program.hp.vocab;
+        const vocab = c.rt.program.vocab();
         var same = true;
         var worst: f64 = 0;
         for (0..n_gen) |i| {
@@ -230,7 +233,7 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var prng: std.Random.DefaultPrng = .init(42);
-    const vocab = rt.program.hp.vocab;
+    const vocab = rt.program.vocab();
     const random = struct {
         fn f(a: std.mem.Allocator, r: std.Random, n: usize, v: u32) ![]u32 {
             const t = try a.alloc(u32, n);
@@ -255,9 +258,12 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
     _ = try c.scenario("unrelated prompt after another", p1, 0, true);
 
     // Pipelined, stopped by the 6th sampled token of an unpipelined run (or
-    // an earlier occurrence of it).
+    // an earlier occurrence of it). The step recorded after the stop has
+    // processed the stop token, so it stays resident; a program that cannot
+    // chain samples records no such step (plan.Program.chainsSamples).
     {
-        const name = "pipelined decode, stopped";
+        const piping = rt.program.chainsSamples();
+        const name = if (piping) "pipelined decode, stopped" else "asynchronous decode, stopped";
         rt.engine.forget();
         const plain = try c.run(p1);
         const stop = plain.tokens[5];
@@ -267,13 +273,15 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
         const n = at + 1;
         const same = piped.finish == .stop and std.mem.eql(u32, piped.run.tokens, plain.tokens[0..n]) and
             std.mem.eql(u32, @ptrCast(piped.run.logits[0 .. n * vocab]), @ptrCast(plain.logits[0 .. n * vocab]));
-        const resident_ok = piped.resident == p1.len + n;
+        const want = p1.len + n - @intFromBool(!piping);
+        const resident_ok = piped.resident == want;
         c.ok = c.ok and same and resident_ok;
-        try out.print("{s} {s:<34} {d} tokens and logits {s} an unpipelined run; {d} resident (want {d}: the stop token too)\n", .{
-            if (same and resident_ok) "PASS" else "FAIL", name, n, if (same) "bitwise identical to" else "DIFFER from", piped.resident, p1.len + n,
-        });
+        const verdict = if (same and resident_ok) "PASS" else "FAIL";
+        const compared = if (same) "bitwise identical to" else "DIFFER from";
+        const why = if (piping) "the stop token too" else "not the stop token, which no step processed";
+        try out.print("{s} {s:<34} {d} tokens and logits {s} an unpipelined run; {d} resident (want {d}: {s})\n", .{ verdict, name, n, compared, piped.resident, want, why });
         const next = try std.mem.concat(arena, u32, &.{ p1, plain.tokens[0..n], other[0..30] });
-        _ = try c.scenario("prompt after a pipelined stop", next, @intCast(p1.len + n), false);
+        _ = try c.scenario(if (piping) "prompt after a pipelined stop" else "prompt after an asynchronous stop", next, @intCast(want), false);
     }
 
     // Cancelled in decode after 3 tokens: the prompt and the first 2 sampled
@@ -289,7 +297,7 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
 
     // Speculation: a prompt that repeats a random phrase, so that the model
     // continues it and drafts are often right, greedy and sampled.
-    if (rt.program.mtp != null) {
+    if (rt.program.mtp()) {
         const phrase = try random(arena, prng.random(), 24, vocab);
         const repeated = try arena.alloc(u32, 8 * phrase.len);
         for (0..8) |i| @memcpy(repeated[i * phrase.len ..][0..phrase.len], phrase);

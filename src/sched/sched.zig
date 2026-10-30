@@ -40,7 +40,10 @@
 //! sampled. That checkpoint lets a later request with the same prompt, or one
 //! that only changes what follows it, restart one token before the end.
 //! Decode is one token per submission, and only the sampled token id (and
-//! its stop flag) comes back.
+//! its stop flag) comes back. A program that cannot take a step's token
+//! from the previous step's sample on the GPU (Qwen4Exp, whose host picks
+//! each token's PLE rows: plan.Program.chainsSamples) decodes one batch at
+//! a time, each step processing the token read back.
 //!
 //! Speculative decoding, with a program built with the model's MTP block:
 //! each round is one batch that runs the MTP block over the last step's
@@ -61,7 +64,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
-const plan = @import("../plan/qwen35.zig");
+const plan = @import("../plan/plan.zig");
 const kernels = @import("../kernels/kernels.zig");
 const sampler = @import("../sampler/sampler.zig");
 const state = @import("../state/state.zig");
@@ -155,7 +158,7 @@ pub const Event = union(enum) {
 /// Batches outstanding at once.
 pub const max_in_flight = 2;
 
-pub const Error = Allocator.Error || Tokenizer.DecodeError || sampler.Params.Error || error{ Busy, EmptyPrompt, PromptTooLong, TooManyStops, TooManyLogprobs, NotSubmitted };
+pub const Error = Allocator.Error || Tokenizer.DecodeError || sampler.Params.Error || plan.Program.StepError || error{ Busy, EmptyPrompt, PromptTooLong, TooManyStops, TooManyLogprobs, NotSubmitted };
 
 pub const Engine = struct {
     gpa: Allocator,
@@ -240,7 +243,7 @@ pub const Engine = struct {
     /// The engine keeps pointers to itself in recorded batches: it must not
     /// move while a batch is pending.
     pub fn init(gpa: Allocator, program: *plan.Program, tok: *const Tokenizer) Allocator.Error!Engine {
-        return .{ .gpa = gpa, .program = program, .tok = tok, .seq = try .init(gpa, program.cfg.checkpoints) };
+        return .{ .gpa = gpa, .program = program, .tok = tok, .seq = try .init(gpa, program.checkpoints()) };
     }
 
     pub fn deinit(e: *Engine) void {
@@ -285,7 +288,7 @@ pub const Engine = struct {
 
     /// Whether requests speculate by default (plan.speculationPays).
     pub fn speculates(e: *const Engine) bool {
-        return e.program.mtp != null and e.program.speculation_pays;
+        return e.program.mtp() and e.program.speculationPays();
     }
 
     const calibration_token = [_]u32{0};
@@ -293,14 +296,14 @@ pub const Engine = struct {
     /// `req` and the memory it points to must stay valid until `.done`.
     pub fn start(e: *Engine, req: Request) Error!void {
         if (e.phase != .idle) return error.Busy;
-        const cfg = e.program.cfg;
+        const vocab = e.program.vocab();
         if (req.prompt.len == 0) return error.EmptyPrompt;
-        if (req.prompt.len > cfg.context) return error.PromptTooLong;
-        if (req.stop_tokens.len > @import("../kernels/kernels.zig").max_stops) return error.TooManyStops;
-        try req.sampling.validate(e.program.hp.vocab);
+        if (req.prompt.len > e.program.context()) return error.PromptTooLong;
+        for (req.prompt) |t| if (t >= vocab) return error.InvalidToken;
+        if (req.stop_tokens.len > kernels.max_stops) return error.TooManyStops;
+        try req.sampling.validate(vocab);
         if (req.logprobs) |n| {
             if (n > max_top_logprobs) return error.TooManyLogprobs;
-            const vocab = e.program.hp.vocab;
             if (e.lp_rows.len < max_in_flight * vocab) {
                 e.gpa.free(e.lp_rows);
                 e.lp_rows = &.{};
@@ -332,7 +335,7 @@ pub const Engine = struct {
         e.placeholder = null;
         e.finish = null;
         e.cancelled = false;
-        e.spec = e.program.mtp != null and (req.speculate orelse e.speculates());
+        e.spec = e.program.mtp() and (req.speculate orelse e.speculates());
         e.mtp_rows = 0;
         e.spare_draw = null;
         e.second = null;
@@ -376,7 +379,8 @@ pub const Engine = struct {
             if (e.queued > 0 or !e.canDecode()) return .wait;
             try e.recordRound();
         } else {
-            if (e.queued == max_in_flight or !e.canDecode()) return .wait;
+            const in_flight: u32 = if (e.program.chainsSamples()) max_in_flight else 1;
+            if (e.queued == in_flight or !e.canDecode()) return .wait;
             try e.recordDecode();
         }
         e.handed = true;
@@ -392,7 +396,7 @@ pub const Engine = struct {
     /// Whether another decode step may be recorded: its sample stays within
     /// max_tokens and the token it processes within the context.
     fn canDecode(e: *const Engine) bool {
-        return e.samples_recorded < e.req.max_tokens and e.seq.len() < e.program.cfg.context;
+        return e.samples_recorded < e.req.max_tokens and e.seq.len() < e.program.context();
     }
 
     /// Reports that the oldest outstanding batch finished, `elapsed_ns` of
@@ -414,7 +418,7 @@ pub const Engine = struct {
             // A step faster than the fixed estimate is noise, not a rate.
             // Steps of a few tokens run the decode kernels, whose cost says
             // nothing about a prefill tile's.
-            e.token_ns = (elapsed_ns - e.step_ns) / std.mem.alignForward(u64, p.tokens, e.program.prefill_tile);
+            e.token_ns = (elapsed_ns - e.step_ns) / std.mem.alignForward(u64, p.tokens, e.program.prefillTile());
             e.rate_tokens = p.tokens;
         }
         if (p.verify) return e.completeVerify();
@@ -467,7 +471,7 @@ pub const Engine = struct {
             e.finish = .stop;
         } else if (try e.stream.push(e.gpa, e.tok, token, &e.text)) {
             e.finish = .stop;
-        } else if (e.usage.completion_tokens == e.req.max_tokens or (e.queued == 0 and e.seq.len() == e.program.cfg.context)) {
+        } else if (e.usage.completion_tokens == e.req.max_tokens or (e.queued == 0 and e.seq.len() == e.program.context())) {
             try e.stream.flush(e.gpa, &e.text);
             e.finish = .length;
         }
@@ -491,7 +495,7 @@ pub const Engine = struct {
         // Without calibration, measure the fixed cost first.
         var m: u32 = if (e.step_ns == 0) 1 else @intCast(std.math.clamp(budget_ns / 10 * 9 / e.step_ns, 1, first_chunk));
         if (e.token_ns != 0) {
-            const tile: u64 = e.program.prefill_tile;
+            const tile: u64 = e.program.prefillTile();
             const target: u64 = @max(budget_ns / 10 * 9, 2 * e.step_ns);
             const ramp = 4 * @as(u64, @max(e.rate_tokens, first_chunk));
             var fit = @min((target -| e.step_ns) / e.token_ns, ramp);
@@ -502,7 +506,8 @@ pub const Engine = struct {
             }
             m = @intCast(@max(1, fit));
         }
-        m = @min(m, e.program.cfg.max_tokens, left);
+        const max = e.program.maxTokens();
+        m = @min(m, max, left);
         const boundary = (pos / state.checkpoint_interval + 1) * state.checkpoint_interval;
         m = @min(m, boundary - pos);
         const len: u32 = @intCast(e.req.prompt.len);
@@ -510,8 +515,10 @@ pub const Engine = struct {
         var end = pos + m;
         if (pos < before_last) end = @min(end, before_last);
         if (end != before_last and end != len) {
-            const aligned = end / chunk_align * chunk_align;
-            end = if (aligned > pos) aligned else @min((pos / chunk_align + 1) * chunk_align, before_last);
+            // Steps can be shorter than the alignment (Qwen4Exp's 4).
+            const step_align = @min(chunk_align, max);
+            const aligned = end / step_align * step_align;
+            end = if (aligned > pos) aligned else @min((pos / step_align + 1) * step_align, before_last);
         }
         return end - pos;
     }
@@ -529,7 +536,7 @@ pub const Engine = struct {
             .logit_rows = @intFromBool(last),
             .draw = if (last) e.takeDraw() else null,
             .sampled = if (slot) |s| &e.sampled[s] else null,
-            .readback = if (slot) |s| e.logitsReadback(s) else null,
+            .logits = if (slot) |s| e.logitsRow(s, e.samples_recorded - 1) else null,
             .path = if (last) null else .prefill,
             .hidden = e.spec,
         });
@@ -557,13 +564,16 @@ pub const Engine = struct {
         e.freshBatch();
         const pos0 = e.seq.len();
         const slot = e.takeSlot();
+        // Unless the program chains samples, nothing is in flight: the host
+        // knows the token.
+        const chains = e.program.chainsSamples();
         try e.program.recordStep(e.gpa, &e.rec, .{
             .pos0 = pos0,
-            .tokens = null,
+            .tokens = if (chains) null else (&e.last_token)[0..1],
             .logit_rows = 1,
             .draw = e.takeDraw(),
             .sampled = &e.sampled[slot],
-            .readback = e.logitsReadback(slot),
+            .logits = e.logitsRow(slot, e.samples_recorded - 1),
         });
         const unknown = for (e.queue[0..e.queued]) |q| {
             if (q.slot != null) break true;
@@ -586,7 +596,7 @@ pub const Engine = struct {
         const token = e.last_token;
         const interval = state.checkpoint_interval;
         const verify = e.mtp_rows > 0 and e.samples_recorded + 2 <= e.req.max_tokens and
-            pos + 2 <= e.program.cfg.context and (pos + 1) % interval != 0 and (pos + 2) % interval != 0;
+            pos + 2 <= e.program.context() and (pos + 1) % interval != 0 and (pos + 2) % interval != 0;
         if (e.mtp_rows > 0) {
             // Each row takes the token after its position: resident, or the
             // latest sample for the last.
@@ -625,7 +635,7 @@ pub const Engine = struct {
             .logit_rows = 1,
             .draw = e.takeDraw(),
             .sampled = &e.sampled[slot],
-            .readback = e.logitsReadback(slot),
+            .logits = e.logitsRow(slot, e.samples_recorded - 1),
             .hidden = true,
         });
         try e.seq.append(e.gpa, &.{token});
@@ -652,17 +662,11 @@ pub const Engine = struct {
         return slot;
     }
 
-    /// Where the logits of the sampling step being recorded (in `slot`) go:
-    /// the request's buffer, for checks, or the slot's row for logprobs.
-    fn logitsReadback(e: *Engine, slot: u32) ?plan.Program.Readback {
-        return .{ .logits = e.logitsRow(slot, e.samples_recorded - 1) orelse return null };
-    }
-
     /// The row sample `k` (of the request) reads its logits back to, in
     /// `slot`: the request's buffer, for checks, or the slot's row for
     /// logprobs.
     fn logitsRow(e: *Engine, slot: u32, k: u32) ?[]f32 {
-        const vocab = e.program.hp.vocab;
+        const vocab = e.program.vocab();
         const row: []f32 = if (e.req.logits) |all|
             all[k * vocab ..][0..vocab]
         else if (e.req.logprobs != null)

@@ -50,7 +50,7 @@ fn decode(u: zllm.sched.Usage) Record.Decode {
 pub fn run(rt: *gen.Runtime, model: []const u8, model_bytes: u64, load_ns: u64, out: *Io.Writer) !void {
     var prng: std.Random.DefaultPrng = .init(7);
     var prompt: [prompt_tokens]u32 = undefined;
-    for (&prompt) |*t| t.* = prng.random().uintLessThan(u32, rt.program.hp.vocab);
+    for (&prompt) |*t| t.* = prng.random().uintLessThan(u32, rt.program.vocab());
     // The first turn after load runs slower: warm up first.
     _ = try turn(rt, &prompt, false);
     const usage = try turn(rt, &prompt, null);

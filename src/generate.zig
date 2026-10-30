@@ -6,7 +6,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const zllm = @import("zllm");
-const plan = zllm.plan.qwen35;
+const plan = zllm.plan;
 const plan_common = zllm.plan.common;
 const chat = zllm.chat;
 const sampler = zllm.sampler;
@@ -208,11 +208,11 @@ pub const Runtime = struct {
         host.file = bytes;
         rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
         try rt.executeTimed(&rec, &t, &rt.load.weights);
-        const mtp = plan.canSpeculate(&rt.model, limits);
+        const mtp = rt.model.canSpeculate(limits);
         var tuning: plan_common.Tuning = .{};
         if (o.tune) {
             // Decoding mostly runs steps of two where it speculates.
-            var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &rt.set, &rt.model, .{}, if (mtp and plan.speculationPays(&rt.model)) 2 else 1);
+            var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &rt.set, &rt.model, .{}, if (mtp and rt.model.speculationPays()) 2 else 1);
             while (try sweep.next()) |words| {
                 const t0 = Io.Timestamp.now(io, .awake);
                 try rt.execute(words);
@@ -226,10 +226,8 @@ pub const Runtime = struct {
         }
         rt.program = try plan.Program.build(arena, gpa, &rec, &rt.set, &rt.model, .{
             .context = o.context,
-            .max_tokens = @min(512, o.context),
             .kv = o.kv,
             .mtp = mtp,
-            .logit_rows = 2,
             .tuning = tuning,
         }, limits);
         try rt.executeTimed(&rec, &t, &rt.load.program);

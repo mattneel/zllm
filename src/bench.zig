@@ -2,7 +2,8 @@
 //! context of random tokens, it times whole decode steps (sampling with the
 //! Qwen thinking defaults) and splits off the per-submission overhead. Then
 //! each kernel class's share: the time a step's launches save, replayed in
-//! order, when that class is left out.
+//! order, when that class is left out. Qwen 3.5 programs only: it replays
+//! their launch list.
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,7 +16,10 @@ const steps = 32;
 
 pub fn run(rt: *gen.Runtime, context: u32, out: *Io.Writer) !void {
     const gpa = rt.gpa;
-    const p = &rt.program;
+    const p = switch (rt.program) {
+        .qwen35 => |*x| x,
+        else => return error.UnsupportedArchitecture,
+    };
     var rec: zllm.gpu.cmd.Recorder = .{};
     defer rec.deinit(gpa);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -127,7 +131,7 @@ pub fn run(rt: *gen.Runtime, context: u32, out: *Io.Writer) !void {
 /// Best of five replays of a decode step's launches, without those of class
 /// `skip`.
 fn replay(rt: *gen.Runtime, rec: *zllm.gpu.cmd.Recorder, seq: anytype, skip: ?usize, pos: u32) !u64 {
-    const p = &rt.program;
+    const p = &rt.program.qwen35;
     var best: u64 = std.math.maxInt(u64);
     for (0..5) |_| {
         p.step_value = .{ .m = 1, .pos0 = pos, .u = 0.5 };

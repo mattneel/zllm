@@ -39,13 +39,13 @@ pub fn run(rt: *gen.Runtime, minutes: u32, out: *Io.Writer) !bool {
 
     var r: Result = .{ .adapter = rt.adapter, .minutes = minutes };
     const t_end = Io.Timestamp.now(rt.io, .awake).addDuration(.fromSeconds(@as(i64, minutes) * 60));
-    const context = p.cfg.context;
+    const context = p.context();
     while (Io.Timestamp.now(rt.io, .awake).durationTo(t_end).toNanoseconds() > 0) {
         // Extend the previous prompt, or start a new one.
         const max_tokens = random.intRangeAtMost(u32, 1, 256);
         if (prompt.items.len == 0 or random.boolean() or prompt.items.len + 3000 + max_tokens > context) prompt.clearRetainingCapacity();
         const add = random.intRangeAtMost(u32, 1, @min(3000, context - max_tokens - @as(u32, @intCast(prompt.items.len))));
-        for (0..add) |_| try prompt.append(gpa, random.uintLessThan(u32, p.hp.vocab));
+        for (0..add) |_| try prompt.append(gpa, random.uintLessThan(u32, p.vocab()));
         const sampling: zllm.sampler.Params = if (random.boolean())
             .{ .temperature = 0 }
         else

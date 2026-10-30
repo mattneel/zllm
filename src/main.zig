@@ -133,10 +133,10 @@ pub fn main(init: std.process.Init) !void {
         defer rt.destroy();
         const ld = rt.load;
         std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, tuning {d}, program {d}, calibration {d}); context {d}, {t} KV", .{
-            rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.tuning / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, opts.context, opts.kv,
+            rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.tuning / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, rt.program.context(), rt.program.kv(),
         });
         if (rt.tuned[0] > 0) std.debug.print("; {d} of {d} decode-multiply shapes tuned to another variant", .{ rt.tuned[1], rt.tuned[0] });
-        if (rt.program.mtp != null) std.debug.print("; {s}", .{if (rt.engine.speculates()) "speculative" else "MTP block, not speculating by default"});
+        if (rt.program.mtp()) std.debug.print("; {s}", .{if (rt.engine.speculates()) "speculative" else "MTP block, not speculating by default"});
         std.debug.print("]\n", .{});
         if (is_benchmark) {
             try benchmark.run(rt, args[2], mapped.bytes.len, @intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()), out);

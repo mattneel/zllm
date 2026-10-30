@@ -25,10 +25,13 @@ pub fn run(rt: *gen.Runtime, chunk: u32, at: u32, out: *Io.Writer) !void {
     const arena = arena_state.allocator();
 
     const total = at + chunk * (prefill_steps + 1);
-    if (total + decode_steps * 4 > p.cfg.context or chunk > p.cfg.max_tokens) return error.ChunkTooLarge;
+    if (total + decode_steps * 4 > p.context() or chunk > p.maxTokens()) return error.ChunkTooLarge;
     var prng: std.Random.DefaultPrng = .init(1);
     const tokens = try arena.alloc(u32, total);
-    for (tokens) |*t| t.* = prng.random().uintLessThan(u32, p.hp.vocab);
+    for (tokens) |*t| t.* = prng.random().uintLessThan(u32, p.vocab());
+    // Decode steps process the previous sample, or where the program needs
+    // the token from the host, a fixed one.
+    const decode_token: ?[]const u32 = if (p.chainsSamples()) null else tokens[0..1];
     rt.engine.forget();
     try p.recordReset(gpa, &rec);
     try p.recordRequest(gpa, &rec, .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .presence_penalty = 1.5 }, tokens, &.{});
@@ -64,14 +67,14 @@ pub fn run(rt: *gen.Runtime, chunk: u32, at: u32, out: *Io.Writer) !void {
 
     rt.host.stopProfile();
     var sampled: [2]u32 = undefined;
-    try p.recordStep(gpa, &rec, .{ .pos0 = pos, .tokens = null, .logit_rows = 1, .draw = 0.5, .sampled = &sampled });
+    try p.recordStep(gpa, &rec, .{ .pos0 = pos, .tokens = decode_token, .logit_rows = 1, .draw = 0.5, .sampled = &sampled });
     try rec.submit(gpa, 1);
     const plain_decode = try time(rt, &rec);
     pos += 1;
     try rt.host.startProfile();
     wall = 0;
     for (0..decode_steps) |_| {
-        try p.recordStep(gpa, &rec, .{ .pos0 = pos, .tokens = null, .logit_rows = 1, .draw = 0.5, .sampled = &sampled });
+        try p.recordStep(gpa, &rec, .{ .pos0 = pos, .tokens = decode_token, .logit_rows = 1, .draw = 0.5, .sampled = &sampled });
         try rec.submit(gpa, 1);
         wall += try time(rt, &rec);
         pos += 1;
@@ -81,12 +84,12 @@ pub fn run(rt: *gen.Runtime, chunk: u32, at: u32, out: *Io.Writer) !void {
     });
     try report(rt, decode_steps, out);
 
-    if (p.mtp != null) {
+    if (p.mtp()) {
         rt.host.stopProfile();
         var verdicts: [2][2]u32 = undefined;
         var draft: u32 = undefined;
         const Round = struct {
-            fn record(pp: *zllm.plan.qwen35.Program, a: std.mem.Allocator, r: *zllm.gpu.cmd.Recorder, at_pos: u32, v: *[2][2]u32, d: *u32) !void {
+            fn record(pp: *zllm.plan.Program, a: std.mem.Allocator, r: *zllm.gpu.cmd.Recorder, at_pos: u32, v: *[2][2]u32, d: *u32) !void {
                 try pp.recordMtp(a, r, .{ .pos0 = at_pos - 2, .tokens = &.{ 1, 2 }, .draft = true });
                 try pp.recordVerify(a, r, .{ .pos0 = at_pos, .token = 2, .draws = .{ 0.5, 0.5 }, .sampled = v, .draft = d });
             }

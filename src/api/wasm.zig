@@ -20,7 +20,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const zllm = @import("zllm");
-const plan = zllm.plan.qwen35;
+const plan = zllm.plan;
 const plan_common = zllm.plan.common;
 const sampler = zllm.sampler;
 const sched = zllm.sched;
@@ -178,17 +178,16 @@ export fn zllm_detokenize(ptr: [*]const u32, count: usize) i32 {
 
 export fn zllm_info() i32 {
     const rt = runtime orelse return fail("info", error.NotLoaded);
-    const hp = rt.program.hp;
-    const cfg = rt.program.cfg;
+    const p = &rt.program;
     rt.text.clearRetainingCapacity();
     rt.text.print(gpa, "{f}", .{std.json.fmt(.{
-        .architecture = "qwen35",
-        .n_layer = hp.n_layer,
-        .n_embd = hp.n_embd,
-        .vocab = hp.vocab,
-        .context = cfg.context,
-        .max_tokens = cfg.max_tokens,
-        .kv = cfg.kv,
+        .architecture = p.architecture(),
+        .n_layer = p.layers(),
+        .n_embd = p.embedding(),
+        .vocab = p.vocab(),
+        .context = p.context(),
+        .max_tokens = p.maxTokens(),
+        .kv = p.kv(),
         .resident_tokens = rt.engine.resident().len,
     }, .{})}) catch |err| return fail("info", err);
     setText(rt.text.items);
@@ -280,10 +279,8 @@ const Runtime = struct {
         rt.model = try plan.Model.upload(arena, gpa, &rt.setup, &rt.set, file, limits);
         rt.program = try plan.Program.build(arena, gpa, &rt.setup, &rt.set, &rt.model, .{
             .context = o.context,
-            .max_tokens = @min(512, o.context),
             .kv = o.kv,
-            .mtp = plan.canSpeculate(&rt.model, limits),
-            .logit_rows = 2,
+            .mtp = rt.model.canSpeculate(limits),
         }, limits);
         try rt.setup.submit(gpa, 0);
         rt.engine = try .init(gpa, &rt.program, &rt.tok);
