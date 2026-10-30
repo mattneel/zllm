@@ -76,11 +76,16 @@ const server = Bun.serve({
   hostname: "0.0.0.0",
   async fetch(req) {
     const { pathname } = new URL(req.url);
+    // The page, its bundle and the wasm change with every rebuild: never
+    // from the browser's cache.
+    const fresh = { "Cache-Control": "no-store" };
     if (pathname === "/") {
-      return new Response(Bun.file(`${root}demo/index.html`));
+      return new Response(Bun.file(`${root}demo/index.html`), { headers: fresh });
     }
     if (pathname === "/zllm.wasm") {
-      return new Response(Bun.file(wasm), { headers: { "Content-Type": "application/wasm" } });
+      return new Response(Bun.file(wasm), {
+        headers: { ...fresh, "Content-Type": "application/wasm" },
+      });
     }
     if (pathname.startsWith("/models/")) {
       const name = decodeURIComponent(pathname.slice("/models/".length));
@@ -91,7 +96,7 @@ const server = Bun.serve({
     }
     const asset = assets.get(pathname);
     if (asset !== undefined) {
-      return new Response(asset);
+      return new Response(asset, { headers: fresh });
     }
     return new Response("not found", { status: 404 });
   },
