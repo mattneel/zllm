@@ -31,6 +31,9 @@ for await (const chunk of engine.chat.completions.create({ messages, stream: tru
   const delta = chunk.choices[0].delta; // reasoning_content, then content
 }
 const reply = await engine.chat.completions.create({ messages, enable_thinking: false });
+// A model with its own template (Llama, Granite, ...) also takes vLLM's
+// chat_template_kwargs:
+await engine.chat.completions.create({ messages, chat_template_kwargs: { date_string: "1 Nov 2026" } });
 
 // Tool calling, in the OpenAI format.
 const tools = [{ type: "function", function: { name: "get_weather", parameters: { /* JSON Schema */ } } }];

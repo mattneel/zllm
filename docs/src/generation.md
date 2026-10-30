@@ -250,7 +250,8 @@ with stray quotes, the penalty steering it off tokens code repeats.
 
 ## Chat format
 
-`zllm chat` formats conversations with the fixed Qwen chat template,
+For Qwen 3.5–3.8 and the Gyro-Coder, `zllm chat` formats conversations with
+the fixed Qwen chat template,
 [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
 @ `855bffc4`, v22.5. `src/chat/chat.zig` transcribes it for text
 conversations with its default options, including:
@@ -269,6 +270,9 @@ conversations with its default options, including:
 
 `check-chat` compares the transcription with the Jinja template, rendered as
 Hugging Face `transformers` renders it.
+
+Other models use their own template from the GGUF, through zllm's Jinja
+interpreter ([Dense transformers](dense.md#chat)).
 
 The template keeps earlier turns' reasoning (`preserve_thinking`), which
 matters for reuse. Each new prompt re-renders the previous reply exactly as

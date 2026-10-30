@@ -82,9 +82,15 @@ var header: ?struct { bytes: []u8, file: zllm.gguf.File } = null;
 var runtime: ?*Runtime = null;
 
 /// Reports `err` with its context; returns the error result.
+/// More about the error `fail` reports next (a chat template's
+/// raise_exception message), alive until then.
+var detail: ?[]const u8 = null;
+
 fn fail(context: []const u8, err: anyerror) i32 {
     message.clearRetainingCapacity();
     message.print(gpa, "{s}: {t}", .{ context, err }) catch {};
+    if (detail) |d| message.print(gpa, ": {s}", .{d}) catch {};
+    detail = null;
     setText(message.items);
     return -1;
 }
@@ -272,6 +278,10 @@ const RequestJson = struct {
     logit_bias: []const sampler.Bias = &.{},
     /// zllm.sched.Request.speculate.
     speculate: ?bool = null,
+    /// More keyword arguments for a model's own chat template, as vLLM's.
+    chat_template_kwargs: ?std.json.Value = null,
+    /// Unix time in seconds, for a model's own template's strftime_now.
+    now: ?i64 = null,
 };
 
 /// The model on the GPU and the engine over it. Heap-allocated: the engine
@@ -283,6 +293,9 @@ const Runtime = struct {
     tok: zllm.tokenizer.Tokenizer,
     /// What requests leave unset takes.
     defaults: sampler.Defaults,
+    /// The model's own chat template, where zllm.chat's fixed one does not
+    /// apply.
+    template: ?zllm.chat.Template = null,
     set: zllm.kernels.Set,
     model: plan.Model,
     program: plan.Program,
@@ -331,6 +344,10 @@ const Runtime = struct {
             .plan_key = key,
         };
         const arena = rt.arena_state.allocator();
+        const arch = file.get("general.architecture");
+        if (arch == null or arch.? != .string or !zllm.chat.supports(arch.?.string)) {
+            rt.template = try zllm.chat.Template.fromGguf(arena, file, &rt.tok);
+        }
         rt.set = try .create(gpa, arena, &rt.setup);
         rt.model = try plan.Model.upload(arena, gpa, &rt.setup, &rt.set, file, rt.limits);
         rt.config.mtp = rt.model.canSpeculate(rt.limits);
@@ -458,9 +475,30 @@ const Runtime = struct {
         var prompt: std.ArrayList(u32) = .empty;
         var defaults = rt.defaults.raw;
         if (r.messages) |messages| {
-            if (!zllm.chat.supports(rt.program.architecture())) return error.NoChatTemplate;
             var text: std.ArrayList(u8) = .empty;
-            try zllm.chat.render(arena, messages, .{ .enable_thinking = r.enable_thinking, .reasoning_effort = r.reasoning_effort, .tools = r.tools }, &text);
+            if (zllm.chat.supports(rt.program.architecture())) {
+                try zllm.chat.render(arena, messages, .{ .enable_thinking = r.enable_thinking, .reasoning_effort = r.reasoning_effort, .tools = r.tools }, &text);
+            } else {
+                const t = rt.template orelse return error.NoChatTemplate;
+                // The tools as sent; the messages in the OpenAI form.
+                const raw = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{ .parse_numbers = false });
+                var kwargs: std.json.ObjectMap = if (r.chat_template_kwargs) |kw| switch (kw) {
+                    .object => |o| try o.clone(arena),
+                    else => return error.BadRequest,
+                } else .empty;
+                if (!kwargs.contains("enable_thinking")) try kwargs.put(arena, "enable_thinking", .{ .bool = r.enable_thinking });
+                if (r.reasoning_effort) |e| if (!kwargs.contains("reasoning_effort")) try kwargs.put(arena, "reasoning_effort", .{ .string = e });
+                var raised: ?[]const u8 = null;
+                t.render(arena, .{
+                    .messages = try zllm.chat.messagesJson(arena, messages),
+                    .tools = if (r.tools.len > 0) raw.object.get("tools") else null,
+                    .kwargs = kwargs,
+                    .now = if (r.now) |s| .fromUnix(s) else null,
+                }, &text, &raised) catch |err| {
+                    detail = raised;
+                    return err;
+                };
+            }
             try rt.tok.encode(arena, text.items, &prompt);
             defaults = rt.defaults.chat(r.enable_thinking);
         } else if (r.tokens) |ids| {

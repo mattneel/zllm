@@ -47,6 +47,13 @@ reference runs them.
 
 ## Chat
 
-zllm's chat format is Qwen 3.5's; `chat` and the browser's `messages`
-requests refuse other architectures (`NoChatTemplate`). Give them a prompt
-with `generate`, or token ids.
+Qwen 3.5–3.8 and the Gyro-Coder chat in zllm's fixed Qwen template
+([Generation](generation.md)). The dense models chat in their own
+(`tokenizer.chat_template` in the GGUF), which `src/chat/jinja.zig` renders as
+transformers' `apply_chat_template` does ([Validation](validation.md#chat-template)):
+the messages in the OpenAI form, the tools offered, `add_generation_prompt`,
+the BOS and EOS tokens' text, `enable_thinking` and `reasoning_effort` when
+set, and in the browser any `chat_template_kwargs`, as vLLM takes them.
+`strftime_now` formats the current UTC date (Llama 3's "Today Date"); the
+browser's shim sends its clock with each request. A model without a template
+refuses chat requests (`NoChatTemplate`).

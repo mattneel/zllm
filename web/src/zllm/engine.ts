@@ -135,6 +135,8 @@ export interface ChatRequest {
   /** Qwen thinking (default on), and its effort ("none" turns it off). */
   enable_thinking?: boolean;
   reasoning_effort?: string;
+  /** More keyword arguments for a model's own chat template (as vLLM's). */
+  chat_template_kwargs?: Record<string, unknown>;
   /** Each content token's log-probability, and `top_logprobs` alternatives. */
   logprobs?: boolean;
   top_logprobs?: number;
@@ -211,6 +213,9 @@ interface RequestJson extends SamplingJson {
   tools?: Tool[];
   enable_thinking?: boolean;
   reasoning_effort?: string | null;
+  chat_template_kwargs?: Record<string, unknown>;
+  /** Unix seconds, for a model's own template's strftime_now. */
+  now?: number;
   logprobs?: number;
   speculate?: boolean;
   max_tokens: number;
@@ -639,6 +644,10 @@ export class Engine {
       ...(offersTools(req) ? { tools: req.tools } : {}),
       enable_thinking: thinking,
       reasoning_effort: req.reasoning_effort ?? null,
+      ...(req.chat_template_kwargs !== undefined
+        ? { chat_template_kwargs: req.chat_template_kwargs }
+        : {}),
+      now: Math.floor(Date.now() / 1000),
       ...(req.logprobs === true ? { logprobs: req.top_logprobs ?? 0 } : {}),
       max_tokens: req.max_completion_tokens ?? req.max_tokens ?? 4096,
       stop: typeof req.stop === "string" ? [req.stop] : (req.stop ?? []),

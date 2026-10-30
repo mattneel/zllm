@@ -173,6 +173,10 @@ pub const Runtime = struct {
     plan_cached: bool = false,
     /// What requests leave unset takes.
     defaults: sampler.Defaults,
+    /// The model's own chat template, where chat's fixed one does not apply.
+    template: ?chat.Template = null,
+    /// Owns `template` (a rebuild resets `arena_state`).
+    template_arena: std.heap.ArenaAllocator,
     /// Rebuilds after a lost device.
     recoveries: u32 = 0,
 
@@ -206,6 +210,7 @@ pub const Runtime = struct {
             .device = undefined,
             .host = undefined,
             .arena_state = .init(gpa),
+            .template_arena = .init(gpa),
             .tok = try .load(gpa, file),
             .defaults = .fromGguf(file),
             .set = undefined,
@@ -216,6 +221,11 @@ pub const Runtime = struct {
         errdefer {
             rt.tok.deinit(gpa);
             rt.arena_state.deinit();
+            rt.template_arena.deinit();
+        }
+        const arch = file.get("general.architecture");
+        if (arch == null or arch.? != .string or !chat.supports(arch.?.string)) {
+            rt.template = try chat.Template.fromGguf(rt.template_arena.allocator(), file, &rt.tok);
         }
         if (rt.tok.ids.get("<|im_end|>")) |id| try rt.stop_tokens.append(gpa, id);
         if (rt.tok.eos) |id| if (std.mem.indexOfScalar(u32, rt.stop_tokens.items, id) == null) try rt.stop_tokens.append(gpa, id);
@@ -338,6 +348,7 @@ pub const Runtime = struct {
         rt.close();
         rt.completions.deinit(gpa);
         rt.stop_tokens.deinit(gpa);
+        rt.template_arena.deinit();
         rt.tok.deinit(gpa);
         rt.arena_state.deinit();
         gpa.destroy(rt);
@@ -441,7 +452,9 @@ pub fn generate(rt: *Runtime, prompt: []const u8, o: Options, out: *Io.Writer) !
 }
 
 pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void {
-    if (!chat.supports(rt.program.architecture())) return error.NoChatTemplate;
+    // The fixed Qwen template, or the model's own.
+    const fixed = chat.supports(rt.program.architecture());
+    if (!fixed and rt.template == null) return error.NoChatTemplate;
     const gpa = rt.gpa;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -467,13 +480,34 @@ pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void
         try messages.append(arena, .{ .role = .user, .content = try arena.dupe(u8, user) });
 
         prompt.clearRetainingCapacity();
-        try chat.render(gpa, messages.items, .{ .enable_thinking = o.think }, &prompt);
+        if (fixed) {
+            try chat.render(gpa, messages.items, .{ .enable_thinking = o.think }, &prompt);
+        } else {
+            var render_arena: std.heap.ArenaAllocator = .init(gpa);
+            defer render_arena.deinit();
+            const ra = render_arena.allocator();
+            var kwargs: std.json.ObjectMap = .empty;
+            try kwargs.put(ra, "enable_thinking", .{ .bool = o.think });
+            var text: std.ArrayList(u8) = .empty;
+            var raised: ?[]const u8 = null;
+            const now = Io.Timestamp.now(rt.io, .real);
+            rt.template.?.render(ra, .{
+                .messages = try chat.messagesJson(ra, messages.items),
+                .kwargs = kwargs,
+                .now = .fromUnix(@intCast(@divFloor(now.toNanoseconds(), std.time.ns_per_s))),
+            }, &text, &raised) catch |err| {
+                if (raised) |msg| std.log.err("chat template: {s}", .{msg});
+                return err;
+            };
+            try prompt.appendSlice(gpa, text.items);
+        }
         ids.clearRetainingCapacity();
         try rt.tok.encode(gpa, prompt.items, &ids);
         if (ids.items.len >= o.context) return error.ConversationTooLong;
 
         reply.clearRetainingCapacity();
-        if (o.think) try out.writeAll("<think>\n");
+        // The reply starts inside the think block the prompt opens.
+        if (if (fixed) o.think else std.mem.endsWith(u8, prompt.items, "<think>\n")) try out.writeAll("<think>\n");
         const t = rt.turn(.{
             .prompt = ids.items,
             .max_tokens = @min(o.max_tokens, o.context - @as(u32, @intCast(ids.items.len))),

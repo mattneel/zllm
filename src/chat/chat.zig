@@ -88,6 +88,33 @@ pub const Template = struct {
     }
 };
 
+/// `messages` in the OpenAI form templates take (reasoning as
+/// reasoning_content, calls as {type, function: {name, arguments}}).
+pub fn messagesJson(arena: Allocator, messages: []const Message) Allocator.Error!std.json.Value {
+    var list: std.json.Array = .empty;
+    for (messages) |m| {
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(arena, "role", .{ .string = @tagName(m.role) });
+        try obj.put(arena, "content", .{ .string = m.content });
+        if (m.reasoning) |r| try obj.put(arena, "reasoning_content", .{ .string = r });
+        if (m.tool_calls.len > 0) {
+            var calls: std.json.Array = .empty;
+            for (m.tool_calls) |call| {
+                var function: std.json.ObjectMap = .empty;
+                try function.put(arena, "name", .{ .string = call.function.name });
+                try function.put(arena, "arguments", call.function.arguments orelse .{ .object = .empty });
+                var entry: std.json.ObjectMap = .empty;
+                try entry.put(arena, "type", .{ .string = "function" });
+                try entry.put(arena, "function", .{ .object = function });
+                try calls.append(arena, .{ .object = entry });
+            }
+            try obj.put(arena, "tool_calls", .{ .array = calls });
+        }
+        try list.append(arena, .{ .object = obj });
+    }
+    return .{ .array = list };
+}
+
 pub const Role = enum { system, developer, user, assistant, tool };
 
 /// A call an assistant turn made, as in the OpenAI and transformers formats.
