@@ -1,6 +1,7 @@
-//! Execution plans: weight layout, activation buffers and recorded steps.
-//! `Model` and `Program` pick the architecture's own from the GGUF
-//! metadata; the engine drives either through `Program`.
+//! Execution plans: weight layout, activation buffers and recorded steps,
+//! and the cache of what tuning found for them. `Model` and `Program` pick
+//! the architecture's own from the GGUF metadata; the engine drives either
+//! through `Program`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,6 +14,7 @@ const graph = @import("../graph/qwen4exp.zig");
 pub const common = @import("common.zig");
 pub const qwen35 = @import("qwen35.zig");
 pub const qwen4exp = @import("qwen4exp.zig");
+pub const cache = @import("cache.zig");
 
 /// A model's weights on the GPU.
 pub const Model = union(enum) {

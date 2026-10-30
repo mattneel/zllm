@@ -120,6 +120,7 @@ pub fn main(init: std.process.Init) !void {
             else => return err,
         };
         if (is_check) opts.context = 2048;
+        opts.plan_cache = try planCacheDir(arena, init.environ_map);
         var mapped = try FileBytes.open(io, args[2]);
         defer mapped.close(io);
         var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
@@ -135,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, tuning {d}, program {d}, calibration {d}); context {d}, {t} KV", .{
             rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.tuning / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, rt.program.context(), rt.program.kv(),
         });
+        if (rt.plan_cached) std.debug.print("; tuning from the plan cache", .{});
         if (rt.tuned[0] > 0) std.debug.print("; {d} of {d} decode-multiply shapes tuned to another variant", .{ rt.tuned[1], rt.tuned[0] });
         if (rt.program.mtp()) std.debug.print("; {s}", .{if (rt.engine.speculates()) "speculative" else "MTP block, not speculating by default"});
         std.debug.print("]\n", .{});
@@ -337,6 +339,21 @@ fn defaultThreads(io: Io, env: *const std.process.Environ.Map) usize {
     var buf: [8]u8 = undefined;
     const smt = Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/smt/active", &buf) catch return logical;
     return if (std.mem.startsWith(u8, smt, "1")) @max(1, logical / 2) else logical;
+}
+
+/// The plan cache's directory: ZLLM_PLAN_CACHE if set (empty: no cache),
+/// else zllm/plans under the user's cache directory (LOCALAPPDATA on
+/// Windows, XDG_CACHE_HOME or ~/.cache elsewhere).
+fn planCacheDir(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]const u8 {
+    if (env.get("ZLLM_PLAN_CACHE")) |dir| return if (dir.len == 0) null else dir;
+    const sep = std.fs.path.sep_str;
+    if (builtin.os.tag == .windows) {
+        const base = env.get("LOCALAPPDATA") orelse return null;
+        return try std.mem.concat(arena, u8, &.{ base, sep, "zllm", sep, "plans" });
+    }
+    if (env.get("XDG_CACHE_HOME")) |base| return try std.mem.concat(arena, u8, &.{ base, "/zllm/plans" });
+    const home = env.get("HOME") orelse return null;
+    return try std.mem.concat(arena, u8, &.{ home, "/.cache/zllm/plans" });
 }
 
 fn fail(msg: []const u8) error{InvalidUsage} {

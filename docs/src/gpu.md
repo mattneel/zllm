@@ -154,6 +154,22 @@ goes from 40.7–41.5 tok/s to 47.0–47.3, one token per step from 30.0–30.4 
 (6.4e-6 relative L2 at most, against 6.2e-6). The sweep takes 13 s;
 `--no-tune` skips it.
 
+### Plan cache
+
+The CLI keeps what a sweep found in the plan cache (spec §7,
+`src/plan/cache.zig`): one JSON file of the variants that differ from the
+default, named by its key, in `%LOCALAPPDATA%\zllm\plans` on Windows and
+`$XDG_CACHE_HOME/zllm/plans` (or `~/.cache/zllm/plans`) elsewhere;
+`ZLLM_PLAN_CACHE` names another directory, or none when empty. The key is a
+SHA-256 over everything that could change the result: the adapter (vendor,
+architecture, device, description, which carries the driver version on most
+backends, and backend), the runtime, the device limits the plan uses, the
+model's GGUF header and tensor index, the zllm version, and every kernel's
+source. A load that finds its key's file uses it instead of sweeping; a file
+under another key, or one naming an unknown variant or type, is ignored, and
+the sweep's result replaces it. On the Gyro-Coder the cached load skips
+2.5 s of tuning and decodes as fast, with the same output.
+
 ## Step program
 
 `src/plan/qwen35.zig` builds everything a step needs once, as the spec's

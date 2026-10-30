@@ -58,6 +58,10 @@ pub const Options = struct {
     speculate: ?bool = null,
     /// Tune the decode multiplies at load.
     tune: bool = true,
+    /// The plan cache's directory: tuning found there for this GPU, model
+    /// and build is used instead of sweeping, and a sweep's is stored. The
+    /// CLI sets it from the environment; null, none.
+    plan_cache: ?[]const u8 = null,
 
     pub fn parse(arena: Allocator, args: []const []const u8) error{ InvalidUsage, OutOfMemory }!Options {
         var o: Options = .{};
@@ -159,6 +163,8 @@ pub const Runtime = struct {
     /// Shapes the sweep tuned, and how many got a variant other than the
     /// default.
     tuned: [2]u32 = .{ 0, 0 },
+    /// The tuning came from the plan cache.
+    plan_cached: bool = false,
     /// What requests leave unset takes.
     defaults: sampler.Defaults,
 
@@ -193,14 +199,21 @@ pub const Runtime = struct {
         };
         const arena = rt.arena_state.allocator();
         const d = host.d;
-        var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
-        const info = d.info(&raw);
-        rt.adapter = try std.fmt.allocPrint(arena, "{s} ({s})", .{ info.device, info.backend });
-        d.freeInfo(raw);
         const limits: plan_common.Limits = .{
             .max_binding = d.limits.maxStorageBufferBindingSize,
             .offset_align = d.limits.minStorageBufferOffsetAlignment,
         };
+        var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
+        const info = d.info(&raw);
+        rt.adapter = try std.fmt.allocPrint(arena, "{s} ({s})", .{ info.device, info.backend });
+        // What the plan cache's tuning is valid for (plan.cache.key).
+        const plan_key = plan.cache.key(.{
+            .adapter = &.{ info.vendor, info.architecture, info.device, info.description, info.backend },
+            .runtime = "dawn",
+            .limits = &.{ limits.max_binding, limits.offset_align },
+            .model_header = bytes[0..@intCast(file.data_offset)],
+        });
+        d.freeInfo(raw);
         var rec: zllm.gpu.cmd.Recorder = .{};
         defer rec.deinit(gpa);
         var t = Io.Timestamp.now(io, .awake);
@@ -211,7 +224,14 @@ pub const Runtime = struct {
         try rt.executeTimed(&rec, &t, &rt.load.weights);
         const mtp = rt.model.canSpeculate(limits);
         var tuning: plan_common.Tuning = .{};
-        if (o.tune) {
+        const cached = if (o.tune) if (o.plan_cache) |dir| readPlan(io, arena, dir, plan_key) else null else null;
+        if (cached) |found| {
+            tuning = found;
+            rt.plan_cached = true;
+            const now = Io.Timestamp.now(io, .awake);
+            rt.load.tuning = @intCast(t.durationTo(now).toNanoseconds());
+            t = now;
+        } else if (o.tune) {
             // Decoding mostly runs steps of two where it speculates.
             var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &rt.set, &rt.model, .{}, if (mtp and rt.model.speculationPays()) 2 else 1);
             while (try sweep.next()) |words| {
@@ -221,6 +241,9 @@ pub const Runtime = struct {
             }
             tuning = sweep.tuning();
             rt.tuned = .{ @intCast(sweep.shapes.len), @intCast(tuning.entries.len) };
+            if (o.plan_cache) |dir| writePlan(io, gpa, dir, plan_key, tuning) catch |err| {
+                std.log.warn("plan cache: cannot write {s}: {t}", .{ dir, err });
+            };
             const now = Io.Timestamp.now(io, .awake);
             rt.load.tuning = @intCast(t.durationTo(now).toNanoseconds());
             t = now;
@@ -393,4 +416,31 @@ pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void
         reportTurn(t);
         try messages.append(arena, .{ .role = .assistant, .content = try arena.dupe(u8, reply.items) });
     }
+}
+
+/// The plan cache's tuning for `key`, from `dir`/<key>.json; null if there
+/// is none or it is unusable (plan.cache.parse).
+fn readPlan(io: Io, arena: Allocator, dir: []const u8, key: plan.cache.Key) ?plan_common.Tuning {
+    var name: [plan.cache.file_name_len]u8 = undefined;
+    const d = Io.Dir.cwd().openDir(io, dir, .{}) catch return null;
+    defer d.close(io);
+    const bytes = d.readFileAlloc(io, plan.cache.fileName(key, &name), arena, .limited(1 << 20)) catch return null;
+    return plan.cache.parse(arena, bytes, key);
+}
+
+/// Stores `tuning` under `key` in `dir`, creating it; written to a
+/// temporary file first, so a reader never sees half of one.
+fn writePlan(io: Io, gpa: Allocator, dir: []const u8, key: plan.cache.Key, tuning: plan_common.Tuning) !void {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try plan.cache.serialize(gpa, key, tuning, &bytes);
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const d = try Io.Dir.cwd().openDir(io, dir, .{});
+    defer d.close(io);
+    var name: [plan.cache.file_name_len]u8 = undefined;
+    const final = plan.cache.fileName(key, &name);
+    var tmp_name: [plan.cache.file_name_len + 4]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_name, "{s}.tmp", .{final});
+    try d.writeFile(io, .{ .sub_path = tmp, .data = bytes.items });
+    try d.rename(tmp, d, final, io);
 }

@@ -1,5 +1,7 @@
 //! zllm: LLM inference on WebGPU from one Zig codebase.
 
+pub const version = @import("version.zig").zllm;
+
 pub const gguf = @import("gguf/gguf.zig");
 pub const tokenizer = @import("tokenizer/tokenizer.zig");
 pub const graph = @import("graph/graph.zig");
@@ -21,6 +23,7 @@ test {
     _ = @import("tokenizer/unicode.zig");
     _ = @import("tokenizer/pretokenize.zig");
     _ = @import("sampler/defaults.zig");
+    _ = @import("plan/cache.zig");
     _ = ref.ops;
     _ = ref.tensor;
     _ = ref.gyro;
