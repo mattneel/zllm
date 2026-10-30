@@ -37,19 +37,20 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,           checkMatmul,         checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair,    checkMatmulF16,      checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,           checkEmbed,          checkRopeAppendF32,  checkRopeAppendF16,     checkRopeAppendRounding,
-        checkAttentionF32,      checkAttentionF16,   checkAttentionWide,  checkAttnDecode,        checkAttnDecodeWide,
-        checkAttnSparse,        checkQsaIndexer,     checkDeltaPrep,      checkDeltaKeep,         checkDeltaRule,
-        checkGatedNormSigmoid,  checkDraft,          checkGyroMatvec,     checkMoeRoute,          checkRotate128,
-        checkMoeCombine,        checkHc,             checkPle,            checkSampleGreedy,      checkSampleTopKTopP,
-        checkSampleMinP,        checkSampleTopP,     checkSamplePlain,    checkSampleTopK1,       checkSampleLargeTopK,
-        checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec, Quant(.q8_0).matmul,    Quant(.q8_0).embed,
-        checkEmbedStride,       Quant(.q3_k).matvec, Quant(.q3_k).matmul, Quant(.q3_k).embed,     Quant(.q4_k).matvec,
-        Quant(.q4_k).matmul,    Quant(.q4_k).embed,  Quant(.q5_k).matvec, Quant(.q5_k).matmul,    Quant(.q5_k).embed,
-        Quant(.q6_k).matvec,    Quant(.q6_k).matmul, Quant(.q6_k).embed,  checkQuantTiles,        checkQuantSiluPair,
-        checkQuantizeQ8K,       checkQuantizeQ80,    checkQuantizeNorm,   checkQuantizeSilu,
+        checkRmsNorm,          checkMatmul,          checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair,   checkMatmulF16,       checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,          checkEmbed,           checkRopeAppendF32,  checkRopeAppendF16,     checkRopeAppendRounding,
+        checkRopeAppendDense,  checkRopeAppendQwen3, checkAttentionF32,   checkAttentionF16,      checkAttentionWide,
+        checkAttentionUngated, checkAttnDecode,      checkAttnDecodeWide, checkAttnDecodeUngated, checkAttnSparse,
+        checkQsaIndexer,       checkDeltaPrep,       checkDeltaKeep,      checkDeltaRule,         checkGatedNormSigmoid,
+        checkDraft,            checkGyroMatvec,      checkMoeRoute,       checkRotate128,         checkMoeCombine,
+        checkHc,               checkPle,             checkSampleGreedy,   checkSampleTopKTopP,    checkSampleMinP,
+        checkSampleTopP,       checkSamplePlain,     checkSampleTopK1,    checkSampleLargeTopK,   checkSampleTopKSkipped,
+        checkSampleVocab,      Quant(.q8_0).matvec,  Quant(.q8_0).matmul, Quant(.q8_0).embed,     checkEmbedStride,
+        Quant(.q3_k).matvec,   Quant(.q3_k).matmul,  Quant(.q3_k).embed,  Quant(.q4_k).matvec,    Quant(.q4_k).matmul,
+        Quant(.q4_k).embed,    Quant(.q5_k).matvec,  Quant(.q5_k).matmul, Quant(.q5_k).embed,     Quant(.q6_k).matvec,
+        Quant(.q6_k).matmul,   Quant(.q6_k).embed,   checkQuantTiles,     checkQuantSiluPair,     checkQuantizeQ8K,
+        checkQuantizeQ80,      checkQuantizeNorm,    checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -695,42 +696,60 @@ fn sigmoid64(x: f64) f64 {
 /// head ← rmsnorm(head) · w, then NeoX RoPE at `pos` over the first n_rot
 /// dims, in float64.
 fn normRope(head: []f64, w: []const f32, pos: usize, n_rot: u32, base: f64, eps: f64) void {
-    var ss: f64 = 0;
-    for (head) |v| ss += v * v;
-    const scale = 1 / @sqrt(ss / @as(f64, @floatFromInt(head.len)) + eps);
-    for (head, w) |*v, wi| v.* = v.* * scale * wi;
+    normRopeMode(head, w, pos, n_rot, base, eps, .{});
+}
+
+/// How rope_append treats a head: the layout and norm it expects, and the
+/// RoPE pairing and per-pair angle divisors.
+const RopeMode = struct {
+    gated: bool = true,
+    norm: bool = true,
+    normal: bool = false,
+    factors: ?[]const f32 = null,
+};
+
+fn normRopeMode(head: []f64, w: []const f32, pos: usize, n_rot: u32, base: f64, eps: f64, mode: RopeMode) void {
+    if (mode.norm) {
+        var ss: f64 = 0;
+        for (head) |v| ss += v * v;
+        const scale = 1 / @sqrt(ss / @as(f64, @floatFromInt(head.len)) + eps);
+        for (head, w) |*v, wi| v.* = v.* * scale * wi;
+    }
     const half = n_rot / 2;
     for (0..half) |i| {
-        const theta = @as(f64, @floatFromInt(pos)) * std.math.pow(f64, base, -2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n_rot)));
-        const x0 = head[i];
-        const x1 = head[i + half];
-        head[i] = x0 * @cos(theta) - x1 * @sin(theta);
-        head[i + half] = x0 * @sin(theta) + x1 * @cos(theta);
+        const factor: f64 = if (mode.factors) |f| f[i] else 1;
+        const theta = @as(f64, @floatFromInt(pos)) * std.math.pow(f64, base, -2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n_rot))) / factor;
+        const a = if (mode.normal) 2 * i else i;
+        const b = if (mode.normal) 2 * i + 1 else i + half;
+        const x0 = head[a];
+        const x1 = head[b];
+        head[a] = x0 * @cos(theta) - x1 * @sin(theta);
+        head[b] = x0 * @sin(theta) + x1 * @cos(theta);
     }
 }
 
 /// rope_append on 5 tokens at positions 7..11 of a fused Q|K|V projection:
-/// 3 query heads of 32 interleaved with gates, 2 KV heads, rotation over the
-/// first 16 dims, rows padded past V. Checks the whole projection (Q heads
-/// rotated in place, gates, K and V untouched) and the cache (K normalized
-/// and rotated, V copied, earlier positions untouched).
-fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool) !Result {
+/// 3 query heads of 32 (interleaved with gates, or not), 2 KV heads,
+/// rotation over the first n_rot dims, rows padded past V. Checks the whole
+/// projection (Q heads rotated in place, gates, K and V untouched) and the
+/// cache (K normalized and rotated, V copied, earlier positions untouched).
+fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool, n_rot: u32, mode: RopeMode) !Result {
     const tokens = 5;
     const heads = 3;
     const kv = 2;
     const hd = 32;
-    const n_rot = 16;
     const pos0 = 7;
     const eps = 1e-6;
     const base = 1e7;
     const width = kv * hd;
-    const k_off = heads * 2 * hd;
+    const q_head: u32 = if (mode.gated) 2 * hd else hd;
+    const k_off = heads * q_head;
     const v_off = k_off + width;
     const row = v_off + width + 8;
     const x = try c.random(tokens * row, 2);
     const qw = try c.random(hd, 1);
     const kw = try c.random(hd, 1);
-    const table = try kernels.ropeTable(c.arena, pos0 + tokens, n_rot, base);
+    const table = try kernels.ropeTableScaled(c.arena, pos0 + tokens, n_rot, base, mode.factors);
     const xa = try c.upload(x);
     const words: u32 = if (half) width / 2 else width;
     const kc = try c.output((pos0 + tokens) * words);
@@ -745,6 +764,9 @@ fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool) !Result {
         .v_off = v_off,
         .f16 = @intFromBool(half),
         .eps = eps,
+        .gated = @intFromBool(mode.gated),
+        .qk_norm = @intFromBool(mode.norm),
+        .normal = @intFromBool(mode.normal),
     }, &.{ xa, try c.upload(qw), try c.upload(kw), try c.upload(table), kc, vc, try c.step(tokens, pos0, 0) }, .{ heads + kv, tokens, 1 });
     const ck = try decodeCache(c, try c.readWords(kc), half);
     const cv = try decodeCache(c, try c.readWords(vc), half);
@@ -758,14 +780,14 @@ fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool) !Result {
     const want = try c.arena.alloc(f64, got.len);
     for (want[0..x.len], x) |*o, v| o.* = v;
     for (0..tokens) |t| {
-        for (0..heads) |h| normRope(want[t * row + h * 2 * hd ..][0..hd], qw, pos0 + t, n_rot, base, eps);
+        for (0..heads) |h| normRopeMode(want[t * row + h * q_head ..][0..hd], qw, pos0 + t, n_rot, base, eps, mode);
         const kd = want[x.len + t * width ..][0..width];
         const vd = want[x.len + cached + t * width ..][0..width];
         for (kd, vd, x[t * row + k_off ..][0..width], x[t * row + v_off ..][0..width]) |*a, *b, kv_, vv| {
             a.* = kv_;
             b.* = vv;
         }
-        for (0..kv) |g| normRope(kd[g * hd ..][0..hd], kw, pos0 + t, n_rot, base, eps);
+        for (0..kv) |g| normRopeMode(kd[g * hd ..][0..hd], kw, pos0 + t, n_rot, base, eps, mode);
     }
     // The table is f32 from the reference formula, so angles carry f32
     // error; the f16 cache rounds to nearest, half a step: at most 2^-11
@@ -774,11 +796,25 @@ fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool) !Result {
 }
 
 fn checkRopeAppendF32(c: *Ctx) !Result {
-    return ropeAppendCase(c, "rope_append (f32 cache)", false);
+    return ropeAppendCase(c, "rope_append (f32 cache)", false, 16, .{});
 }
 
 fn checkRopeAppendF16(c: *Ctx) !Result {
-    return ropeAppendCase(c, "rope_append (f16 cache)", true);
+    return ropeAppendCase(c, "rope_append (f16 cache)", true, 16, .{});
+}
+
+/// A dense model's prologue (Llama 3, Granite): Q heads not interleaved with
+/// gates, no Q/K norm, normal RoPE over the whole head with per-pair angle
+/// divisors (Llama 3's rope_freqs).
+fn checkRopeAppendDense(c: *Ctx) !Result {
+    const factors = try c.random(16, 1);
+    for (factors) |*f| f.* = 1 + 4 * @abs(f.*);
+    return ropeAppendCase(c, "rope_append (dense, normal)", true, 32, .{ .gated = false, .norm = false, .normal = true, .factors = factors });
+}
+
+/// Qwen 3's prologue: Q heads not interleaved, Q/K norm, NeoX RoPE.
+fn checkRopeAppendQwen3(c: *Ctx) !Result {
+    return ropeAppendCase(c, "rope_append (dense, NeoX)", true, 32, .{ .gated = false });
 }
 
 /// The f16 cache must hold the f32 cache's values rounded to nearest, ties
@@ -848,29 +884,32 @@ fn cacheWords(c: *Ctx, values: []f32, half: bool) ![]u32 {
 }
 
 /// An attention shape: `heads` query heads over 2 KV heads, head_dim 256,
-/// queries in rows padded past their gates (q_row). Qwen 3.5's 0.8B has 8
-/// heads; 24 (Qwen3.8-Flash-Next) takes attn_split_wide.
-fn AttnShape(comptime n_heads: u32) type {
+/// queries in rows padded past them (q_row), interleaved with their output
+/// gates when `gated`. Qwen 3.5's 0.8B has 8 heads; 24 (Qwen3.8-Flash-Next)
+/// takes attn_split_wide.
+fn AttnShape(comptime n_heads: u32, comptime is_gated: bool) type {
     return struct {
         const heads = n_heads;
+        const gated = is_gated;
         const kv = 2;
         const hd = 256;
         const width = kv * hd;
-        const q_row = heads * 2 * hd + 96;
+        const q_head = if (gated) 2 * hd else hd;
+        const q_row = heads * q_head + 96;
         const scale: f32 = 1.0 / 16.0;
         const split = kernels.attnSplit(heads / kv);
     };
 }
 
-/// Gated attention of `second` queries at positions first.. over the cache,
-/// in float64.
+/// Attention (gated when S.gated) of `second` queries at positions first..
+/// over the cache, in float64.
 fn attnWant(c: *Ctx, comptime S: type, qg: []const f32, k: []const f32, v: []const f32, first: u32, second: u32) ![]f64 {
     const want = try c.arena.alloc(f64, second * S.heads * S.hd);
     const s = try c.arena.alloc(f64, first + second);
     for (0..second) |t| for (0..S.heads) |h| {
         const kvh = h / (S.heads / S.kv);
         const keys = first + t + 1;
-        const q = qg[t * S.q_row + h * 2 * S.hd ..][0..S.hd];
+        const q = qg[t * S.q_row + h * S.q_head ..][0..S.hd];
         var max: f64 = -std.math.inf(f64);
         for (0..keys) |j| {
             var dot: f64 = 0;
@@ -886,7 +925,8 @@ fn attnWant(c: *Ctx, comptime S: type, qg: []const f32, k: []const f32, v: []con
         for (0..S.hd) |d| {
             var o: f64 = 0;
             for (0..keys) |j| o += s[j] * v[j * S.width + kvh * S.hd + d];
-            want[(t * S.heads + h) * S.hd + d] = o / sum * sigmoid64(qg[t * S.q_row + h * 2 * S.hd + S.hd + d]);
+            const gate: f64 = if (S.gated) sigmoid64(qg[t * S.q_row + h * 2 * S.hd + S.hd + d]) else 1;
+            want[(t * S.heads + h) * S.hd + d] = o / sum * gate;
         }
     };
     return want;
@@ -912,7 +952,7 @@ fn attentionCase(c: *Ctx, comptime S: type, name: []const u8, half: bool) !Resul
     const l = c.launcher();
     var row0: u32 = 0;
     while (row0 < second) : (row0 += kernels.attn_rows) {
-        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = @intFromBool(half), .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .row0 = row0 };
+        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = @intFromBool(half), .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .row0 = row0, .gated = @intFromBool(S.gated) };
         const split: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } };
         const combine: kernels.Grid = .{ .rows_y_from = .{ .x = S.heads, .row0 = row0, .max_rows = kernels.attn_rows } };
         const e: kernels.Extent = .{ .rows = second, .keys = total };
@@ -924,15 +964,19 @@ fn attentionCase(c: *Ctx, comptime S: type, name: []const u8, half: bool) !Resul
 }
 
 fn checkAttentionF32(c: *Ctx) !Result {
-    return attentionCase(c, AttnShape(8), "attention, 3 chunks (f32 cache)", false);
+    return attentionCase(c, AttnShape(8, true), "attention, 3 chunks (f32 cache)", false);
 }
 
 fn checkAttentionF16(c: *Ctx) !Result {
-    return attentionCase(c, AttnShape(8), "attention, 3 chunks (f16 cache)", true);
+    return attentionCase(c, AttnShape(8, true), "attention, 3 chunks (f16 cache)", true);
 }
 
 fn checkAttentionWide(c: *Ctx) !Result {
-    return attentionCase(c, AttnShape(24), "attention, 3 chunks, groups of 12", true);
+    return attentionCase(c, AttnShape(24, true), "attention, 3 chunks, groups of 12", true);
+}
+
+fn checkAttentionUngated(c: *Ctx) !Result {
+    return attentionCase(c, AttnShape(8, false), "attention, 3 chunks, ungated", true);
 }
 
 /// Decode attention: 3 queries after 150 cached positions, through
@@ -949,7 +993,7 @@ fn attnDecodeCase(c: *Ctx, comptime S: type, name: []const u8) !Result {
     const part = try c.output(second * S.heads * max_blocks * (S.hd + 2));
     const l = c.launcher();
     const step = try c.step(second, first, 0);
-    const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row };
+    const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .gated = @intFromBool(S.gated) };
     const qa = try c.upload(qg);
     const grid: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block } };
     try l.launch(S.split, params, &.{ qa, try c.upload(try cacheWords(c, k, true)), try c.upload(try cacheWords(c, v, true)), part, step }, grid.resolve(.{ .rows = second, .keys = total }));
@@ -959,11 +1003,15 @@ fn attnDecodeCase(c: *Ctx, comptime S: type, name: []const u8) !Result {
 }
 
 fn checkAttnDecode(c: *Ctx) !Result {
-    return attnDecodeCase(c, AttnShape(8), "attn_split + combine");
+    return attnDecodeCase(c, AttnShape(8, true), "attn_split + combine");
 }
 
 fn checkAttnDecodeWide(c: *Ctx) !Result {
-    return attnDecodeCase(c, AttnShape(24), "attn_split + combine, groups of 12");
+    return attnDecodeCase(c, AttnShape(24, true), "attn_split + combine, groups of 12");
+}
+
+fn checkAttnDecodeUngated(c: *Ctx) !Result {
+    return attnDecodeCase(c, AttnShape(8, false), "attn_split + combine, ungated");
 }
 
 /// The sparse attention's indexer over 230 positions, in steps of 3, 4, 1
@@ -1109,7 +1157,7 @@ fn checkQsaIndexer(c: *Ctx) !Result {
 /// of positions 64-127 left out (a whole 64-key block). With a width past
 /// every row's position, the same kernels attend to everything.
 fn checkAttnSparse(c: *Ctx) !Result {
-    const S = AttnShape(24);
+    const S = AttnShape(24, true);
     const first = 297;
     const second = 3;
     const total = first + second;
@@ -1134,7 +1182,7 @@ fn checkAttnSparse(c: *Ctx) !Result {
         const part = try c.output(second * S.heads * max_blocks * (S.hd + 2));
         const step = try c.step(second, first, 0);
         const qsa = try c.uniform(P.Qsa{ .heads = 4, .dim = 128, .ratio = r, .width = width, .stride = stride, .n_rot = 64, .eps = 1e-6, .row = 640 });
-        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row };
+        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .gated = @intFromBool(S.gated) };
         const grid: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block } };
         const l = c.launcher();
         try l.launch(.attn_split_sparse, params, &.{ qa, ka, va, part, step, sel_a, qsa }, grid.resolve(.{ .rows = second, .keys = total }));
@@ -1160,7 +1208,7 @@ fn attnWantMasked(c: *Ctx, comptime S: type, qg: []const f32, k: []const f32, v:
     const s = try c.arena.alloc(f64, total);
     for (0..second) |t| for (0..S.heads) |h| {
         const kvh = h / (S.heads / S.kv);
-        const q = qg[t * S.q_row + h * 2 * S.hd ..][0..S.hd];
+        const q = qg[t * S.q_row + h * S.q_head ..][0..S.hd];
         var max: f64 = -std.math.inf(f64);
         for (0..total) |j| {
             if (!mask[t * total + j]) continue;

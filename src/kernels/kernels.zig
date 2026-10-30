@@ -387,9 +387,16 @@ pub const params = struct {
         v_off: u32,
         f16: u32,
         eps: f32,
-        _pad: [3]u32 = @splat(0),
+        /// Query heads interleaved with their output gates (2·head_dim
+        /// apart); else head_dim apart.
+        gated: u32 = 1,
+        /// Per-head RMSNorm of Q and K by q_norm and k_norm; else neither
+        /// is normalized (both bindings are still bound).
+        qk_norm: u32 = 1,
+        /// RoPE pairs (2i, 2i + 1) (Llama's "normal" RoPE); else
+        /// (i, i + n_rot/2) (NeoX).
+        normal: u32 = 0,
     };
-    /// `attn_split` and `attn_combine`, for tokens row0 ...
     /// The sparse attention indexer's (qsa_*.wgsl, attn_sparse.wgsl):
     /// `heads` query heads of `dim`, blocks of `ratio` cells, `width` cells
     /// attended past which selection starts, `stride` blocks per row of the
@@ -404,6 +411,7 @@ pub const params = struct {
         eps: f32,
         row: u32,
     };
+    /// `attn_split` and `attn_combine`, for tokens row0 ...
     pub const Attention = extern struct {
         heads: u32,
         kv_heads: u32,
@@ -413,6 +421,10 @@ pub const params = struct {
         max_blocks: u32,
         q_row: u32,
         row0: u32 = 0,
+        /// Query heads interleaved with their output gates, which
+        /// attn_combine applies; else head_dim apart, ungated.
+        gated: u32 = 1,
+        _pad: [3]u32 = @splat(0),
     };
     pub const DeltaPrep = extern struct {
         channels: u32,
@@ -568,10 +580,16 @@ pub fn sampleStateWords(vocab: u32) u32 {
 /// RoPE (cos, sin) for positions [0, positions) and the n_rot/2 rotation
 /// pairs, as `rope_append` reads it. Same formula as the CPU reference.
 pub fn ropeTable(gpa: Allocator, positions: usize, n_rot: usize, base: f32) Allocator.Error![]f32 {
+    return ropeTableScaled(gpa, positions, n_rot, base, null);
+}
+
+/// As `ropeTable`, pair i's angle divided by factors[i] (Llama 3's
+/// `rope_freqs`).
+pub fn ropeTableScaled(gpa: Allocator, positions: usize, n_rot: usize, base: f32, factors: ?[]const f32) Allocator.Error![]f32 {
     const half = n_rot / 2;
     const table = try gpa.alloc(f32, positions * half * 2);
     for (0..positions) |pos| for (0..half) |i| {
-        const cs = ops.ropeCosSin(@intCast(pos), i, n_rot, base);
+        const cs = ops.ropeCosSinScaled(@intCast(pos), i, n_rot, base, if (factors) |f| f[i] else 1);
         table[(pos * half + i) * 2 ..][0..2].* = cs;
     };
     return table;

@@ -65,8 +65,13 @@ pub fn rope(x: []f32, pos: u32, n_rot: usize, base: f32) void {
 /// (cos, sin) of the rotation applied to pair `i` at position `pos`. GPU
 /// kernels read a table of these rather than evaluating trig themselves.
 pub fn ropeCosSin(pos: u32, i: usize, n_rot: usize, base: f32) [2]f32 {
+    return ropeCosSinScaled(pos, i, n_rot, base, 1);
+}
+
+/// As `ropeCosSin`, the angle divided by `factor`.
+pub fn ropeCosSinScaled(pos: u32, i: usize, n_rot: usize, base: f32, factor: f32) [2]f32 {
     const exponent = -2.0 * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_rot));
-    const theta = @as(f32, @floatFromInt(pos)) * std.math.pow(f32, base, exponent);
+    const theta = @as(f32, @floatFromInt(pos)) * std.math.pow(f32, base, exponent) / factor;
     return .{ @cos(theta), @sin(theta) };
 }
 

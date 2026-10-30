@@ -189,7 +189,12 @@ hit every tile and chunk remainder:
   positions before the step, which must stay zero. Its f16 cache must hold
   exactly its f32 cache's values rounded to nearest, ties to even, over
   random values at exponents −28 to 17 and planted ties, subnormals,
-  overflow, ±inf and NaN.
+  overflow, ±inf and NaN. Two more cases run the dense models' layouts:
+  query heads without gates, no Q/K norm and normal RoPE pairs with
+  per-pair angle divisors (Llama, Granite), and Qwen 3's (Q/K norm, NeoX).
+  Ignoring any of the three switches, or the divisors, fails them; the
+  ungated attention cases fail with the gate applied or the gated query
+  stride.
 - **Fused multiplies** start from a random output, so an accumulate that
   overwrites fails.
 
@@ -206,8 +211,9 @@ errors to within a factor of 2.
 | rope_append, f32 cache | 9.3e-8 | 1e-5 |
 | rope_append, f16 cache | 2.4e-4 | 5e-4 (half an f16 step) |
 | rope_append's f16 rounding, 65,536 values | 0 differ | 0 |
-| attention in 3 chunks, f32 and f16 cache; groups of 12 | 3.6e-7 | 1e-5 |
-| attn_split + attn_combine; groups of 12 | 3.2e-7 | 1e-5 |
+| rope_append, dense layouts (normal RoPE with divisors; Qwen 3), f16 cache | 2.4e-4 | 5e-4 |
+| attention in 3 chunks, f32 and f16 cache; groups of 12; ungated | 3.6e-7 | 1e-5 |
+| attn_split + attn_combine; groups of 12; ungated | 4.4e-7 | 1e-5 |
 | delta_prep (4 steps) | 4.0e-8 | 1e-5 |
 | delta_rule + gated_norm (2 steps) | 2.5e-7 | 1e-5 |
 

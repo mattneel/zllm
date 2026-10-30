@@ -1,16 +1,17 @@
 // The attention prologue for the step's m tokens, on the fused Q|K|V
-// projection (row t: Q heads interleaved with their output gates at 0, K at
-// k_off, V at v_off, `row` floats per token). One workgroup per (head x,
-// token t), over heads + kv_heads:
+// projection (row t: Q heads at 0, interleaved with their output gates when
+// `gated`, else head_dim apart; K at k_off, V at v_off, `row` floats per
+// token). One workgroup per (head x, token t), over heads + kv_heads:
 //
-//   x < heads    query head x: RMSNorm · q_norm, then NeoX RoPE on the
-//                first n_rot dims, in place
-//   x ≥ heads    KV head g = x − heads: K gets RMSNorm · k_norm and RoPE;
-//                K and V go to the cache at position pos0 + t
+//   x < heads    query head x: RMSNorm · q_norm (when qk_norm), then RoPE
+//                on the first n_rot dims, in place
+//   x ≥ heads    KV head g = x − heads: K gets RMSNorm · k_norm (when
+//                qk_norm) and RoPE; K and V go to the cache at position
+//                pos0 + t
 //
-// RoPE rotates pairs (i, i + n_rot/2) by the angle of position pos0 + t,
-// read as (cos, sin) from a host-built table: WGSL sin/cos are only accurate
-// near [−π, π]. The cache stores f16 pairs when f16 != 0, else f32 bits,
+// RoPE rotates pairs (i, i + n_rot/2) (NeoX), or (2i, 2i + 1) when `normal`,
+// by the angle of position pos0 + t, read as (cos, sin) from a host-built
+// table: WGSL sin/cos are only accurate near [−π, π]. The cache stores f16 pairs when f16 != 0, else f32 bits,
 // `kv_heads · head_dim` values per position. head_dim ≤ WG.
 //
 // The f16 values are rounded to nearest, ties to even, as llama.cpp's cache
@@ -27,9 +28,9 @@ struct Params {
     v_off: u32,
     f16: u32,
     eps: f32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    gated: u32,
+    qk_norm: u32,
+    normal: u32,
 }
 
 struct Step {
@@ -60,7 +61,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     let hd = p.head_dim;
     let is_q = x < p.heads;
     let g = x - select(p.heads, 0u, is_q);
-    let base = t * p.row + select(p.k_off + g * hd, 2u * x * hd, is_q);
+    let q_head = select(hd, 2u * hd, p.gated != 0u);
+    let base = t * p.row + select(p.k_off + g * hd, x * q_head, is_q);
 
     var v = 0.0;
     if (i < hd) {
@@ -76,7 +78,11 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     }
     let scale = 1.0 / sqrt(partial[0] / f32(hd) + p.eps);
     if (i < hd) {
-        vals[i] = v * scale * select(k_norm[i], q_norm[i], is_q);
+        if (p.qk_norm != 0u) {
+            vals[i] = v * scale * select(k_norm[i], q_norm[i], is_q);
+        } else {
+            vals[i] = v;
+        }
     }
     workgroupBarrier();
 
@@ -84,10 +90,13 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     let pos = step.pos0 + t;
     if (i < half) {
         let cs = rope[pos * half + i];
-        let x0 = vals[i];
-        let x1 = vals[i + half];
-        vals[i] = x0 * cs.x - x1 * cs.y;
-        vals[i + half] = x0 * cs.y + x1 * cs.x;
+        // The pair's two dims: (i, i + half), or (2i, 2i + 1).
+        let a = select(i, 2u * i, p.normal != 0u);
+        let b = select(i + half, 2u * i + 1u, p.normal != 0u);
+        let x0 = vals[a];
+        let x1 = vals[b];
+        vals[a] = x0 * cs.x - x1 * cs.y;
+        vals[b] = x0 * cs.y + x1 * cs.x;
     }
     workgroupBarrier();
 

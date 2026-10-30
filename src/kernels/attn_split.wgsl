@@ -8,7 +8,9 @@
 //
 // Scores: 4 threads per key, each over a quarter of head_dim; the group's
 // queries sit in workgroup memory, so each K row is read once for the whole
-// group. Cache format as in `attention` (f16 pairs or f32 bits).
+// group. Cache format as in `attention` (f16 pairs or f32 bits). Query
+// heads sit 2·head_dim apart, interleaved with their gates, when `gated`;
+// else head_dim apart.
 //
 // MAX_GROUP, the most query heads per KV head, is prepended (kernels.zig:
 // attn_split, attn_split_wide, attn_split_sparse), with `included`, which
@@ -33,6 +35,10 @@ struct Params {
     max_blocks: u32,
     q_row: u32,
     row0: u32,
+    gated: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct Step {
@@ -88,10 +94,11 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     let k0 = b * BLOCK;
     let kv_stride = p.kv_heads * hd;
     let q_stride = p.q_row;
+    let q_head = select(hd, 2u * hd, p.gated != 0u);
 
     for (var i = lid; i < group * hd; i += WG) {
         let h = g * group + i / hd;
-        qs[i] = qg[row * q_stride + 2u * h * hd + i % hd];
+        qs[i] = qg[row * q_stride + h * q_head + i % hd];
     }
     workgroupBarrier();
 
