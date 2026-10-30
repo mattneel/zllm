@@ -126,7 +126,11 @@ execution plan asks:
   buffer, and the sampler's buffers. With MTP, also the MTP block's own KV
   cache, and a second copy of the recurrent buffer that `delta_rule` fills
   with the state as after a step's kept row (`Step.keep`): rolling back to
-  that row is one buffer copy.
+  that row is one buffer copy. A speculative round records the MTP block's
+  step over the last step's positions, its draft head over the last row
+  only and the `draft` argmax, then the verify step: the token and the
+  draft through the decode kernels, both rows' logits, and the sampler twice
+  (the second launch set reads logits row 1 with its own draw).
 - **Launches:** every dispatch with its bind group and parameters, which are
   packed into shared 64 KiB uniform buffers.
 

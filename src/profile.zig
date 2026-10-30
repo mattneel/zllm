@@ -1,8 +1,9 @@
 //! `zllm profile`: GPU time per kernel, from timestamp queries around every
 //! dispatch (Host.startProfile). After filling the context to `at` tokens,
 //! it runs prefill steps of `chunk` random tokens, then decode steps with
-//! sampling, and reports each kernel's time
-//! per step. Each dispatch then runs in its own compute pass, so the totals
+//! sampling, then (with an MTP block) speculative rounds: the block over two
+//! positions with the draft, then the two-position verify step. It reports
+//! each kernel's time per step or round. Each dispatch then runs in its own compute pass, so the totals
 //! can exceed an unprofiled step, which is timed too for comparison.
 
 const std = @import("std");
@@ -24,7 +25,7 @@ pub fn run(rt: *gen.Runtime, chunk: u32, at: u32, out: *Io.Writer) !void {
     const arena = arena_state.allocator();
 
     const total = at + chunk * (prefill_steps + 1);
-    if (total + decode_steps * 2 > p.cfg.context or chunk > p.cfg.max_tokens) return error.ChunkTooLarge;
+    if (total + decode_steps * 4 > p.cfg.context or chunk > p.cfg.max_tokens) return error.ChunkTooLarge;
     var prng: std.Random.DefaultPrng = .init(1);
     const tokens = try arena.alloc(u32, total);
     for (tokens) |*t| t.* = prng.random().uintLessThan(u32, p.hp.vocab);
@@ -79,6 +80,34 @@ pub fn run(rt: *gen.Runtime, chunk: u32, at: u32, out: *Io.Writer) !void {
         pos, ms(plain_decode), ms(wall / decode_steps),
     });
     try report(rt, decode_steps, out);
+
+    if (p.mtp != null) {
+        rt.host.stopProfile();
+        var verdicts: [2][2]u32 = undefined;
+        var draft: u32 = undefined;
+        const Round = struct {
+            fn record(pp: *zllm.plan.qwen35.Program, a: std.mem.Allocator, r: *zllm.gpu.cmd.Recorder, at_pos: u32, v: *[2][2]u32, d: *u32) !void {
+                try pp.recordMtp(a, r, .{ .pos0 = at_pos - 2, .tokens = &.{ 1, 2 }, .draft = true });
+                try pp.recordVerify(a, r, .{ .pos0 = at_pos, .token = 2, .draws = .{ 0.5, 0.5 }, .sampled = v, .draft = d });
+            }
+        };
+        try Round.record(p, gpa, &rec, pos, &verdicts, &draft);
+        try rec.submit(gpa, 1);
+        const plain_round = try time(rt, &rec);
+        pos += 2;
+        try rt.host.startProfile();
+        wall = 0;
+        for (0..decode_steps) |_| {
+            try Round.record(p, gpa, &rec, pos, &verdicts, &draft);
+            try rec.submit(gpa, 1);
+            wall += try time(rt, &rec);
+            pos += 2;
+        }
+        try out.print("\nspeculative rounds (MTP over 2 positions, then verify) at position {d}: {d:.2} ms per round unprofiled, {d:.2} ms profiled\n", .{
+            pos, ms(plain_round), ms(wall / decode_steps),
+        });
+        try report(rt, decode_steps, out);
+    }
     try out.flush();
 }
 

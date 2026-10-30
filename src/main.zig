@@ -417,7 +417,8 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{
         .max_tokens = chunk,
         .context = n,
-        .logit_rows = @min(chunk, 64),
+        // An MTP program needs two rows (its verify step).
+        .logit_rows = if (opts.mtp) @max(2, @min(chunk, 64)) else @min(chunk, 64),
         .kv = opts.kv,
         .checkpoints = 1,
         .mtp = opts.mtp,

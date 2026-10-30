@@ -346,6 +346,40 @@ const Upload = struct {
 
 pub const KvFormat = enum(u32) { f32 = 0, f16 = 1 };
 
+/// Whether a program for `m` can be built with `mtp`: the model has an MTP
+/// block and a logits row the storage offset alignment divides (the verify
+/// step's second sampler binds row 1).
+pub fn canSpeculate(m: *const Model, limits: Limits) bool {
+    return m.mtp != null and (@as(u64, m.hp.vocab) * 4) % limits.offset_align == 0;
+}
+
+/// Whether speculating pays off for `m`, by default: a speculative round
+/// costs a two-position step (about one step: decoding a weight serves
+/// both positions) plus a draft, which runs the MTP block and the whole
+/// output head. Where the draft's weights are at most an eighth of the main
+/// model's, rounds cost little more than steps and acceptance rates seen in
+/// practice (70% and up) make them pay; in a small model the head alone is
+/// a large share (the 0.8B's is about 30%), and drafts cost more than they
+/// save.
+pub fn speculationPays(m: *const Model) bool {
+    const t = m.mtp orelse return false;
+    const Bytes = struct {
+        n: u64 = 0,
+        fn add(s: *@This(), w: *const Matrix) void {
+            for (w.chunks) |ch| s.n += ch.arg.size;
+        }
+    };
+    var main: Bytes = .{};
+    for (m.layers) |*l| Model.eachLayerMatrix(l, &main, Bytes.add);
+    const head = if (m.output) |*o| o else &m.tok_embd;
+    main.add(head);
+    var draft: Bytes = .{};
+    draft.add(&t.eh_proj);
+    Model.eachLayerMatrix(&t.block, &draft, Bytes.add);
+    draft.add(head);
+    return draft.n * 8 <= main.n;
+}
+
 pub const Config = struct {
     /// Most tokens one step processes (one prefill chunk).
     max_tokens: u32 = 512,
@@ -357,7 +391,9 @@ pub const Config = struct {
     kv: KvFormat = .f16,
     /// DeltaNet checkpoint slots.
     checkpoints: u32 = 4,
-    /// Build the MTP block's step (recordMtp); needs a model with one.
+    /// Build the MTP block's step (recordMtp) and the two-position verify
+    /// step (recordVerify); needs a model with an MTP block, logit_rows ≥ 2,
+    /// and a logits row size the storage offset alignment divides.
     mtp: bool = false,
 };
 
@@ -443,6 +479,8 @@ pub const Program = struct {
     /// costs as much as a whole one (kernels.matmulTiles).
     prefill_tile: u32,
     mtp: ?MtpProgram = null,
+    /// speculationPays for the model.
+    speculation_pays: bool = false,
 
     // Upload staging, alive until the batch that writes it has executed.
     step_value: P.Step = .{ .m = 0, .pos0 = 0, .u = 0 },
@@ -614,7 +652,8 @@ pub const Program = struct {
             .decode = try mm.vector(logits, x, lm, .{ .norm = m.output_norm }),
         };
 
-        const mtp: ?MtpProgram = if (!cfg.mtp) null else if (m.mtp) |*t| blk: {
+        var mtp: ?MtpProgram = if (!cfg.mtp) null else if (m.mtp) |*t| blk: {
+            if (cfg.logit_rows < 2 or (@as(u64, hp.vocab) * 4) % limits.offset_align != 0) return error.BadConfig;
             const mtp_step = try a.buffer(@sizeOf(P.Step), .{ .uniform = true, .copy_dst = true });
             const mtp_tokens = try a.storage(cap);
             const e1 = try a.storage(cap * e);
@@ -647,25 +686,19 @@ pub const Program = struct {
                 .body = mbody.items,
                 .head_norm = try b.add(.rmsnorm, norm, &.{ x, t.head_norm, h }, .rows_x),
                 .head = .{ .prefill = head.prefill, .decode = try mm.vector(logits, x, lm, .{ .norm = t.head_norm }) },
+                .draft_head = try mm.vector(logits, lm_in, lm, .{ .norm = t.head_norm }),
+                .draft = try b.add(.draft, P.Draft{ .vocab = hp.vocab, .row = 0, .slot = 1 }, &.{ logits, token_ids }, .{ .fixed = .{ 1, 1, 1 } }),
+                .verify_step = try a.buffer(@sizeOf(P.Step), .{ .uniform = true, .copy_dst = true }),
                 .token_stage = try arena.alloc(u32, cfg.max_tokens),
             };
         } else return error.BadConfig;
 
         const mark = try b.addWith(.mark_tokens, sample_params, &.{ prompt_ids, prompt_mask }, .{ .elems = 1 });
-        var sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch) = undefined;
-        for (std.enums.values(kernels.SamplePhase)) |phase| {
-            const groups: u32 = if (phase.wide()) kernels.sampleGroups(hp.vocab) else 1;
-            const rounds: u32 = if (phase == .hist or phase == .digit) 4 else 1;
-            for (sample.getPtr(phase), 0..) |*l, r| {
-                // Phases with one round reuse round 0's launch.
-                if (r >= rounds) {
-                    l.* = sample.get(phase)[0];
-                    continue;
-                }
-                l.* = try b.add(.sample, P.SamplePhase{ .phase = @backingInt(phase), .round = @intCast(r) }, &.{
-                    logits, bias, prompt_mask, counts, work, sample_state, token_ids, step, sample_params,
-                }, .{ .fixed = .{ groups, 1, 1 } });
-            }
+        const sampler_args: SamplerArgs = .{ .bias = bias, .prompt_mask = prompt_mask, .counts = counts, .work = work, .state = sample_state, .next = token_ids, .params = sample_params };
+        const sample = try sampler_args.launches(&b, hp.vocab, logits, step);
+        if (mtp) |*t| {
+            const row_bytes = @as(u64, hp.vocab) * 4;
+            t.verify_sample = try sampler_args.launches(&b, hp.vocab, .{ .buffer = logits.buffer, .offset = row_bytes, .size = row_bytes }, t.verify_step);
         }
         try b.finish();
 
@@ -674,6 +707,7 @@ pub const Program = struct {
             .cfg = cfg,
             .prefill_tile = prefillTile(m),
             .mtp = mtp,
+            .speculation_pays = speculationPays(m),
             .step = step,
             .token_ids = token_ids,
             .x = x,
@@ -713,12 +747,14 @@ pub const Program = struct {
         try rec.copyBuffer(gpa, p.checkpoints[slot], 0, p.recurrent.buffer, 0, p.recurrent.size);
     }
 
-    /// Rolls the DeltaNet state back to the kept row of the last step that
-    /// kept one (Step.keep): the positions after it are dropped. Attention
-    /// needs nothing: the next step overwrites their cache rows.
+    /// Undoes a verify step whose draft was rejected: rolls the DeltaNet
+    /// state back to its kept row (the positions after it are dropped;
+    /// attention needs nothing, as the next step overwrites their cache
+    /// rows) and uncounts its second sample, the sampler's last draw.
     pub fn recordRollback(p: *const Program, gpa: Allocator, rec: *cmd.Recorder) Allocator.Error!void {
         std.debug.assert(p.cfg.mtp);
         try rec.copyBuffer(gpa, p.kept.buffer, 0, p.recurrent.buffer, 0, p.recurrent.size);
+        try p.sample.get(.unbump)[0].record(gpa, rec, .{ .rows = 1 });
     }
 
     /// Sets up the sampler for a request: its parameters, the prompt's token
@@ -843,6 +879,10 @@ pub const Program = struct {
         path: ?Path = null,
         /// Where the logit rows land, row-major.
         logits: ?[]f32 = null,
+        /// Write the last row's draft (its argmax) to token_ids[1] for
+        /// recordVerify; its logits overwrite logits row 0 after any logit
+        /// rows' readback.
+        draft: bool = false,
     };
 
     /// Runs the MTP block over rows of the previous step's final hidden
@@ -873,10 +913,69 @@ pub const Program = struct {
             .fork => |f| for (f.pick(path)) |l| try l.record(gpa, rec, ext),
             .final_norm, .layer_end => unreachable,
         };
-        if (s.logit_rows == 0) return;
-        const fused = path == .decode and s.logit_rows == m and m <= p.cfg.logit_rows;
-        if (!fused) try t.head_norm.record(gpa, rec, ext);
-        try p.recordHead(gpa, rec, t.head, m, s.logit_rows, fused, s.logits);
+        if (s.logit_rows > 0) {
+            const fused = path == .decode and s.logit_rows == m and m <= p.cfg.logit_rows;
+            if (!fused) try t.head_norm.record(gpa, rec, ext);
+            try p.recordHead(gpa, rec, t.head, m, s.logit_rows, fused, s.logits);
+        }
+        if (s.draft) try p.recordDraft(gpa, rec, m);
+    }
+
+    /// The draft from the MTP step's last row: only its logits are needed.
+    fn recordDraft(p: *Program, gpa: Allocator, rec: *cmd.Recorder, m: u32) Allocator.Error!void {
+        const t = &p.mtp.?;
+        const e: u64 = p.hp.n_embd;
+        try rec.copyBuffer(gpa, p.x.buffer, (m - 1) * e * 4, p.lm_in.buffer, 0, e * 4);
+        for (t.draft_head) |l| try l.record(gpa, rec, .{ .rows = 1 });
+        try t.draft.record(gpa, rec, .{ .rows = 1 });
+    }
+
+    pub const Verify = struct {
+        /// Position of the token; the draft goes at pos0 + 1.
+        pos0: u32,
+        token: u32,
+        /// The draws for the samples after the token and after the draft.
+        draws: [2]f32,
+        /// Each sample read back as (token, is_stop).
+        sampled: *[2][2]u32,
+        /// The draft read back.
+        draft: *u32,
+        /// Each position's logits, read back.
+        logits: [2]?[]f32 = .{ null, null },
+    };
+
+    /// A speculative step: the token and the draft recordMtp left in
+    /// token_ids[1], through the decode kernels at pos0 and pos0 + 1,
+    /// keeping the DeltaNet state after the token (recordRollback restores
+    /// it when the draft is rejected), with each final hidden state left in
+    /// `h` for recordMtp. Samples both positions, in order, so the second
+    /// sample sees the first in the sampler's output counts.
+    pub fn recordVerify(p: *Program, gpa: Allocator, rec: *cmd.Recorder, v: Verify) Allocator.Error!void {
+        const t = &p.mtp.?;
+        std.debug.assert(p.sample_len > 0 and v.pos0 + 2 <= p.cfg.context);
+        p.step_value = .{ .m = 2, .pos0 = v.pos0, .u = v.draws[0], .keep = 1 };
+        try rec.writeBuffer(gpa, p.step.buffer, 0, std.mem.asBytes(&p.step_value));
+        t.verify_value = .{ .m = 2, .pos0 = v.pos0, .u = v.draws[1] };
+        try rec.writeBuffer(gpa, t.verify_step.buffer, 0, std.mem.asBytes(&t.verify_value));
+        p.token_stage[0] = v.token;
+        try rec.writeBuffer(gpa, p.token_ids.buffer, 0, std.mem.sliceAsBytes(p.token_stage[0..1]));
+
+        const ext: kernels.Extent = .{ .rows = 2, .keys = v.pos0 + 2 };
+        for (p.body) |item| switch (item) {
+            .launch, .final_norm => |l| try l.record(gpa, rec, ext),
+            .fork => |f| for (f.decode) |l| try l.record(gpa, rec, ext),
+            .layer_end => {},
+        };
+        for (p.head.decode) |l| try l.record(gpa, rec, .{ .rows = 2 });
+        const vocab: usize = p.hp.vocab;
+        for (v.logits, 0..) |dst, r| if (dst) |row| {
+            try rec.readBuffer(gpa, read_token, p.logits.buffer, r * vocab * 4, std.mem.sliceAsBytes(row[0..vocab]));
+        };
+        try rec.readBuffer(gpa, read_token, p.token_ids.buffer, 4, std.mem.asBytes(v.draft));
+        for ([_]*const std.EnumArray(kernels.SamplePhase, [4]kernels.Launch){ &p.sample, &t.verify_sample }, v.sampled) |set, *dst| {
+            for (p.sample_steps[0..p.sample_len]) |ss| try set.get(ss.phase)[ss.round].record(gpa, rec, .{ .rows = 1 });
+            try rec.readBuffer(gpa, read_token, p.sample_state.buffer, 0, std.mem.asBytes(dst));
+        }
     }
 };
 
@@ -893,8 +992,51 @@ pub const MtpProgram = struct {
     body: []const Item,
     head_norm: kernels.Launch,
     head: Fork,
+    /// The head over one row of `lm_in` (the step's last, copied from x),
+    /// with the head norm, into logits row 0.
+    draft_head: []const kernels.Launch,
+    /// The argmax of logits row 0 into token_ids[1], where the verify step
+    /// embeds the draft.
+    draft: kernels.Launch,
+    /// The verify step's second draw (`u`; the rest unused).
+    verify_step: Arg,
+    /// The sampler over logits row 1, with the second draw.
+    verify_sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch) = undefined,
     step_value: P.Step = .{ .m = 0, .pos0 = 0, .u = 0 },
+    verify_value: P.Step = .{ .m = 0, .pos0 = 0, .u = 0 },
     token_stage: []u32,
+};
+
+/// The sampler's bindings besides the logits row and the step uniform.
+const SamplerArgs = struct {
+    bias: Arg,
+    prompt_mask: Arg,
+    counts: Arg,
+    work: Arg,
+    state: Arg,
+    next: Arg,
+    params: Arg,
+
+    /// One launch per sampler phase and round, over `logits` with the draw
+    /// in `step`.
+    fn launches(s: SamplerArgs, b: *kernels.Builder, vocab: u32, logits: Arg, step: Arg) Allocator.Error!std.EnumArray(kernels.SamplePhase, [4]kernels.Launch) {
+        var out: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch) = undefined;
+        for (std.enums.values(kernels.SamplePhase)) |phase| {
+            const groups: u32 = if (phase.wide()) kernels.sampleGroups(vocab) else 1;
+            const rounds: u32 = if (phase == .hist or phase == .digit) 4 else 1;
+            for (out.getPtr(phase), 0..) |*l, r| {
+                // Phases with one round reuse round 0's launch.
+                if (r >= rounds) {
+                    l.* = out.get(phase)[0];
+                    continue;
+                }
+                l.* = try b.add(.sample, P.SamplePhase{ .phase = @backingInt(phase), .round = @intCast(r) }, &.{
+                    logits, s.bias, s.prompt_mask, s.counts, s.work, s.state, s.next, step, s.params,
+                }, .{ .fixed = .{ groups, 1, 1 } });
+            }
+        }
+        return out;
+    }
 };
 
 /// Completion token of every read a Program records.
