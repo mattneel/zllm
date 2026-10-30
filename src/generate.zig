@@ -23,8 +23,9 @@ pub const usage =
     \\  --kv f16|f32          KV cache format (default f16)
     \\  --temperature F --top-k N --top-p F --min-p F
     \\  --repetition-penalty F --presence-penalty F --frequency-penalty F
-    \\                        sampling, as in vLLM; `chat` defaults to the Qwen 3.5
-    \\                        model card's text settings, `generate` to plain sampling
+    \\                        sampling, as in vLLM; unset, the model's defaults: the
+    \\                        GGUF's recommended settings, over the model card's for
+    \\                        `chat` (Qwen 3.5's for its architecture), else plain
     \\  --seed N              seed for the draws (default: from the clock)
     \\  --stop S              stop string, repeatable
     \\  --system S            (chat) system prompt
@@ -136,9 +137,6 @@ pub const Options = struct {
 };
 
 /// Qwen 3.5 model card, text tasks.
-const qwen_thinking: sampler.Params = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .presence_penalty = 1.5 };
-const qwen_instruct: sampler.Params = .{ .temperature = 1.0, .top_p = 1.0, .top_k = 20, .presence_penalty = 2.0 };
-
 /// The model on the GPU and an engine over it. Heap-allocated: the engine
 /// and the program must not move.
 pub const Runtime = struct {
@@ -161,6 +159,8 @@ pub const Runtime = struct {
     /// Shapes the sweep tuned, and how many got a variant other than the
     /// default.
     tuned: [2]u32 = .{ 0, 0 },
+    /// What requests leave unset takes.
+    defaults: sampler.Defaults,
 
     pub const Load = struct {
         /// Shaders and pipelines compiled.
@@ -185,6 +185,7 @@ pub const Runtime = struct {
             .host = host,
             .arena_state = .init(gpa),
             .tok = try .load(gpa, file),
+            .defaults = .fromGguf(file),
             .set = undefined,
             .model = undefined,
             .program = undefined,
@@ -336,7 +337,7 @@ pub fn generate(rt: *Runtime, prompt: []const u8, o: Options, out: *Io.Writer) !
     const t = try rt.turn(.{
         .prompt = ids.items,
         .max_tokens = o.max_tokens,
-        .sampling = o.sampling(.{}, o.seed orelse defaultSeed(rt.io)),
+        .sampling = o.sampling(rt.defaults.raw, o.seed orelse defaultSeed(rt.io)),
         .stop_tokens = rt.stop_tokens.items,
         .stop = o.stops,
         .speculate = o.speculate,
@@ -360,7 +361,7 @@ pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void
     var reply: std.ArrayList(u8) = .empty;
     defer reply.deinit(gpa);
     const seed = o.seed orelse defaultSeed(rt.io);
-    const defaults = if (o.think) qwen_thinking else qwen_instruct;
+    const defaults = rt.defaults.chat(o.think);
 
     var turn_index: u64 = 0;
     while (true) : (turn_index += 1) {

@@ -188,6 +188,7 @@ export fn zllm_info() i32 {
         .context = p.context(),
         .max_tokens = p.maxTokens(),
         .kv = p.kv(),
+        .sampling = .{ .thinking = rt.defaults.thinking, .instruct = rt.defaults.instruct, .raw = rt.defaults.raw },
         .resident_tokens = rt.engine.resident().len,
     }, .{})}) catch |err| return fail("info", err);
     setText(rt.text.items);
@@ -203,10 +204,6 @@ export fn zllm_unload() void {
     }
     header = null;
 }
-
-/// Qwen 3.5 model card sampling for text tasks, as `zllm chat` uses.
-const qwen_thinking: sampler.Params = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .presence_penalty = 1.5 };
-const qwen_instruct: sampler.Params = .{ .temperature = 1.0, .top_p = 1.0, .top_k = 20, .presence_penalty = 2.0 };
 
 /// A request as the shim sends it (web/src/zllm/engine.ts `RequestJson`):
 /// exactly one of `prompt` (raw text), `tokens` or `messages` (chat).
@@ -242,6 +239,8 @@ const Runtime = struct {
     /// The current request's memory, alive until the next `start`.
     request_arena: std.heap.ArenaAllocator,
     tok: zllm.tokenizer.Tokenizer,
+    /// What requests leave unset takes.
+    defaults: sampler.Defaults,
     set: zllm.kernels.Set,
     model: plan.Model,
     program: plan.Program,
@@ -268,6 +267,7 @@ const Runtime = struct {
             .arena_state = .init(gpa),
             .request_arena = .init(gpa),
             .tok = try .load(gpa, file),
+            .defaults = .fromGguf(file),
             .set = undefined,
             .model = undefined,
             .program = undefined,
@@ -372,12 +372,12 @@ const Runtime = struct {
         const r = try std.json.parseFromSliceLeaky(RequestJson, arena, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always, .parse_numbers = false });
 
         var prompt: std.ArrayList(u32) = .empty;
-        var defaults: sampler.Params = .{};
+        var defaults = rt.defaults.raw;
         if (r.messages) |messages| {
             var text: std.ArrayList(u8) = .empty;
             try zllm.chat.render(arena, messages, .{ .enable_thinking = r.enable_thinking, .reasoning_effort = r.reasoning_effort, .tools = r.tools }, &text);
             try rt.tok.encode(arena, text.items, &prompt);
-            defaults = if (r.enable_thinking) qwen_thinking else qwen_instruct;
+            defaults = rt.defaults.chat(r.enable_thinking);
         } else if (r.tokens) |ids| {
             try prompt.appendSlice(arena, ids);
         } else if (r.prompt) |text| {

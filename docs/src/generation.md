@@ -227,6 +227,27 @@ from vLLM, both deliberate:
 checks, and a CPU reference sampler that `gpu-check` compares the kernel
 against.
 
+What a request leaves unset takes the model's defaults
+(`src/sampler/defaults.zig`), as vLLM takes a model's
+`generation_config.json`. The base is the architecture's model card, for
+chat: Qwen 3.5's text-task settings for its architecture (Qwen 3.5, 3.6 and
+3.8 dense), plain sampling for any other:
+
+| Mode | Temperature | top_p | top_k | Presence penalty |
+|---|---|---|---|---|
+| Thinking | 1.0 | 0.95 | 20 | 1.5 |
+| `--no-think` | 1.0 | 1.0 | 20 | 2.0 |
+
+The GGUF's own recommendation, llama.cpp's `general.sampling.*` keys,
+replaces the fields it sets, in either mode, and raw continuations
+(`generate`) take it over plain sampling. zllm takes temp, top_k, top_p,
+min_p and penalty_repeat; it ignores the other keys (penalty_last_n,
+xtc_*, mirostat*) and values outside the sampler's range. The 27B's GGUF
+recommends temperature 1, top_k 20 and top_p 0.95; so does the
+Gyro-Coder's, whose architecture has no card: its chat takes no presence
+penalty. With the Qwen card's 2.0 (no reasoning block), its code came out
+with stray quotes, the penalty steering it off tokens code repeats.
+
 ## Chat format
 
 `zllm chat` formats conversations with the fixed Qwen chat template,
@@ -258,16 +279,6 @@ which would force recomputing every earlier reply.
 Text streams through `src/tokenizer/stream.zig`. It holds back bytes until
 they form complete UTF-8 and cannot be the start of a stop string. The stop
 string itself is not output, as in vLLM by default.
-
-`chat` defaults to the Qwen 3.5 model card's text-task sampling:
-
-| Mode | Temperature | top_p | top_k | Presence penalty |
-|---|---|---|---|---|
-| Thinking | 1.0 | 0.95 | 20 | 1.5 |
-| `--no-think` | 1.0 | 1.0 | 20 | 2.0 |
-
-`generate` samples plainly unless told otherwise, as vLLM does for a model
-without a `generation_config.json`.
 
 ## Performance
 

@@ -20,6 +20,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("tokenizer/unicode.zig");
     _ = @import("tokenizer/pretokenize.zig");
+    _ = @import("sampler/defaults.zig");
     _ = ref.ops;
     _ = ref.tensor;
     _ = ref.gyro;

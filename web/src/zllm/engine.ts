@@ -49,7 +49,10 @@ export interface GenerateRequest {
   prompt?: string;
   tokens?: number[];
   maxTokens?: number;
-  /** Plain sampling (temperature 1) where unset. */
+  /**
+   * The model's default sampling where unset (`stats().model.sampling.raw`):
+   * its GGUF's recommended settings, else plain sampling (temperature 1).
+   */
   sampling?: Sampling;
   /** Strings that end generation; not part of the output. */
   stop?: string[];

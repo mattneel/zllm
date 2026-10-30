@@ -44,9 +44,10 @@ engine.stats(); await engine.unload();
 await zllm.cacheUsage(); await zllm.clearCache();
 ```
 
-- **Requests** run one at a time; a second waits for the first. `generate`
-  samples plainly unless told otherwise (temperature 1). `chat` defaults to
-  the model card's settings, as `zllm chat` does.
+- **Requests** run one at a time; a second waits for the first. What a
+  request leaves unset takes the model's defaults, as `zllm chat` and
+  `zllm generate` do ([Generation](generation.md#sampling)); `stats().model.sampling`
+  lists them.
 - **Chat** renders the fixed Qwen template inside the core, the template
   `check-chat` pins. Each reply is split into `reasoning_content` and
   `content`, as vLLM's Qwen3 reasoning parser does. An assistant turn sent

@@ -17,6 +17,9 @@ const kernels = @import("../kernels/kernels.zig");
 /// Temperatures below this sample greedily (vLLM's _SAMPLING_EPS).
 pub const greedy_below = 1e-5;
 
+/// A model's default sampling (defaults.zig).
+pub const Defaults = @import("defaults.zig").Defaults;
+
 pub const Bias = struct { token: u32, bias: f32 };
 
 pub const Params = struct {
