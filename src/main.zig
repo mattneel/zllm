@@ -424,8 +424,8 @@ const ForwardOptions = struct {
 };
 
 /// gpu-forward for Qwen4Exp: the decode kernels in steps of up to
-/// min(chunk, decode_max_rows) tokens, the host reading each token's PLE
-/// rows from the mapped file. Writes the records the reference names alike:
+/// min(chunk, decode_max_rows) tokens, the PLE rows read from the mapped
+/// file. Writes the records the reference names alike:
 /// each layer's streams (`l_last-<layer>`) and chosen experts
 /// (`ffn_moe_topk-<layer>`), and every position's logits.
 fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file: zllm.gguf.File, bytes: []const u8, tokens: []const u32, out_path: []const u8, opts: ForwardOptions) !void {
@@ -460,14 +460,6 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file
     try runBatch(host, &rec, &completions);
     const t_loaded = Io.Timestamp.now(io, .awake);
 
-    // The PLE table's rows, read from the mapped file per token.
-    const ple = zllm.ref.qwen4exp.ple;
-    const config = try ple.Config.fromGguf(file);
-    const table = file.tensor("per_layer_token_embd.weight") orelse return error.MissingTensor;
-    const row_bytes = table.byteSize() / table.dims[1];
-    var history: ple.History = .{};
-    const rows = try arena.alloc(u8, chunk * plan.ple_heads * row_bytes);
-
     const vocab: usize = model.hp.vocab;
     const logits = try arena.alloc(f32, @as(usize, n) * vocab);
     // Every layer's streams and experts, for every position; each step
@@ -486,12 +478,6 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file
     var steps: u32 = 0;
     while (pos0 < n) : (steps += 1) {
         const m = @min(chunk, n - pos0);
-        for (tokens[pos0..][0..m], 0..) |t, i| {
-            for (try history.accept(config, t), 0..) |r, head| {
-                const src = file.data_offset + table.offset + r * row_bytes;
-                @memcpy(rows[(i * plan.ple_heads + head) * row_bytes ..][0..row_bytes], bytes[src..][0..row_bytes]);
-            }
-        }
         for (streams, experts, step_streams, step_experts) |s, x, *ss, *sx| {
             ss.* = s[pos0 * hd ..][0 .. m * hd];
             sx.* = x[pos0 * used ..][0 .. m * used];
@@ -500,7 +486,7 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file
         try program.recordStep(gpa, &rec, .{
             .pos0 = pos0,
             .tokens = tokens[pos0..][0..m],
-            .ple_rows = rows[0 .. m * plan.ple_heads * row_bytes],
+            .logit_rows = m,
             .logits = logits[pos0 * vocab ..][0 .. m * vocab],
             .readback = &readback,
         });

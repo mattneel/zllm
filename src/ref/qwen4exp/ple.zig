@@ -23,7 +23,7 @@ pub const Config = struct {
     table_rows: u64,
 
     /// The 16 table rows of `token` after `previous` (newest first).
-    pub fn rows(c: Config, token: u32, previous: [2]?u32) Error![heads]u64 {
+    pub fn rows(c: Config, token: u32, previous: [2]?u32) error{InvalidToken}![heads]u64 {
         if (token >= c.vocab) return error.InvalidToken;
         var context = [_]u64{ token, c.eos_token, c.eos_token };
         for (previous, 0..) |p, i| {
@@ -74,7 +74,7 @@ pub const History = struct {
     previous: [2]?u32 = .{ null, null },
 
     /// The rows of `token`, which then joins the history.
-    pub fn accept(h: *History, c: Config, token: u32) Error![heads]u64 {
+    pub fn accept(h: *History, c: Config, token: u32) error{InvalidToken}![heads]u64 {
         const r = try c.rows(token, h.previous);
         // Not `.{ token, h.previous[0] }`: that writes previous[0] before
         // reading it.

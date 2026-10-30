@@ -5,8 +5,11 @@
 //! at the sparse attention's budget: up to 2,048 + 3 cells the indexer
 //! selects every cell, so dense attention is the same computation.
 //!
-//! The per-layer embedding (PLE) table stays in the file: the host reads
-//! each token's 16 rows (ple.Config) and passes their bytes with the step.
+//! The per-layer embedding (PLE) table stays in the file: each step hashes
+//! its tokens' histories (ple.History) and records `write_file`s of their
+//! 16 rows each, which the host serves from the file (a mapping natively,
+//! the picked File in the browser). The engine therefore passes every
+//! step's tokens: a sampled token is read back before the next step.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -15,6 +18,8 @@ const graph = @import("../graph/qwen4exp.zig");
 const cmd = @import("../gpu/cmd.zig");
 const kernels = @import("../kernels/kernels.zig");
 const gyro = @import("../ref/gyro/gyro.zig");
+const ple = @import("../ref/qwen4exp/ple.zig");
+const sampler = @import("../sampler/sampler.zig");
 const common = @import("common.zig");
 const Arg = kernels.Arg;
 const P = kernels.params;
@@ -29,8 +34,8 @@ pub const Hparams = graph.Hparams;
 /// Contexts the program allows: the sparse attention's cell budget, below
 /// which it is dense (the indexer is not built yet).
 pub const max_context = 2048;
-/// PLE rows a token reads, and the bytes of a Q8_0 row of 160 values.
-pub const ple_heads = 16;
+/// PLE rows a token reads.
+pub const ple_heads = ple.heads;
 
 const Hc = struct {
     norm: Arg,
@@ -92,8 +97,9 @@ pub const Model = struct {
     signs_embd: Arg,
     signs_ff: Arg,
     codebook: Arg,
+    ple: PleTable,
 
-    pub const UploadError = graph.Error || common.UploadError;
+    pub const UploadError = graph.Error || ple.Error || common.UploadError;
 
     /// Calls f(context, w) for every Q8_0 multiply (for tuning and scratch
     /// sizing).
@@ -182,6 +188,7 @@ pub const Model = struct {
             };
         }
         const signs = try rotationSigns(arena, file, hp);
+        const table = try PleTable.find(file, hp);
         return .{
             .hp = hp,
             .tok_embd = try u.matrix("token_embd.weight", null, e, hp.vocab),
@@ -196,7 +203,32 @@ pub const Model = struct {
             .signs_embd = try upload32(gpa, rec, signs.embd),
             .signs_ff = try upload32(gpa, rec, signs.ff),
             .codebook = try uploadBytes(gpa, rec, gyro.codebook_bytes),
+            .ple = table,
         };
+    }
+};
+
+/// Where each token's PLE rows lie in the file. A row is read with the 2
+/// bytes after it, `stride` in all, as GPU writes are whole words; another
+/// tensor's data must follow the table so that stays inside the file.
+const PleTable = struct {
+    config: ple.Config,
+    /// Absolute file offset of row 0.
+    at: u64,
+    row_bytes: u64,
+    stride: u32,
+
+    fn find(file: gguf.File, hp: Hparams) Model.UploadError!PleTable {
+        const t = file.tensor("per_layer_token_embd.weight") orelse return error.MissingTensor;
+        if (t.type != .q8_0 or t.n_dims != 2 or t.dims[0] != hp.ple_head_dim) return error.Unsupported;
+        const row_bytes = t.byteSize() / t.dims[1];
+        const stride = std.mem.alignForward(u64, row_bytes, 4);
+        const end = t.offset + t.byteSize();
+        const followed = for (file.tensors) |other| {
+            if (other.offset >= end + (stride - row_bytes)) break true;
+        } else false;
+        if (!followed) return error.Unsupported;
+        return .{ .config = try ple.Config.fromGguf(file), .at = file.data_offset + t.offset, .row_bytes = row_bytes, .stride = @intCast(stride) };
     }
 };
 
@@ -262,6 +294,8 @@ pub const Config = struct {
     /// Positions the KV caches and the RoPE table hold, at most max_context.
     context: u32 = max_context,
     kv: common.KvFormat = .f16,
+    /// Recurrent-state checkpoint slots.
+    checkpoints: u32 = 3,
     tuning: common.Tuning = .{},
 };
 
@@ -278,13 +312,19 @@ pub const Program = struct {
     res: Arg,
     /// A block's input, [token][n_embd].
     cur: Arg,
-    /// The PLE rows' bytes as read from the file, [token][16 rows].
+    /// The PLE rows as read from the file, [token][16 rows], `table.stride`
+    /// bytes apart.
     ple_rows: Arg,
     logits: Arg,
-    /// Every DeltaNet layer's state and conv history, and the PLE block's
-    /// convolution history.
+    /// Every DeltaNet layer's state and conv history, then the PLE block's
+    /// convolution history: the state a checkpoint copies.
     recurrent: Arg,
-    ple_hist: Arg,
+    checkpoints: []const cmd.Buffer,
+    table: PleTable,
+    /// The tokens the next step's PLE rows hash after, and each checkpoint
+    /// slot's.
+    history: ple.History = .{},
+    saved: []ple.History,
     body: []const Item,
     /// The token embeddings: the body's first `embeds` items.
     embeds: usize,
@@ -295,9 +335,22 @@ pub const Program = struct {
     /// The router's choices, [token][n_expert_used] expert ids.
     ids: Arg,
     head: []const Item,
-    ple_stage: []u8,
     token_stage: []u32,
     step_value: P.Step = .{ .m = 0, .pos0 = 0, .u = 0 },
+    // The sampler, as Qwen 3.5's program runs it.
+    sample_params: Arg,
+    bias: Arg,
+    prompt_ids: Arg,
+    prompt_mask: Arg,
+    counts: Arg,
+    sample_state: Arg,
+    mark: kernels.Launch,
+    sample: std.EnumArray(kernels.SamplePhase, [4]kernels.Launch),
+    sample_steps: [kernels.max_sample_steps]kernels.SampleStep = undefined,
+    sample_len: usize = 0,
+    sample_value: P.Sample = undefined,
+    prompt_stage: []u32,
+    bias_stage: [][2]u32,
 
     pub const BuildError = common.BuildError;
 
@@ -352,15 +405,13 @@ pub const Program = struct {
         const sh_act = try a.storage(cap * @as(u64, hp.n_ff_shexp));
         const sh_out = try a.storage(cap * e);
         // PLE.
-        const ple_row_bytes: u64 = @as(u64, hp.ple_head_dim) / 32 * 34;
-        const ple_rows = try a.buffer(cap * ple_heads * ple_row_bytes, .{ .storage = true, .copy_dst = true });
+        const ple_rows = try a.buffer(cap * ple_heads * @as(u64, m.ple.stride), .{ .storage = true, .copy_dst = true });
         const ple_index = try a.storage(cap * ple_heads);
         const ple_emb = try a.storage(cap * e);
         const ple_key = try a.storage(cap * hd);
         const ple_value = try a.storage(cap * e);
         const ple_gated = try a.storage(cap * hd);
         const ple_normed = try a.storage(cap * hd);
-        const ple_hist = try a.storage(@as(u64, hp.ple_conv - 1) * hp.ple_dilation * hd);
         const index = try arena.alloc(u32, cap * ple_heads);
         for (index, 0..) |*v, i| v.* = @intCast(i);
         try rec.writeBuffer(gpa, ple_index.buffer, 0, std.mem.sliceAsBytes(index));
@@ -378,8 +429,21 @@ pub const Program = struct {
         const per_layer = hist_at + std.mem.alignForward(u64, hist_bytes, al);
         var n_linear: u64 = 0;
         for (0..hp.n_layer) |il| n_linear += @intFromBool(hp.recurrent(il));
-        const recurrent = try a.buffer(per_layer * n_linear, .{ .storage = true, .copy_dst = true, .copy_src = true });
+        const ple_hist_bytes: u64 = 4 * @as(u64, hp.ple_conv - 1) * hp.ple_dilation * hd;
+        const recurrent = try a.buffer(per_layer * n_linear + ple_hist_bytes, .{ .storage = true, .copy_dst = true, .copy_src = true });
+        const ple_hist: Arg = .{ .buffer = recurrent.buffer, .offset = per_layer * n_linear, .size = ple_hist_bytes };
+        const checkpoints = try arena.alloc(cmd.Buffer, cfg.checkpoints);
+        for (checkpoints) |*cp| cp.* = (try a.buffer(recurrent.size, .{ .copy_src = true, .copy_dst = true })).buffer;
+        // No step keeps a row: every layer binds the same unwritten stand-in.
         const kept = try a.buffer(16, .{ .storage = true });
+
+        const sample_params = try a.buffer(@sizeOf(P.Sample), .{ .uniform = true, .copy_dst = true });
+        const bias = try a.storage(2 * kernels.max_bias);
+        const prompt_ids = try a.storage(cfg.context);
+        const prompt_mask = try a.storage(hp.vocab);
+        const counts = try a.storage(hp.vocab);
+        const work = try a.storage(hp.vocab);
+        const sample_state = try a.storage(kernels.sampleStateWords(hp.vocab));
         const kv_bytes: u64 = if (cfg.kv == .f16) 2 else 4;
         const kv_layer = @as(u64, cfg.context) * kv_dim * kv_bytes;
 
@@ -430,7 +494,7 @@ pub const Program = struct {
         for (m.layers, route_end, layer_end) |*layer, *re, *le| {
             if (layer.ple) |*pw| {
                 // The token's 16 table rows, decoded as a 16-row Q8_0 table.
-                try body.append(arena, .{ .launch = try b.add(.embed_q8_0, P.EmbedBf16{ .dim = hp.ple_head_dim, .row0 = 0, .chunk_rows = cap * ple_heads }, &.{ ple_index, .{ .buffer = ple_rows.buffer, .size = ple_rows.size }, ple_emb }, .rows_x), .mul = ple_heads });
+                try body.append(arena, .{ .launch = try b.add(.embed_q8_0, P.EmbedBf16{ .dim = hp.ple_head_dim, .row0 = 0, .chunk_rows = cap * ple_heads, .stride = m.ple.stride }, &.{ ple_index, ple_rows, ple_emb }, .rows_x), .mul = ple_heads });
                 try add(&body, arena, try mm.vector(ple_key, ple_emb, &pw.key, .{}));
                 try add(&body, arena, try mm.vector(ple_value, ple_emb, &pw.value, .{}));
                 try body.append(arena, .{ .launch = try b.add(.ple_mix, P.PleMix{ .dim = hp.n_embd, .hc = hp.hc, .eps = hp.eps }, &.{ ple_key, res, ple_value, pw.norm_key, pw.norm_query, pw.norm_conv, ple_gated, ple_normed }, .{ .rows_y = hp.hc }) });
@@ -542,6 +606,9 @@ pub const Program = struct {
         var head: std.ArrayList(Item) = .empty;
         try Mix.build(&head, &b, mm, arena, &m.hc_head, hp, bufs);
         try add(&head, arena, try mm.vector(logits, cur, &m.output, .{}));
+        const mark = try b.addWith(.mark_tokens, sample_params, &.{ prompt_ids, prompt_mask }, .{ .elems = 1 });
+        const sampler_args: common.SamplerArgs = .{ .bias = bias, .prompt_mask = prompt_mask, .counts = counts, .work = work, .state = sample_state, .next = token_ids, .params = sample_params };
+        const sample = try sampler_args.launches(&b, hp.vocab, logits, step);
         try b.finish();
 
         return .{
@@ -554,32 +621,72 @@ pub const Program = struct {
             .ple_rows = ple_rows,
             .logits = logits,
             .recurrent = recurrent,
-            .ple_hist = ple_hist,
+            .checkpoints = checkpoints,
+            .table = m.ple,
+            .saved = try arena.alloc(ple.History, cfg.checkpoints),
             .body = body.items,
             .embeds = embed_end,
             .route_end = route_end,
             .layer_end = layer_end,
             .ids = ids,
             .head = head.items,
-            .ple_stage = try arena.alloc(u8, cap * ple_heads * ple_row_bytes),
             .token_stage = try arena.alloc(u32, cap),
+            .sample_params = sample_params,
+            .bias = bias,
+            .prompt_ids = prompt_ids,
+            .prompt_mask = prompt_mask,
+            .counts = counts,
+            .sample_state = sample_state,
+            .mark = mark,
+            .sample = sample,
+            .prompt_stage = try arena.alloc(u32, cfg.context),
+            .bias_stage = try arena.alloc([2]u32, kernels.max_bias),
         };
     }
 
-    /// Zeroes the recurrent state and the PLE history: the next step starts
-    /// a sequence at position 0.
-    pub fn recordReset(p: *const Program, gpa: Allocator, rec: *cmd.Recorder) Allocator.Error!void {
+    /// Zeroes the recurrent state (the PLE convolution's too) and the token
+    /// history: the next step starts a sequence at position 0.
+    pub fn recordReset(p: *Program, gpa: Allocator, rec: *cmd.Recorder) Allocator.Error!void {
         try rec.clearBuffer(gpa, p.recurrent.buffer, 0, p.recurrent.size);
-        try rec.clearBuffer(gpa, p.ple_hist.buffer, 0, p.ple_hist.size);
+        p.history = .{};
+    }
+
+    pub fn recordSave(p: *Program, gpa: Allocator, rec: *cmd.Recorder, slot: u32) Allocator.Error!void {
+        try rec.copyBuffer(gpa, p.recurrent.buffer, 0, p.checkpoints[slot], 0, p.recurrent.size);
+        p.saved[slot] = p.history;
+    }
+
+    pub fn recordRestore(p: *Program, gpa: Allocator, rec: *cmd.Recorder, slot: u32) Allocator.Error!void {
+        try rec.copyBuffer(gpa, p.checkpoints[slot], 0, p.recurrent.buffer, 0, p.recurrent.size);
+        p.history = p.saved[slot];
+    }
+
+    /// Sets up the sampler for a request: its parameters, the prompt's token
+    /// set for the repetition penalty, and zero output counts.
+    pub fn recordRequest(p: *Program, gpa: Allocator, rec: *cmd.Recorder, params: sampler.Params, prompt: []const u32, stops: []const u32) Allocator.Error!void {
+        std.debug.assert(prompt.len <= p.cfg.context);
+        p.sample_value = params.gpu(p.hp.vocab, @intCast(prompt.len), stops);
+        p.sample_len = kernels.sampleSteps(p.sample_value, &p.sample_steps).len;
+        try rec.writeBuffer(gpa, p.sample_params.buffer, 0, std.mem.asBytes(&p.sample_value));
+        const biases = params.biasWords(p.bias_stage);
+        if (biases.len > 0) try rec.writeBuffer(gpa, p.bias.buffer, 0, std.mem.sliceAsBytes(biases));
+        @memcpy(p.prompt_stage[0..prompt.len], prompt);
+        if (prompt.len > 0) try rec.writeBuffer(gpa, p.prompt_ids.buffer, 0, std.mem.sliceAsBytes(p.prompt_stage[0..prompt.len]));
+        try rec.clearBuffer(gpa, p.counts.buffer, 0, p.counts.size);
+        try rec.clearBuffer(gpa, p.prompt_mask.buffer, 0, p.prompt_mask.size);
+        if (prompt.len > 0) try p.mark.record(gpa, rec, .{ .rows = @intCast(prompt.len) });
     }
 
     pub const Step = struct {
         pos0: u32,
         tokens: []const u32,
-        /// Each token's 16 PLE rows as stored, in order (16 × 170 bytes a
-        /// token for Q8_0 rows of 160).
-        ple_rows: []const u8,
-        /// Every row's logits, read back here ([tokens][vocab]), if given.
+        /// 0, or every row: project the rows to logits.
+        logit_rows: u32 = 0,
+        /// Sample from the row with this draw (a one-token step with its
+        /// logits), reading back (token, is_stop) into `sampled`.
+        draw: ?f32 = null,
+        sampled: ?*[2]u32 = null,
+        /// The rows' logits, read back here ([tokens][vocab]), if given.
         logits: ?[]f32 = null,
         readback: ?*const Readback = null,
     };
@@ -592,18 +699,26 @@ pub const Program = struct {
         experts: []const []u32,
     };
 
-    pub fn recordStep(p: *Program, gpa: Allocator, rec: *cmd.Recorder, s: Step) Allocator.Error!void {
+    pub const StepError = Allocator.Error || error{InvalidToken};
+
+    pub fn recordStep(p: *Program, gpa: Allocator, rec: *cmd.Recorder, s: Step) StepError!void {
         const m: u32 = @intCast(s.tokens.len);
-        const e: u64 = p.hp.n_embd;
-        const hc: u64 = p.hp.hc;
+        const e: usize = p.hp.n_embd;
+        const hc: usize = p.hp.hc;
         std.debug.assert(m > 0 and m <= kernels.decode_max_rows and s.pos0 + m <= p.cfg.context);
-        std.debug.assert(s.ple_rows.len == @as(usize, m) * p.ple_stage.len / kernels.decode_max_rows);
-        p.step_value = .{ .m = m, .pos0 = s.pos0, .u = 0 };
+        std.debug.assert(s.logit_rows == 0 or s.logit_rows == m);
+        std.debug.assert(s.draw == null or (m == 1 and s.logit_rows == 1));
+        p.step_value = .{ .m = m, .pos0 = s.pos0, .u = s.draw orelse 0 };
         try rec.writeBuffer(gpa, p.step.buffer, 0, std.mem.asBytes(&p.step_value));
         @memcpy(p.token_stage[0..m], s.tokens);
         try rec.writeBuffer(gpa, p.token_ids.buffer, 0, std.mem.sliceAsBytes(p.token_stage[0..m]));
-        @memcpy(p.ple_stage[0..s.ple_rows.len], s.ple_rows);
-        try rec.writeBuffer(gpa, p.ple_rows.buffer, 0, p.ple_stage[0..s.ple_rows.len]);
+        // Each token's PLE rows, straight from the file.
+        const t = p.table;
+        for (s.tokens, 0..) |token, i| {
+            for (try p.history.accept(t.config, token), 0..) |row, head| {
+                try rec.writeFile(gpa, p.ple_rows.buffer, (i * ple_heads + head) * t.stride, t.at + row * t.row_bytes, t.stride);
+            }
+        }
 
         const ext = struct {
             fn of(item: Item, m_: u32, keys: u32) kernels.Extent {
@@ -613,8 +728,8 @@ pub const Program = struct {
         const keys = s.pos0 + m;
         // The embeddings, then into each of the token's streams.
         for (p.body[0..p.embeds]) |item| try item.launch.record(gpa, rec, ext(item, m, keys));
-        for (0..m) |t| for (0..hc) |c| {
-            try rec.copyBuffer(gpa, p.cur.buffer, t * e * 4, p.res.buffer, (t * hc + c) * e * 4, e * 4);
+        for (0..m) |r| for (0..hc) |c| {
+            try rec.copyBuffer(gpa, p.cur.buffer, r * e * 4, p.res.buffer, (r * hc + c) * e * 4, e * 4);
         };
         var il: usize = 0;
         for (p.body[p.embeds..], p.embeds..) |item, at| {
@@ -628,10 +743,16 @@ pub const Program = struct {
                 il += 1;
             }
         }
+        if (s.logit_rows == 0) return;
         for (p.head) |item| try item.launch.record(gpa, rec, ext(item, m, keys));
         if (s.logits) |dst| {
             const vocab: usize = p.hp.vocab;
             try rec.readBuffer(gpa, common.read_token, p.logits.buffer, 0, std.mem.sliceAsBytes(dst[0 .. m * vocab]));
+        }
+        if (s.draw != null) {
+            std.debug.assert(p.sample_len > 0);
+            for (p.sample_steps[0..p.sample_len]) |ss| try p.sample.get(ss.phase)[ss.round].record(gpa, rec, .{ .rows = 1 });
+            try rec.readBuffer(gpa, common.read_token, p.sample_state.buffer, 0, std.mem.asBytes(s.sampled.?));
         }
     }
 };

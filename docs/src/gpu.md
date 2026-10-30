@@ -259,9 +259,17 @@ computes the same thing.
   experts go up as stored, TQ2_T, read by `gyro_matvec` at the ids the
   router wrote; then the router, the codebook and the Hadamard sign
   vectors. Everything but the PLE table is about 21 GB of GPU memory.
-- **PLE:** the 50.7 GiB n-gram table stays in the file. For each token the
-  host hashes its history, reads its 16 Q8_0 rows (16 × 170 bytes) and
-  sends them with the step; `embed_q8_0` decodes them as a 16-row table.
+- **PLE:** the 50.7 GiB n-gram table stays in the file. Each step hashes
+  its tokens' histories (the two tokens before each) and records a
+  `write_file` of each of their 16 Q8_0 rows, which the host serves from
+  the file: the mapping natively, the picked `File` in the browser. GPU
+  writes are whole words, so each 170-byte row is read with the 2 bytes
+  after it, 172 bytes apart, and `embed_q8_0` decodes them at that stride.
+  The history belongs to the program: a reset clears it, and checkpoints
+  save it with the recurrent state.
+- **State:** every DeltaNet layer's recurrent state and conv history, and
+  the PLE convolution's history, in one buffer that checkpoints copy.
+- **Sampling:** the sampler's launches as Qwen 3.5's program records them.
 - **A layer:** the four streams' norms and the low-rank mix into the
   block's input (`hc_act`, `hc_mix`), the mixer (DeltaNet with a sigmoid
   gate, or attention with `attn_split_wide`), `hc_combine` back into the
