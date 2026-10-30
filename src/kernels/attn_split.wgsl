@@ -10,6 +10,9 @@
 // queries sit in workgroup memory, so each K row is read once for the whole
 // group. Cache format as in `attention` (f16 pairs or f32 bits).
 //
+// MAX_GROUP, the most query heads per KV head, is prepended (kernels.zig:
+// attn_split, attn_split_wide).
+//
 // part layout per (t, head, block): [max, sum, o_0 .. o_{head_dim−1}], at
 // ((t · heads + head) · blocks + b) · (head_dim + 2), blocks = max_blocks,
 // t counted from row0.
@@ -45,13 +48,13 @@ struct Step {
 const WG: u32 = 256u;
 const BLOCK: u32 = 64u;
 const SPLIT: u32 = WG / BLOCK;
-const MAX_GROUP: u32 = 8u;
 const MAX_HEAD_DIM: u32 = 256u;
 
+// At MAX_GROUP 12, 16,384 bytes in all, WebGPU's guaranteed limit; once
+// the scores are reduced, `red` holds each head's (max, sum).
 var<workgroup> qs: array<f32, MAX_GROUP * MAX_HEAD_DIM>;
 var<workgroup> red: array<f32, WG>;
 var<workgroup> sc: array<f32, MAX_GROUP * BLOCK>;
-var<workgroup> stat: array<f32, 2 * MAX_GROUP>;
 
 fn k_pair(i: u32) -> vec2f {
     if (p.f16 != 0u) {
@@ -133,8 +136,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
         for (var i = n; i < BLOCK; i++) {
             sc[lid * BLOCK + i] = 0.0;
         }
-        stat[2u * lid] = mx;
-        stat[2u * lid + 1u] = sum;
+        red[2u * lid] = mx;
+        red[2u * lid + 1u] = sum;
     }
     workgroupBarrier();
 
@@ -156,8 +159,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
             let base = ((t * p.heads + head) * p.max_blocks + b) * (hd + 2u);
             part[base + 2u + d] = acc[h];
             if (d == 0u) {
-                part[base] = stat[2u * h];
-                part[base + 1u] = stat[2u * h + 1u];
+                part[base] = red[2u * h];
+                part[base + 1u] = red[2u * h + 1u];
             }
         }
     }

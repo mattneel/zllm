@@ -31,7 +31,11 @@ pub const Kernel = enum {
     embed_bf16,
     embed_f16,
     rope_append,
+    // attn_split.wgsl with MAX_GROUP set: groups of up to attn_max_group,
+    // and the wide variant's up to attn_max_group_wide (more workgroup
+    // memory, which costs the narrow groups' prefill ~2%).
     attn_split,
+    attn_split_wide,
     attn_combine,
     delta_prep,
     delta_rule,
@@ -149,6 +153,8 @@ fn composed(comptime name: []const u8) []const u8 {
             return @embedFile("quant/common.wgsl") ++ @embedFile("quant/" ++ t ++ ".wgsl") ++ dot ++ @embedFile(body);
         }
     }
+    if (std.mem.eql(u8, name, "attn_split")) return std.fmt.comptimePrint("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group}) ++ @embedFile("attn_split.wgsl");
+    if (std.mem.eql(u8, name, "attn_split_wide")) return std.fmt.comptimePrint("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group_wide}) ++ @embedFile("attn_split.wgsl");
     return @embedFile(name ++ ".wgsl");
 }
 
@@ -265,7 +271,16 @@ comptime {
     // Decode steps use the first chunk.
     std.debug.assert(decode_max_rows <= attn_rows);
 }
+/// Most query heads per KV head attn_split holds, and attn_split_wide (its
+/// workgroup memory: 16,384 bytes, WebGPU's guaranteed limit).
 pub const attn_max_group = 8;
+pub const attn_max_group_wide = 12;
+
+/// The attention kernel for GQA groups of `group` query heads.
+pub fn attnSplit(group: u32) Kernel {
+    std.debug.assert(group <= attn_max_group_wide);
+    return if (group <= attn_max_group) .attn_split else .attn_split_wide;
+}
 /// Widest DeltaNet head `delta_prep` normalizes in one workgroup.
 pub const max_delta_head = 256;
 /// Sampler limits: logit-bias entries and stop tokens per request.

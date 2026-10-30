@@ -37,18 +37,18 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,           checkMatmul,         checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair,    checkMatmulF16,      checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,           checkEmbed,          checkRopeAppendF32,  checkRopeAppendF16,     checkAttentionF32,
-        checkAttentionF16,      checkAttnDecode,     checkDeltaPrep,      checkDeltaKeep,         checkDeltaRule,
-        checkGatedNormSigmoid,  checkDraft,          checkGyroMatvec,     checkMoeRoute,          checkRotate128,
-        checkMoeCombine,        checkHc,             checkPle,            checkSampleGreedy,      checkSampleTopKTopP,
-        checkSampleMinP,        checkSampleTopP,     checkSamplePlain,    checkSampleTopK1,       checkSampleLargeTopK,
-        checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec, Quant(.q8_0).matmul,    Quant(.q8_0).embed,
-        Quant(.q3_k).matvec,    Quant(.q3_k).matmul, Quant(.q3_k).embed,  Quant(.q4_k).matvec,    Quant(.q4_k).matmul,
-        Quant(.q4_k).embed,     Quant(.q5_k).matvec, Quant(.q5_k).matmul, Quant(.q5_k).embed,     Quant(.q6_k).matvec,
-        Quant(.q6_k).matmul,    Quant(.q6_k).embed,  checkQuantTiles,     checkQuantSiluPair,     checkQuantizeQ8K,
-        checkQuantizeQ80,       checkQuantizeNorm,   checkQuantizeSilu,
+        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair, checkMatmulF16,       checkMatvecNormF16,     checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,        checkEmbed,           checkRopeAppendF32,     checkRopeAppendF16,     checkAttentionF32,
+        checkAttentionF16,   checkAttentionWide,   checkAttnDecode,        checkAttnDecodeWide,    checkDeltaPrep,
+        checkDeltaKeep,      checkDeltaRule,       checkGatedNormSigmoid,  checkDraft,             checkGyroMatvec,
+        checkMoeRoute,       checkRotate128,       checkMoeCombine,        checkHc,                checkPle,
+        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,        checkSamplePlain,
+        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,       Quant(.q8_0).matvec,
+        Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,    Quant(.q3_k).embed,
+        Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,    Quant(.q5_k).matmul,
+        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,     checkQuantTiles,
+        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,      checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -776,21 +776,24 @@ fn cacheWords(c: *Ctx, values: []f32, half: bool) ![]u32 {
     return words;
 }
 
-/// The Qwen 3.5 attention shape: 8 query heads over 2 KV heads, head_dim
-/// 256, queries in rows padded past their gates (q_row).
-const AttnShape = struct {
-    const heads = 8;
-    const kv = 2;
-    const hd = 256;
-    const width = kv * hd;
-    const q_row = heads * 2 * hd + 96;
-    const scale: f32 = 1.0 / 16.0;
-};
+/// An attention shape: `heads` query heads over 2 KV heads, head_dim 256,
+/// queries in rows padded past their gates (q_row). Qwen 3.5's 0.8B has 8
+/// heads; 24 (Qwen3.8-Flash-Next) takes attn_split_wide.
+fn AttnShape(comptime n_heads: u32) type {
+    return struct {
+        const heads = n_heads;
+        const kv = 2;
+        const hd = 256;
+        const width = kv * hd;
+        const q_row = heads * 2 * hd + 96;
+        const scale: f32 = 1.0 / 16.0;
+        const split = kernels.attnSplit(heads / kv);
+    };
+}
 
 /// Gated attention of `second` queries at positions first.. over the cache,
 /// in float64.
-fn attnWant(c: *Ctx, qg: []const f32, k: []const f32, v: []const f32, first: u32, second: u32) ![]f64 {
-    const S = AttnShape;
+fn attnWant(c: *Ctx, comptime S: type, qg: []const f32, k: []const f32, v: []const f32, first: u32, second: u32) ![]f64 {
     const want = try c.arena.alloc(f64, second * S.heads * S.hd);
     const s = try c.arena.alloc(f64, first + second);
     for (0..second) |t| for (0..S.heads) |h| {
@@ -821,8 +824,7 @@ fn attnWant(c: *Ctx, qg: []const f32, k: []const f32, v: []const f32, first: u32
 /// Prefill attention for 70 queries after 270 cached positions, as a step
 /// runs it: attn_split and attn_combine over chunks of attn_rows tokens (32,
 /// 32, 6), each over 64-position blocks of the 340 keys, the last partial.
-fn attentionCase(c: *Ctx, name: []const u8, half: bool) !Result {
-    const S = AttnShape;
+fn attentionCase(c: *Ctx, comptime S: type, name: []const u8, half: bool) !Result {
     const first = 270;
     const second = 70;
     const total = first + second;
@@ -843,25 +845,28 @@ fn attentionCase(c: *Ctx, name: []const u8, half: bool) !Result {
         const split: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } };
         const combine: kernels.Grid = .{ .rows_y_from = .{ .x = S.heads, .row0 = row0, .max_rows = kernels.attn_rows } };
         const e: kernels.Extent = .{ .rows = second, .keys = total };
-        try l.launch(.attn_split, params, &.{ qa, ka, va, part, step }, split.resolve(e));
+        try l.launch(S.split, params, &.{ qa, ka, va, part, step }, split.resolve(e));
         try l.launch(.attn_combine, params, &.{ qa, part, out, step }, combine.resolve(e));
     }
     const got = try c.read(out);
-    return .{ .name = name, .err = relErr(got, try attnWant(c, qg, k, v, first, second)), .tolerance = 1e-5 };
+    return .{ .name = name, .err = relErr(got, try attnWant(c, S, qg, k, v, first, second)), .tolerance = 1e-5 };
 }
 
 fn checkAttentionF32(c: *Ctx) !Result {
-    return attentionCase(c, "attention, 3 chunks (f32 cache)", false);
+    return attentionCase(c, AttnShape(8), "attention, 3 chunks (f32 cache)", false);
 }
 
 fn checkAttentionF16(c: *Ctx) !Result {
-    return attentionCase(c, "attention, 3 chunks (f16 cache)", true);
+    return attentionCase(c, AttnShape(8), "attention, 3 chunks (f16 cache)", true);
+}
+
+fn checkAttentionWide(c: *Ctx) !Result {
+    return attentionCase(c, AttnShape(24), "attention, 3 chunks, groups of 12", true);
 }
 
 /// Decode attention: 3 queries after 150 cached positions, through
 /// attn_split (three 64-position blocks, the last partial) and attn_combine.
-fn checkAttnDecode(c: *Ctx) !Result {
-    const S = AttnShape;
+fn attnDecodeCase(c: *Ctx, comptime S: type, name: []const u8) !Result {
     const first = 150;
     const second = 3;
     const total = first + second;
@@ -876,10 +881,18 @@ fn checkAttnDecode(c: *Ctx) !Result {
     const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row };
     const qa = try c.upload(qg);
     const grid: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block } };
-    try l.launch(.attn_split, params, &.{ qa, try c.upload(try cacheWords(c, k, true)), try c.upload(try cacheWords(c, v, true)), part, step }, grid.resolve(.{ .rows = second, .keys = total }));
+    try l.launch(S.split, params, &.{ qa, try c.upload(try cacheWords(c, k, true)), try c.upload(try cacheWords(c, v, true)), part, step }, grid.resolve(.{ .rows = second, .keys = total }));
     try l.launch(.attn_combine, params, &.{ qa, part, out, step }, .{ S.heads, second, 1 });
     const got = try c.read(out);
-    return .{ .name = "attn_split + combine", .err = relErr(got, try attnWant(c, qg, k, v, first, second)), .tolerance = 1e-5 };
+    return .{ .name = name, .err = relErr(got, try attnWant(c, S, qg, k, v, first, second)), .tolerance = 1e-5 };
+}
+
+fn checkAttnDecode(c: *Ctx) !Result {
+    return attnDecodeCase(c, AttnShape(8), "attn_split + combine");
+}
+
+fn checkAttnDecodeWide(c: *Ctx) !Result {
+    return attnDecodeCase(c, AttnShape(24), "attn_split + combine, groups of 12");
 }
 
 /// Cache words as f32 values.
