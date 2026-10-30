@@ -16,6 +16,7 @@ const ops = @import("ops.zig");
 const mm = @import("matmul.zig");
 const Matrix = mm.Matrix;
 const Pool = @import("pool.zig").Pool;
+const Loader = @import("loader.zig").Loader;
 
 const vec_len = 16;
 const V = @Vector(vec_len, f32);
@@ -115,7 +116,7 @@ pub const Model = struct {
                 .ffn_up = try l.matrix("blk.{d}.ffn_up.weight", i, &.{ e, ff }),
                 .ffn_down = try l.matrix("blk.{d}.ffn_down.weight", i, &.{ ff, e }),
                 .mixer = switch (kind) {
-                    .attention => .{ .attention = try l.attention(hp, i) },
+                    .attention => .{ .attention = try loadAttention(&l, hp, i) },
                     .delta_net => blk: {
                         const d: u64 = hp.gdn_head_dim;
                         const key_dim = d * hp.gdn_k_heads;
@@ -148,7 +149,7 @@ pub const Model = struct {
                     .ffn_gate = try l.matrix("blk.{d}.ffn_gate.weight", i, &.{ e, ff }),
                     .ffn_up = try l.matrix("blk.{d}.ffn_up.weight", i, &.{ e, ff }),
                     .ffn_down = try l.matrix("blk.{d}.ffn_down.weight", i, &.{ ff, e }),
-                    .mixer = .{ .attention = try l.attention(hp, i) },
+                    .mixer = .{ .attention = try loadAttention(&l, hp, i) },
                 },
                 // The model's output norm where the block has no own.
                 .head_norm = if (l.has("blk.{d}.nextn.shared_head_norm.weight", i))
@@ -263,56 +264,20 @@ pub const Model = struct {
     }
 };
 
-const Loader = struct {
-    /// Owns everything the model keeps.
-    arena: Allocator,
-    pool: *Pool,
-    file: gguf.File,
-    bytes: []const u8,
-
-    fn global(l: *Loader, name: []const u8, shape: []const u64) tensor.Error![]f32 {
-        return tensor.load(l.arena, l.file, l.bytes, name, shape);
-    }
-
-    fn get(l: *Loader, comptime fmt: []const u8, layer: usize, shape: []const u64) tensor.Error![]f32 {
-        var buf: [96]u8 = undefined;
-        return l.global(std.fmt.bufPrint(&buf, fmt, .{layer}) catch unreachable, shape);
-    }
-
-    /// A GGML {k, n} weight as a packed n×k `Matrix`.
-    fn globalMatrix(l: *Loader, name: []const u8, shape: *const [2]u64) tensor.Error!Matrix {
-        const info = l.file.tensor(name) orelse return error.MissingTensor;
-        if (!std.mem.eql(u64, info.shape(), shape)) return error.BadShape;
-        const n: usize = @intCast(shape[1]);
-        const k: usize = @intCast(shape[0]);
-        return Matrix.init(l.arena, l.pool, info.type, l.file.tensorBytes(l.bytes, info), n, k);
-    }
-
-    fn matrix(l: *Loader, comptime fmt: []const u8, layer: usize, shape: *const [2]u64) tensor.Error!Matrix {
-        var buf: [96]u8 = undefined;
-        return l.globalMatrix(std.fmt.bufPrint(&buf, fmt, .{layer}) catch unreachable, shape);
-    }
-
-    fn has(l: *Loader, comptime fmt: []const u8, layer: usize) bool {
-        var buf: [96]u8 = undefined;
-        return l.file.tensor(std.fmt.bufPrint(&buf, fmt, .{layer}) catch unreachable) != null;
-    }
-
-    /// Layer `i`'s gated full attention.
-    fn attention(l: *Loader, hp: Hparams, i: usize) tensor.Error!Attention {
-        const e: u64 = hp.n_embd;
-        const hd: u64 = hp.head_dim;
-        const kv_out = hd * hp.n_head_kv;
-        return .{
-            .wq = try l.matrix("blk.{d}.attn_q.weight", i, &.{ e, 2 * hd * hp.n_head }),
-            .wk = try l.matrix("blk.{d}.attn_k.weight", i, &.{ e, kv_out }),
-            .wv = try l.matrix("blk.{d}.attn_v.weight", i, &.{ e, kv_out }),
-            .wo = try l.matrix("blk.{d}.attn_output.weight", i, &.{ hd * hp.n_head, e }),
-            .q_norm = try l.get("blk.{d}.attn_q_norm.weight", i, &.{hd}),
-            .k_norm = try l.get("blk.{d}.attn_k_norm.weight", i, &.{hd}),
-        };
-    }
-};
+/// Layer `i`'s gated full attention.
+fn loadAttention(l: *Loader, hp: Hparams, i: usize) tensor.Error!Attention {
+    const e: u64 = hp.n_embd;
+    const hd: u64 = hp.head_dim;
+    const kv_out = hd * hp.n_head_kv;
+    return .{
+        .wq = try l.matrix("blk.{d}.attn_q.weight", i, &.{ e, 2 * hd * hp.n_head }),
+        .wk = try l.matrix("blk.{d}.attn_k.weight", i, &.{ e, kv_out }),
+        .wv = try l.matrix("blk.{d}.attn_v.weight", i, &.{ e, kv_out }),
+        .wo = try l.matrix("blk.{d}.attn_output.weight", i, &.{ hd * hp.n_head, e }),
+        .q_norm = try l.get("blk.{d}.attn_q_norm.weight", i, &.{hd}),
+        .k_norm = try l.get("blk.{d}.attn_k_norm.weight", i, &.{hd}),
+    };
+}
 
 /// out[t] = rmsnorm(in[t]) * weight for each row.
 fn normRows(out: []f32, in: []const f32, weight: []const f32, eps: f32) void {
