@@ -42,7 +42,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     if (in_head) {
         let zz = z[wg.y * p.z_row + p.z_off + wg.x * p.dim + b];
         let r = 1.0 / sqrt(partial[0] / f32(p.dim) + p.eps);
-        let gate = 1.0 / (1.0 + exp(-zz));
-        o[base + b] = v * r * w[b] * select(zz * gate, gate, p.sigmoid != 0u);
+        // silu as written before the sigmoid gate existed, to round alike.
+        let gate = select(zz / (1.0 + exp(-zz)), 1.0 / (1.0 + exp(-zz)), p.sigmoid != 0u);
+        o[base + b] = v * r * w[b] * gate;
     }
 }
