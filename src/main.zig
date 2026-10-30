@@ -125,12 +125,9 @@ pub fn main(init: std.process.Init) !void {
         defer mapped.close(io);
         var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
         defer file.deinit(gpa);
-        const d = try openDawn(gpa, init.environ_map);
-        defer d.deinit(gpa);
-        var host = zllm.gpu.Host.init(gpa, d);
-        defer host.deinit();
         const t0 = Io.Timestamp.now(io, .awake);
-        const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
+        const dawn_lib = init.environ_map.get("ZLLM_DAWN") orelse zllm.gpu.dawn.default_library;
+        const rt = try gen.Runtime.create(gpa, io, dawn_lib, file, mapped.bytes, opts);
         defer rt.destroy();
         const ld = rt.load;
         std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, tuning {d}, program {d}, calibration {d}); context {d}, {t} KV", .{

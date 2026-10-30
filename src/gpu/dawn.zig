@@ -59,6 +59,8 @@ pub const Procs = struct {
     ComputePassEncoderDispatchWorkgroups: Proc(c.WGPUProcComputePassEncoderDispatchWorkgroups),
     ComputePassEncoderEnd: Proc(c.WGPUProcComputePassEncoderEnd),
     ComputePassEncoderRelease: Proc(c.WGPUProcComputePassEncoderRelease),
+    /// Dawn's, not in webgpu.h: loses the device as a driver reset would.
+    DeviceForceLoss: *const fn (c.WGPUDevice, c.WGPUDeviceLostReason, c.WGPUStringView) callconv(.c) void,
 
     fn load(lib: *dynlib.Lib) error{MissingSymbol}!Procs {
         var p: Procs = undefined;
@@ -255,6 +257,12 @@ pub const Device = struct {
                 else => "unknown",
             },
         };
+    }
+
+    /// Loses the device, as a driver reset or a GPU hang would: checks use
+    /// it to exercise recovery.
+    pub fn forceLoss(d: *Device) void {
+        d.p.DeviceForceLoss(d.device, c.WGPUDeviceLostReason_Unknown, str("zllm: forced loss"));
     }
 
     pub fn freeInfo(d: *Device, raw: c.WGPUAdapterInfo) void {

@@ -33,6 +33,11 @@ const gen = @import("generate.zig");
 
 const n_gen = 12;
 
+/// A load's total, in milliseconds.
+fn loadMs(l: gen.Runtime.Load) u64 {
+    return (l.pipelines + l.weights + l.tuning + l.program + l.calibration) / std.time.ns_per_ms;
+}
+
 const Run = struct { tokens: []u32, logits: []f32, cached: u32, usage: zllm.sched.Usage };
 
 /// The larger error; a NaN is infinitely large (@max would pass it by).
@@ -312,6 +317,35 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
         const both = accepted > 0 and rejected > 0;
         c.ok = c.ok and both;
         try out.print("{s} {s:<34} {d} accepted, {d} rejected\n", .{ if (both) "PASS" else "FAIL", "drafts accepted and rejected", accepted, rejected });
+    }
+
+    // A lost device: the request fails with the typed error and the runtime
+    // rebuilds itself, its tuning from the plan cache; the same prompt then
+    // gives the tokens and logits it gave before.
+    {
+        const name = "device lost, rebuilt";
+        rt.engine.forget();
+        const before = try c.run(other);
+        rt.device.forceLoss();
+        const lost = blk: {
+            _ = c.run(other) catch |err| {
+                if (err == error.DeviceLost) break :blk true;
+                return err;
+            };
+            break :blk false;
+        };
+        const after = try c.run(other);
+        const same = std.mem.eql(u32, before.tokens, after.tokens) and std.mem.eql(u32, @ptrCast(before.logits), @ptrCast(after.logits));
+        // From the plan cache, wherever there is one to tune from.
+        const cached = rt.plan_cached or !rt.options.tune or rt.options.plan_cache == null;
+        const ok = lost and same and cached and rt.recoveries == 1;
+        c.ok = c.ok and ok;
+        const verdict = if (ok) "PASS" else "FAIL";
+        const typed = if (lost) "error.DeviceLost" else "NO typed error";
+        const tuning = if (rt.plan_cached) "tuning from the plan cache" else "tuning not from the plan cache";
+        const compared = if (same) "bitwise identical to" else "DIFFER from";
+        try out.print("{s} {s:<34} {s}; rebuilt in {d} ms ({s}), {d} tokens and logits {s} the run before\n", .{ verdict, name, typed, loadMs(rt.load), tuning, n_gen, compared });
+        try out.flush();
     }
 
     // Logprobs, greedy, with the logits read back too: each token's must be

@@ -154,6 +154,19 @@ goes from 40.7–41.5 tok/s to 47.0–47.3, one token per step from 30.0–30.4 
 (6.4e-6 relative L2 at most, against 6.2e-6). The sweep takes 13 s;
 `--no-tune` skips it.
 
+### Device lost
+
+A lost device (a driver reset, a GPU hang, a removed adapter) fails the
+request in flight with `error.DeviceLost` (spec §8). The native runtime then
+rebuilds itself before returning: a new Dawn device, the weights read again
+from the file mapping, the tuning from the plan cache, a fresh engine with
+no resident sequence (`Runtime.recover`). `zllm chat` reports it and takes
+the message again. On the RTX 5090 Laptop the 0.8B rebuilds in 2.2 s.
+`engine-check` forces a loss through Dawn's `wgpuDeviceForceLoss` and checks
+the typed error, a rebuild from the plan cache, and the same prompt's
+tokens and logits, bitwise, after it. The browser shim does not rebuild yet:
+it reports the loss as an error.
+
 ### Plan cache
 
 The CLI keeps what a sweep found in the plan cache (spec §7,

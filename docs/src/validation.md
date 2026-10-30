@@ -426,6 +426,7 @@ relative L2.
 | After a 700-token prompt cancelled after its first prefill step: the same prompt | 448: the chunk that ran | bitwise identical |
 | Logprobs: a 300-token prompt, greedy, top 3 | (fresh) | each token's logprob within 1.2e-7 of the log-softmax of its read-back logits, the top entry the sampled token; identical without the check's readback |
 | Speculation: a prompt repeating a random 24-token phrase, 48 tokens, greedy, sampled, and sampled with penalties, with and without speculation | (fresh) | the same tokens and bitwise identical logits; 52 drafts accepted and 34 rejected across the three |
+| Device lost (forced): the 300-token prompt before and after | (fresh) | the request fails with `error.DeviceLost`; the runtime rebuilds with the plan cache's tuning (2.2 s); bitwise the tokens and logits of the run before. A rebuild that tunes again instead fails it |
 
 The pipelined run completes each batch only when the engine asks for it
 (`wait`), so every decode step is recorded before the previous token is

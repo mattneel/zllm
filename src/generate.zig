@@ -146,6 +146,12 @@ pub const Options = struct {
 pub const Runtime = struct {
     gpa: Allocator,
     io: Io,
+    /// What a rebuild after a lost device needs (recover).
+    dawn_lib: []const u8,
+    file: zllm.gguf.File,
+    bytes: []const u8,
+    options: Options,
+    device: *zllm.gpu.dawn.Device,
     host: *zllm.gpu.Host,
     arena_state: std.heap.ArenaAllocator,
     tok: zllm.tokenizer.Tokenizer,
@@ -167,6 +173,8 @@ pub const Runtime = struct {
     plan_cached: bool = false,
     /// What requests leave unset takes.
     defaults: sampler.Defaults,
+    /// Rebuilds after a lost device.
+    recoveries: u32 = 0,
 
     pub const Load = struct {
         /// Shaders and pipelines compiled.
@@ -182,13 +190,21 @@ pub const Runtime = struct {
         calibration: u64 = 0,
     };
 
-    pub fn create(gpa: Allocator, io: Io, host: *zllm.gpu.Host, file: zllm.gguf.File, bytes: []const u8, o: Options) !*Runtime {
+    /// Opens Dawn from `dawn_lib` and loads the model from `file` (its
+    /// header) and `bytes` (the mapped file), which must outlive the
+    /// runtime.
+    pub fn create(gpa: Allocator, io: Io, dawn_lib: []const u8, file: zllm.gguf.File, bytes: []const u8, o: Options) !*Runtime {
         const rt = try gpa.create(Runtime);
         errdefer gpa.destroy(rt);
         rt.* = .{
             .gpa = gpa,
             .io = io,
-            .host = host,
+            .dawn_lib = dawn_lib,
+            .file = file,
+            .bytes = bytes,
+            .options = o,
+            .device = undefined,
+            .host = undefined,
             .arena_state = .init(gpa),
             .tok = try .load(gpa, file),
             .defaults = .fromGguf(file),
@@ -197,8 +213,45 @@ pub const Runtime = struct {
             .program = undefined,
             .engine = undefined,
         };
+        errdefer {
+            rt.tok.deinit(gpa);
+            rt.arena_state.deinit();
+        }
+        if (rt.tok.ids.get("<|im_end|>")) |id| try rt.stop_tokens.append(gpa, id);
+        if (rt.tok.eos) |id| if (std.mem.indexOfScalar(u32, rt.stop_tokens.items, id) == null) try rt.stop_tokens.append(gpa, id);
+        try rt.open();
+        errdefer rt.close();
+        try rt.build();
+        return rt;
+    }
+
+    /// Opens a Dawn device and a host on it.
+    fn open(rt: *Runtime) !void {
+        rt.device = zllm.gpu.dawn.Device.init(rt.gpa, rt.dawn_lib) catch |err| {
+            std.log.err("cannot open Dawn ({s}): {t}", .{ rt.dawn_lib, err });
+            return err;
+        };
+        errdefer rt.device.deinit(rt.gpa);
+        rt.host = try rt.gpa.create(zllm.gpu.Host);
+        rt.host.* = .init(rt.gpa, rt.device);
+    }
+
+    fn close(rt: *Runtime) void {
+        rt.host.deinit();
+        rt.gpa.destroy(rt.host);
+        rt.device.deinit(rt.gpa);
+    }
+
+    /// Everything on the GPU: pipelines, weights, tuning (from the plan
+    /// cache when it has it), the step program, the engine, calibration.
+    fn build(rt: *Runtime) !void {
         const arena = rt.arena_state.allocator();
-        const d = host.d;
+        const gpa = rt.gpa;
+        const io = rt.io;
+        const file = rt.file;
+        const bytes = rt.bytes;
+        const o = rt.options;
+        const d = rt.host.d;
         const limits: plan_common.Limits = .{
             .max_binding = d.limits.maxStorageBufferBindingSize,
             .offset_align = d.limits.minStorageBufferOffsetAlignment,
@@ -219,7 +272,7 @@ pub const Runtime = struct {
         var t = Io.Timestamp.now(io, .awake);
         rt.set = try .create(gpa, arena, &rec);
         try rt.executeTimed(&rec, &t, &rt.load.pipelines);
-        host.file = bytes;
+        rt.host.file = bytes;
         rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
         try rt.executeTimed(&rec, &t, &rt.load.weights);
         const mtp = rt.model.canSpeculate(limits);
@@ -262,15 +315,27 @@ pub const Runtime = struct {
             rt.engine.calibrated(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()));
         }
         rt.load.calibration = @intCast(t.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds());
+    }
 
-        if (rt.tok.ids.get("<|im_end|>")) |id| try rt.stop_tokens.append(gpa, id);
-        if (rt.tok.eos) |id| if (std.mem.indexOfScalar(u32, rt.stop_tokens.items, id) == null) try rt.stop_tokens.append(gpa, id);
-        return rt;
+    /// After the device was lost (spec 8): a new device, and everything on
+    /// it rebuilt, the tuning from the plan cache. The resident sequence is
+    /// gone; the next request prefills its whole prompt.
+    pub fn recover(rt: *Runtime) !void {
+        rt.engine.deinit();
+        rt.close();
+        _ = rt.arena_state.reset(.free_all);
+        rt.load = .{};
+        rt.tuned = .{ 0, 0 };
+        rt.plan_cached = false;
+        try rt.open();
+        try rt.build();
+        rt.recoveries += 1;
     }
 
     pub fn destroy(rt: *Runtime) void {
         const gpa = rt.gpa;
         rt.engine.deinit();
+        rt.close();
         rt.completions.deinit(gpa);
         rt.stop_tokens.deinit(gpa);
         rt.tok.deinit(gpa);
@@ -300,13 +365,18 @@ pub const Runtime = struct {
     pub const Turn = struct { finish: zllm.sched.Finish, usage: zllm.sched.Usage };
 
     /// Generates from `req.prompt`, streaming text to `out` and appending
-    /// it to `text` (and the token ids to `ids`, if given).
+    /// it to `text` (and the token ids to `ids`, if given). If the device is
+    /// lost, the runtime rebuilds itself (recover) and the turn fails with
+    /// error.DeviceLost: the runtime is usable again.
     pub fn turn(rt: *Runtime, req: zllm.sched.Request, out: *Io.Writer, text: *std.ArrayList(u8), ids: ?*std.ArrayList(u32)) !Turn {
         try rt.engine.start(req);
         while (true) switch (try rt.engine.next()) {
             .submit => |words| {
                 const t0 = Io.Timestamp.now(rt.io, .awake);
-                try rt.execute(words);
+                rt.execute(words) catch |err| {
+                    if (err == error.DeviceLost) try rt.recover();
+                    return err;
+                };
                 const ns = t0.durationTo(Io.Timestamp.now(rt.io, .awake)).toNanoseconds();
                 try rt.engine.complete(@intCast(ns));
             },
@@ -403,14 +473,22 @@ pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void
 
         reply.clearRetainingCapacity();
         if (o.think) try out.writeAll("<think>\n");
-        const t = try rt.turn(.{
+        const t = rt.turn(.{
             .prompt = ids.items,
             .max_tokens = @min(o.max_tokens, o.context - @as(u32, @intCast(ids.items.len))),
             .sampling = o.sampling(defaults, seed +% turn_index),
             .stop_tokens = rt.stop_tokens.items,
             .stop = o.stops,
             .speculate = o.speculate,
-        }, out, &reply, null);
+        }, out, &reply, null) catch |err| switch (err) {
+            error.DeviceLost => {
+                // Rebuilt: the message goes unanswered and can be sent again.
+                _ = messages.pop();
+                try out.writeAll("\n[the GPU device was lost; reloaded from the plan cache: send the message again]\n");
+                continue;
+            },
+            else => return err,
+        };
         try out.writeByte('\n');
         try out.flush();
         reportTurn(t);
