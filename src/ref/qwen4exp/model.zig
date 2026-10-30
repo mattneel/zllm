@@ -7,50 +7,13 @@ const Allocator = std.mem.Allocator;
 const gguf = @import("../../gguf/gguf.zig");
 const kernels = @import("kernels.zig");
 const ple = @import("ple.zig");
+const graph = @import("../../graph/qwen4exp.zig");
 const Matrix = kernels.Matrix;
 
-pub const arch = "qwen4exp";
+pub const arch = graph.arch;
+pub const Hparams = graph.Hparams;
 
-pub const Error = Allocator.Error || ple.Error || error{ WrongArchitecture, MissingTensor, BadShape, UnsupportedTensorType, Unsupported };
-
-pub const Hparams = struct {
-    n_layer: u32,
-    n_embd: u32,
-    n_head: u32,
-    n_head_kv: u32,
-    head_dim: u32,
-    n_rot: u32,
-    rope_base: f32,
-    eps: f32,
-    n_expert: u32,
-    n_expert_used: u32,
-    n_ff_exp: u32,
-    n_ff_shexp: u32,
-    ssm_conv: u32,
-    ssm_state: u32,
-    ssm_k_heads: u32,
-    ssm_v_heads: u32,
-    ssm_inner: u32,
-    /// Hyper-connection streams, and the rank of their mixing.
-    hc: u32,
-    hc_rank: u32,
-    idx_heads: u32,
-    idx_dim: u32,
-    idx_top_k: u32,
-    ple_layer: u32,
-    ple_head_dim: u32,
-    ple_conv: u32,
-    ple_dilation: u32,
-    vocab: u32,
-    expert_weights_scale: f32,
-
-    pub fn hcDim(h: Hparams) u32 {
-        return h.hc * h.n_embd;
-    }
-    pub fn convChannels(h: Hparams) u32 {
-        return h.ssm_state * h.ssm_k_heads * 2 + h.ssm_state * h.ssm_v_heads;
-    }
-};
+pub const Error = Allocator.Error || ple.Error || graph.Error || error{ BadShape, UnsupportedTensorType };
 
 pub const Hc = struct {
     norm: []const f32,
@@ -252,56 +215,11 @@ const Binder = struct {
     }
 
     fn bind(b: *Binder) Error!Model {
-        const arch_name = try b.value("general.architecture");
-        if (arch_name != .string or !std.mem.eql(u8, arch_name.string, arch)) return error.WrongArchitecture;
-        const ple_layers = try b.ints(arch ++ ".ple.layers");
-        if (ple_layers.len != 1) return error.Unsupported;
-        const embd = try b.tensor("token_embd.weight");
-        var h: Hparams = .{
-            .n_layer = try b.num("block_count"),
-            .n_embd = try b.num("embedding_length"),
-            .n_head = try b.num("attention.head_count"),
-            .n_head_kv = try b.num("attention.head_count_kv"),
-            .head_dim = try b.num("attention.key_length"),
-            .n_rot = try b.num("rope.dimension_count"),
-            .rope_base = try b.float("rope.freq_base"),
-            .eps = try b.float("attention.layer_norm_rms_epsilon"),
-            .n_expert = try b.num("expert_count"),
-            .n_expert_used = try b.num("expert_used_count"),
-            .n_ff_exp = try b.num("expert_feed_forward_length"),
-            .n_ff_shexp = try b.num("expert_shared_feed_forward_length"),
-            .ssm_conv = try b.num("ssm.conv_kernel"),
-            .ssm_state = try b.num("ssm.state_size"),
-            .ssm_k_heads = try b.num("ssm.group_count"),
-            .ssm_v_heads = try b.num("ssm.time_step_rank"),
-            .ssm_inner = try b.num("ssm.inner_size"),
-            .hc = try b.num("hyper_connection.count"),
-            .hc_rank = try b.num("hyper_connection.low_rank"),
-            .idx_heads = try b.num("attention.indexer.head_count"),
-            .idx_dim = try b.num("attention.indexer.key_length"),
-            .idx_top_k = try b.num("attention.indexer.top_k"),
-            .ple_layer = ple_layers[0],
-            .ple_head_dim = try b.num("embedding_length_per_layer_input"),
-            .ple_conv = try b.num("ple.conv_kernel"),
-            .ple_dilation = try b.num("ple.ngram_size"),
-            .vocab = std.math.cast(u32, embd.dims[1]) orelse return error.BadShape,
-            .expert_weights_scale = 0,
-        };
-        if (b.file.get(arch ++ ".expert_weights_scale") != null) h.expert_weights_scale = try b.float("expert_weights_scale");
-        if (h.head_dim != try b.num("attention.value_length")) return error.Unsupported;
-        if (h.ssm_inner != h.ssm_state * h.ssm_v_heads or h.ssm_v_heads % h.ssm_k_heads != 0) return error.Unsupported;
-        if (h.n_head % h.n_head_kv != 0 or h.n_rot > h.head_dim or h.n_rot % 2 != 0) return error.Unsupported;
-        if (ple.heads * h.ple_head_dim != h.n_embd or h.hc < 2 or h.hcDim() > kernels.max_cols) return error.Unsupported;
-        if (h.n_expert > 512 or h.ple_layer >= h.n_layer) return error.Unsupported;
-        // Text positions are the same in every M-RoPE section, so it
-        // reduces to NeoX ordering over the sections' total.
-        var section_sum: u32 = 0;
-        for (try b.ints(arch ++ ".rope.dimension_sections")) |s| section_sum += s;
-        if (section_sum * 2 != h.n_rot) return error.Unsupported;
+        const h = try Hparams.fromGguf(b.file);
+        if (h.hcDim() > kernels.max_cols) return error.Unsupported;
 
         const ratios = try b.ints(arch ++ ".attention.compress_ratios");
         if (ratios.len < h.n_layer) return error.BadMetadata;
-        const interval = if (b.file.get(arch ++ ".full_attention_interval") != null) try b.num("full_attention_interval") else 4;
 
         // Rotated weights store W·D·H.
         const names = try b.value("prism.hadamard.weight_names");
@@ -341,7 +259,7 @@ const Binder = struct {
             .arena = undefined,
         };
         for (m.layers, 0..) |*l, il| {
-            const recurrent = (il + 1) % interval != 0;
+            const recurrent = h.recurrent(il);
             l.hc_attn = try b.hc(il, "attn", h);
             l.hc_ffn = try b.hc(il, "ffn", h);
             if (recurrent) {
