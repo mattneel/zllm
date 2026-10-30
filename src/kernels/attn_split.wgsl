@@ -11,7 +11,11 @@
 // group. Cache format as in `attention` (f16 pairs or f32 bits).
 //
 // MAX_GROUP, the most query heads per KV head, is prepended (kernels.zig:
-// attn_split, attn_split_wide).
+// attn_split, attn_split_wide, attn_split_sparse), with `included`, which
+// keys a query attends to among those up to its position: all
+// (attn_dense.wgsl), or the sparse attention's selection (attn_sparse.wgsl).
+// An excluded key's score is the sentinel −FLT_MAX and its weight 0, also
+// where a block has no key left.
 //
 // part layout per (t, head, block): [max, sum, o_0 .. o_{head_dim−1}], at
 // ((t · heads + head) · blocks + b) · (head_dim + 2), blocks = max_blocks,
@@ -95,12 +99,13 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
     let j = lid / SPLIT;
     let s = lid % SPLIT;
     let key = k0 + j;
+    let live = key < keys && included(row, key);
     let span = hd / SPLIT;
     var dot: array<f32, MAX_GROUP>;
     for (var h = 0u; h < MAX_GROUP; h++) {
         dot[h] = 0.0;
     }
-    if (key < keys) {
+    if (live) {
         let kb = (key * kv_stride + g * hd + s * span) / 2u;
         for (var d = 0u; d < span / 2u; d++) {
             let kk = k_pair(kb + d);
@@ -115,7 +120,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
         workgroupBarrier();
         if (s == 0u) {
             let total = red[lid] + red[lid + 1u] + red[lid + 2u] + red[lid + 3u];
-            sc[h * BLOCK + j] = select(-0x1.fffffep+127f, total * p.scale, key < keys);
+            sc[h * BLOCK + j] = select(-0x1.fffffep+127f, total * p.scale, live);
         }
         workgroupBarrier();
     }
@@ -129,7 +134,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
         }
         var sum = 0.0;
         for (var i = 0u; i < n; i++) {
-            let e = exp(sc[lid * BLOCK + i] - mx);
+            let s = sc[lid * BLOCK + i];
+            let e = select(exp(s - mx), 0.0, s == -0x1.fffffep+127f);
             sc[lid * BLOCK + i] = e;
             sum += e;
         }

@@ -33,10 +33,17 @@ pub const Kernel = enum {
     rope_append,
     // attn_split.wgsl with MAX_GROUP set: groups of up to attn_max_group,
     // and the wide variant's up to attn_max_group_wide (more workgroup
-    // memory, which costs the narrow groups' prefill ~2%).
+    // memory, which costs the narrow groups' prefill ~2%); the sparse one
+    // is the wide one over the sparse attention's selection.
     attn_split,
     attn_split_wide,
+    attn_split_sparse,
     attn_combine,
+    // Qwen3.8-Flash-Next's sparse attention indexer.
+    qsa_keys,
+    qsa_pool,
+    qsa_score,
+    qsa_select,
     delta_prep,
     delta_rule,
     gated_norm,
@@ -154,8 +161,12 @@ fn composed(comptime name: []const u8) []const u8 {
             return @embedFile("quant/common.wgsl") ++ @embedFile("quant/" ++ t ++ ".wgsl") ++ dot ++ @embedFile(body);
         }
     }
-    if (std.mem.eql(u8, name, "attn_split")) return std.fmt.comptimePrint("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group}) ++ @embedFile("attn_split.wgsl");
-    if (std.mem.eql(u8, name, "attn_split_wide")) return std.fmt.comptimePrint("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group_wide}) ++ @embedFile("attn_split.wgsl");
+    const group = std.fmt.comptimePrint;
+    if (std.mem.eql(u8, name, "attn_split")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group}) ++ @embedFile("attn_dense.wgsl") ++ @embedFile("attn_split.wgsl");
+    if (std.mem.eql(u8, name, "attn_split_wide")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group_wide}) ++ @embedFile("attn_dense.wgsl") ++ @embedFile("attn_split.wgsl");
+    if (std.mem.eql(u8, name, "attn_split_sparse")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group_wide}) ++ @embedFile("attn_sparse.wgsl") ++ @embedFile("attn_split.wgsl");
+    // The kernels that store f16 round it themselves.
+    if (std.mem.eql(u8, name, "rope_append") or std.mem.eql(u8, name, "qsa_keys")) return @embedFile("f16_round.wgsl") ++ @embedFile(name ++ ".wgsl");
     return @embedFile(name ++ ".wgsl");
 }
 
@@ -379,6 +390,20 @@ pub const params = struct {
         _pad: [3]u32 = @splat(0),
     };
     /// `attn_split` and `attn_combine`, for tokens row0 ...
+    /// The sparse attention indexer's (qsa_*.wgsl, attn_sparse.wgsl):
+    /// `heads` query heads of `dim`, blocks of `ratio` cells, `width` cells
+    /// attended past which selection starts, `stride` blocks per row of the
+    /// scores and the selection, `row` floats per row of the projection.
+    pub const Qsa = extern struct {
+        heads: u32,
+        dim: u32,
+        ratio: u32,
+        width: u32,
+        stride: u32,
+        n_rot: u32,
+        eps: f32,
+        row: u32,
+    };
     pub const Attention = extern struct {
         heads: u32,
         kv_heads: u32,

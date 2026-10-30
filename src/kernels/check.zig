@@ -37,19 +37,19 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,         checkMatmulChunked,   checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair, checkMatmulF16,      checkMatvecNormF16,   checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,        checkEmbed,          checkRopeAppendF32,   checkRopeAppendF16,     checkRopeAppendRounding,
-        checkAttentionF32,   checkAttentionF16,   checkAttentionWide,   checkAttnDecode,        checkAttnDecodeWide,
-        checkDeltaPrep,      checkDeltaKeep,      checkDeltaRule,       checkGatedNormSigmoid,  checkDraft,
-        checkGyroMatvec,     checkMoeRoute,       checkRotate128,       checkMoeCombine,        checkHc,
-        checkPle,            checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
-        checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
-        Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,   checkEmbedStride,       Quant(.q3_k).matvec,
-        Quant(.q3_k).matmul, Quant(.q3_k).embed,  Quant(.q4_k).matvec,  Quant(.q4_k).matmul,    Quant(.q4_k).embed,
-        Quant(.q5_k).matvec, Quant(.q5_k).matmul, Quant(.q5_k).embed,   Quant(.q6_k).matvec,    Quant(.q6_k).matmul,
-        Quant(.q6_k).embed,  checkQuantTiles,     checkQuantSiluPair,   checkQuantizeQ8K,       checkQuantizeQ80,
-        checkQuantizeNorm,   checkQuantizeSilu,
+        checkRmsNorm,           checkMatmul,         checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair,    checkMatmulF16,      checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,           checkEmbed,          checkRopeAppendF32,  checkRopeAppendF16,     checkRopeAppendRounding,
+        checkAttentionF32,      checkAttentionF16,   checkAttentionWide,  checkAttnDecode,        checkAttnDecodeWide,
+        checkAttnSparse,        checkQsaIndexer,     checkDeltaPrep,      checkDeltaKeep,         checkDeltaRule,
+        checkGatedNormSigmoid,  checkDraft,          checkGyroMatvec,     checkMoeRoute,          checkRotate128,
+        checkMoeCombine,        checkHc,             checkPle,            checkSampleGreedy,      checkSampleTopKTopP,
+        checkSampleMinP,        checkSampleTopP,     checkSamplePlain,    checkSampleTopK1,       checkSampleLargeTopK,
+        checkSampleTopKSkipped, checkSampleVocab,    Quant(.q8_0).matvec, Quant(.q8_0).matmul,    Quant(.q8_0).embed,
+        checkEmbedStride,       Quant(.q3_k).matvec, Quant(.q3_k).matmul, Quant(.q3_k).embed,     Quant(.q4_k).matvec,
+        Quant(.q4_k).matmul,    Quant(.q4_k).embed,  Quant(.q5_k).matvec, Quant(.q5_k).matmul,    Quant(.q5_k).embed,
+        Quant(.q6_k).matvec,    Quant(.q6_k).matmul, Quant(.q6_k).embed,  checkQuantTiles,        checkQuantSiluPair,
+        checkQuantizeQ8K,       checkQuantizeQ80,    checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -964,6 +964,226 @@ fn checkAttnDecode(c: *Ctx) !Result {
 
 fn checkAttnDecodeWide(c: *Ctx) !Result {
     return attnDecodeCase(c, AttnShape(24), "attn_split + combine, groups of 12");
+}
+
+/// The sparse attention's indexer over 230 positions, in steps of 3, 4, 1
+/// and 2 tokens (qsa_keys, qsa_pool, qsa_score, qsa_select): 4 query heads of
+/// 128, blocks of 4, top-k 40 (width 43). Every token's query heads are
+/// equal, so about half the blocks score exactly 0, and rows just past the
+/// width must break those ties by index. Exact: the key cache against the raw
+/// keys rounded to f16 (nearest), and each row's selection against a sort of
+/// the GPU's own scores (highest first, ties to the lower block), the K-th
+/// block cut to what is left of the width. Against float64: the queries
+/// (norm and RoPE), the pooled blocks (mean of the f16 keys, norm, RoPE at
+/// the block's start) and the scores over the GPU's queries and blocks.
+fn checkQsaIndexer(c: *Ctx) !Result {
+    const heads = 4;
+    const d = 128;
+    const r = 4;
+    const n_rot = 64;
+    const rope_base = 1e7;
+    const total = 230;
+    const width = 40 + r - 1;
+    const eps = 1e-6;
+    const row = (heads + 1) * d;
+    const stride = total / r + 1;
+    const cap = kernels.decode_max_rows;
+
+    const raw = try c.arena.alloc(f32, total * row);
+    for (0..total) |t| {
+        const q = try c.random(d, 2);
+        for (0..heads) |h| @memcpy(raw[t * row + h * d ..][0..d], q);
+        @memcpy(raw[t * row + heads * d ..][0..d], try c.random(d, 2));
+    }
+    const qn = try c.random(d, 1);
+    const kn = try c.random(d, 1);
+    const params: P.Qsa = .{ .heads = heads, .dim = d, .ratio = r, .width = width, .stride = stride, .n_rot = n_rot, .eps = eps, .row = row };
+    const idx = try c.output(cap * row);
+    const keys = try c.output(total * d / 2);
+    const pooled = try c.output(stride * d);
+    const scores = try c.output(cap * stride);
+    const sel = try c.output(cap * stride);
+    const rope = try c.upload(try kernels.ropeTable(c.arena, total, n_rot, rope_base));
+    const qn_a = try c.upload(qn);
+    const kn_a = try c.upload(kn);
+
+    // Per position: the GPU's query heads, scores and selection.
+    const got_q = try c.arena.alloc(f32, total * heads * d);
+    const got_scores = try c.arena.alloc(f32, total * stride);
+    const got_sel = try c.arena.alloc(u32, total * stride);
+    const sizes = [_]u32{ 3, 4, 1, 2 };
+    var pos: u32 = 0;
+    var i: usize = 0;
+    while (pos < total) : (i += 1) {
+        const m: u32 = @min(sizes[i % sizes.len], total - pos);
+        try c.rec.writeBuffer(c.gpa, idx.buffer, 0, std.mem.sliceAsBytes(raw[pos * row ..][0 .. m * row]));
+        const step = try c.step(m, pos, 0);
+        const l = c.launcher();
+        try l.launch(.qsa_keys, params, &.{ idx, qn_a, rope, keys, step }, .{ heads + 1, m, 1 });
+        try l.launch(.qsa_pool, params, &.{ keys, kn_a, rope, pooled, step }, .{ 2, 1, 1 });
+        try l.launch(.qsa_score, params, &.{ idx, pooled, scores, step }, .{ std.math.divCeil(u32, stride, 256) catch unreachable, m, 1 });
+        try l.launch(.qsa_select, params, &.{ scores, sel, step }, .{ 1, m, 1 });
+        const q_rows = try c.read(idx);
+        const s_rows = try c.read(scores);
+        const sel_rows = try c.readWords(sel);
+        for (0..m) |t| {
+            @memcpy(got_q[(pos + t) * heads * d ..][0 .. heads * d], q_rows[t * row ..][0 .. heads * d]);
+            @memcpy(got_scores[(pos + t) * stride ..][0..stride], s_rows[t * stride ..][0..stride]);
+            @memcpy(got_sel[(pos + t) * stride ..][0..stride], sel_rows[t * stride ..][0..stride]);
+        }
+        pos += m;
+    }
+    const got_keys = try c.readWords(keys);
+    const got_pooled = try c.read(pooled);
+
+    var exact = true;
+    // The key cache: the raw keys rounded to nearest.
+    for (0..total) |p| for (0..d / 2) |j| {
+        const lo: u16 = @bitCast(@as(f16, @floatCast(raw[p * row + heads * d + 2 * j])));
+        const hi: u16 = @bitCast(@as(f16, @floatCast(raw[p * row + heads * d + 2 * j + 1])));
+        exact = exact and got_keys[p * d / 2 + j] == (@as(u32, lo) | (@as(u32, hi) << 16));
+    };
+    // The queries.
+    const want_q = try c.arena.alloc(f64, total * heads * d);
+    for (0..total) |p| for (0..heads) |h| {
+        const head = want_q[(p * heads + h) * d ..][0..d];
+        for (head, raw[p * row + h * d ..][0..d]) |*w, v| w.* = v;
+        normRope(head, qn, p, n_rot, rope_base, eps);
+    };
+    // The pooled blocks, from the cached (f16) keys.
+    const blocks = total / r;
+    const want_pooled = try c.arena.alloc(f64, blocks * d);
+    for (0..blocks) |b| {
+        const out = want_pooled[b * d ..][0..d];
+        for (out, 0..) |*w, j| {
+            var sum: f64 = 0;
+            for (0..r) |k| sum += @as(f16, @floatCast(raw[(b * r + k) * row + heads * d + j]));
+            w.* = sum / r;
+        }
+        normRope(out, kn, b * r, n_rot, rope_base, eps);
+    }
+    // Scores over the GPU's queries and blocks; the selection from the
+    // GPU's scores.
+    var score_err: f64 = 0;
+    const order = try c.arena.alloc(u32, stride);
+    for (width..total) |p| {
+        const visible = p + 1;
+        const nb = visible / r;
+        const want_s = try c.arena.alloc(f64, nb);
+        for (want_s, 0..) |*w, b| {
+            var s: f64 = 0;
+            for (0..heads) |h| {
+                var dot: f64 = 0;
+                for (0..d) |j| dot += @as(f64, got_q[(p * heads + h) * d + j]) * got_pooled[b * d + j];
+                s += @max(dot, 0);
+            }
+            w.* = s;
+        }
+        score_err = worse(score_err, relErr(got_scores[p * stride ..][0..nb], want_s));
+        const s = got_scores[p * stride ..][0..nb];
+        for (order[0..nb], 0..) |*o, b| o.* = @intCast(b);
+        const By = struct {
+            s: []const f32,
+            fn more(ctx: @This(), a: u32, b: u32) bool {
+                return if (ctx.s[a] != ctx.s[b]) ctx.s[a] > ctx.s[b] else a < b;
+            }
+        };
+        std.mem.sort(u32, order[0..nb], By{ .s = s }, By.more);
+        var left = width - (visible - nb * r);
+        const want_sel = try c.arena.alloc(u32, nb);
+        @memset(want_sel, 0);
+        for (order[0..nb]) |b| {
+            if (left == 0) break;
+            want_sel[b] = @min(r, left);
+            left -= want_sel[b];
+        }
+        exact = exact and std.mem.eql(u32, got_sel[p * stride ..][0..nb], want_sel);
+    }
+    const err = worse(worse(relErr(got_q, want_q), relErr(got_pooled[0 .. blocks * d], want_pooled)), score_err);
+    return .{ .name = "sparse attention indexer (4 steps)", .err = if (exact) err else std.math.inf(f64), .tolerance = 1e-5 };
+}
+
+/// attn_split_sparse + attn_combine for 3 queries after 297 cached
+/// positions (groups of 12): each row attends to its tail and, per block of
+/// 4, the cells the selection takes from the block's start, with every cell
+/// of positions 64-127 left out (a whole 64-key block). With a width past
+/// every row's position, the same kernels attend to everything.
+fn checkAttnSparse(c: *Ctx) !Result {
+    const S = AttnShape(24);
+    const first = 297;
+    const second = 3;
+    const total = first + second;
+    const r = 4;
+    const stride = total / r + 1;
+    const k = try c.random(total * S.width, 1);
+    const v = try c.random(total * S.width, 1);
+    const qg = try c.random(second * S.q_row, 1);
+    const ka = try c.upload(try cacheWords(c, k, true));
+    const va = try c.upload(try cacheWords(c, v, true));
+    const qa = try c.upload(qg);
+    const sel = try c.arena.alloc(u32, second * stride);
+    for (sel, 0..) |*s, j| {
+        const b = j % stride;
+        s.* = if (b >= 16 and b < 32) 0 else c.rand.uintLessThan(u32, r + 1);
+    }
+    const sel_a = try c.upload(sel);
+    const max_blocks = std.math.divCeil(u32, total, kernels.attn_block) catch unreachable;
+    var worst: f64 = 0;
+    for ([_]u32{ 100, 400 }) |width| {
+        const out = try c.output(second * S.heads * S.hd);
+        const part = try c.output(second * S.heads * max_blocks * (S.hd + 2));
+        const step = try c.step(second, first, 0);
+        const qsa = try c.uniform(P.Qsa{ .heads = 4, .dim = 128, .ratio = r, .width = width, .stride = stride, .n_rot = 64, .eps = 1e-6, .row = 640 });
+        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row };
+        const grid: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block } };
+        const l = c.launcher();
+        try l.launch(.attn_split_sparse, params, &.{ qa, ka, va, part, step, sel_a, qsa }, grid.resolve(.{ .rows = second, .keys = total }));
+        try l.launch(.attn_combine, params, &.{ qa, part, out, step }, .{ S.heads, second, 1 });
+        const got = try c.read(out);
+        const mask = try c.arena.alloc(bool, second * total);
+        for (0..second) |t| {
+            const visible = first + t + 1;
+            const tail = visible / r * r;
+            for (0..total) |key| {
+                mask[t * total + key] = key < visible and (visible <= width or key >= tail or key % r < sel[t * stride + key / r]);
+            }
+        }
+        worst = worse(worst, relErr(got, try attnWantMasked(c, S, qg, k, v, first, second, mask)));
+    }
+    return .{ .name = "attn_split_sparse + combine", .err = worst, .tolerance = 1e-5 };
+}
+
+/// attnWant over the keys `mask` keeps for each query row ([row][total]).
+fn attnWantMasked(c: *Ctx, comptime S: type, qg: []const f32, k: []const f32, v: []const f32, first: u32, second: u32, mask: []const bool) ![]f64 {
+    const total = first + second;
+    const want = try c.arena.alloc(f64, second * S.heads * S.hd);
+    const s = try c.arena.alloc(f64, total);
+    for (0..second) |t| for (0..S.heads) |h| {
+        const kvh = h / (S.heads / S.kv);
+        const q = qg[t * S.q_row + h * 2 * S.hd ..][0..S.hd];
+        var max: f64 = -std.math.inf(f64);
+        for (0..total) |j| {
+            if (!mask[t * total + j]) continue;
+            var dot: f64 = 0;
+            for (0..S.hd) |dd| dot += @as(f64, q[dd]) * k[j * S.width + kvh * S.hd + dd];
+            s[j] = dot * S.scale;
+            max = @max(max, s[j]);
+        }
+        var sum: f64 = 0;
+        for (0..total) |j| {
+            if (!mask[t * total + j]) continue;
+            s[j] = @exp(s[j] - max);
+            sum += s[j];
+        }
+        for (0..S.hd) |dd| {
+            var o: f64 = 0;
+            for (0..total) |j| if (mask[t * total + j]) {
+                o += s[j] * v[j * S.width + kvh * S.hd + dd];
+            };
+            want[(t * S.heads + h) * S.hd + dd] = o / sum * sigmoid64(qg[t * S.q_row + h * 2 * S.hd + S.hd + dd]);
+        }
+    };
+    return want;
 }
 
 /// Cache words as f32 values.
