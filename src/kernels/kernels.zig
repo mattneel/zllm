@@ -40,6 +40,9 @@ pub const Kernel = enum {
     sample,
     draft,
     gyro_matvec,
+    moe_route,
+    rotate128,
+    moe_combine,
     repad,
     repack_q3_k,
     quantize_q8,
@@ -387,6 +390,9 @@ pub const params = struct {
         _pad: u32 = 0,
     };
     pub const Draft = extern struct { vocab: u32, row: u32, slot: u32, _pad: u32 = 0 };
+    pub const MoeRoute = extern struct { n_expert: u32, n_used: u32, cols: u32, x_stride: u32, scale: f32 = 0, _pad: [3]u32 = @splat(0) };
+    pub const Rotate128 = extern struct { width: u32, x_stride: u32, y_stride: u32, silu_pair: u32 = 0 };
+    pub const MoeCombine = extern struct { n_used: u32, dim: u32, _pad: [2]u32 = @splat(0) };
     pub const GyroMatvec = extern struct {
         rows: u32,
         cols: u32,

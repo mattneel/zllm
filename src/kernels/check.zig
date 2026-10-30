@@ -37,17 +37,17 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,        checkMatmul,         checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair, checkMatmulF16,      checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,        checkEmbed,          checkRopeAppendF32,  checkRopeAppendF16,     checkAttentionF32,
-        checkAttentionF16,   checkAttnDecode,     checkDeltaPrep,      checkDeltaKeep,         checkDeltaRule,
-        checkDraft,          checkGyroMatvec,     checkSampleGreedy,   checkSampleTopKTopP,    checkSampleMinP,
-        checkSampleTopP,     checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK,   checkSampleTopKSkipped,
-        checkSampleVocab,    Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,     Quant(.q3_k).matvec,
-        Quant(.q3_k).matmul, Quant(.q3_k).embed,  Quant(.q4_k).matvec, Quant(.q4_k).matmul,    Quant(.q4_k).embed,
-        Quant(.q5_k).matvec, Quant(.q5_k).matmul, Quant(.q5_k).embed,  Quant(.q6_k).matvec,    Quant(.q6_k).matmul,
-        Quant(.q6_k).embed,  checkQuantTiles,     checkQuantSiluPair,  checkQuantizeQ8K,       checkQuantizeQ80,
-        checkQuantizeNorm,   checkQuantizeSilu,
+        checkRmsNorm,        checkMatmul,          checkMatmulChunked,     checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair, checkMatmulF16,       checkMatvecNormF16,     checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,        checkEmbed,           checkRopeAppendF32,     checkRopeAppendF16,     checkAttentionF32,
+        checkAttentionF16,   checkAttnDecode,      checkDeltaPrep,         checkDeltaKeep,         checkDeltaRule,
+        checkDraft,          checkGyroMatvec,      checkMoeRoute,          checkRotate128,         checkMoeCombine,
+        checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,        checkSamplePlain,
+        checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,       Quant(.q8_0).matvec,
+        Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,    Quant(.q3_k).embed,
+        Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,    Quant(.q5_k).matmul,
+        Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,     checkQuantTiles,
+        checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,      checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -1272,6 +1272,112 @@ fn checkGyroMatvec(c: *Ctx) !Result {
         worst = @max(worst, relErr(got, want));
     }
     return .{ .name = "gyro_matvec tq2_t (routed, gate+up, down)", .err = worst, .tolerance = 1e-5 };
+}
+
+/// Routing for 3 tokens over 256 experts, the model's top 10: softmax of
+/// router · x, the 10 largest (ids exact), their normalized weights, and the
+/// shared gate's logit.
+fn checkMoeRoute(c: *Ctx) !Result {
+    const n_expert = 256;
+    const used = 10;
+    const cols = 2560;
+    const tokens = 3;
+    const router = try c.random(n_expert * cols, 0.05);
+    const shared = try c.random(cols, 0.05);
+    const x = try c.random(tokens * cols, 1);
+    const ids = try c.output(tokens * used);
+    const weights = try c.output(tokens * used);
+    const logit = try c.output(tokens);
+    try c.launcher().launch(.moe_route, P.MoeRoute{ .n_expert = n_expert, .n_used = used, .cols = cols, .x_stride = cols }, &.{
+        try c.upload(router), try c.upload(shared), try c.upload(x), ids, weights, logit,
+    }, .{ tokens, 1, 1 });
+    const got_ids = try c.readWords(ids);
+    const got_w = try c.read(weights);
+    const got_l = try c.read(logit);
+    const want_w = try c.arena.alloc(f64, tokens * used);
+    const want_l = try c.arena.alloc(f64, tokens);
+    var ids_ok = true;
+    for (0..tokens) |t| {
+        const xr = x[t * cols ..][0..cols];
+        var probs: [n_expert]f64 = undefined;
+        var m: f64 = -std.math.inf(f64);
+        for (&probs, 0..) |*pr, e| {
+            var s: f64 = 0;
+            for (router[e * cols ..][0..cols], xr) |w, v| s += @as(f64, w) * v;
+            pr.* = s;
+            m = @max(m, s);
+        }
+        var sum: f64 = 0;
+        for (&probs) |*pr| {
+            pr.* = @exp(pr.* - m);
+            sum += pr.*;
+        }
+        for (&probs) |*pr| pr.* /= sum;
+        var total: f64 = 0;
+        for (0..used) |k| {
+            var best: usize = 0;
+            for (probs, 0..) |pr, e| if (pr > probs[best]) {
+                best = e;
+            };
+            ids_ok = ids_ok and got_ids[t * used + k] == best;
+            want_w[t * used + k] = probs[best];
+            total += probs[best];
+            probs[best] = -1;
+        }
+        for (want_w[t * used ..][0..used]) |*w| w.* /= total;
+        var s: f64 = 0;
+        for (shared, xr) |w, v| s += @as(f64, w) * v;
+        want_l[t] = s;
+    }
+    const err = @max(relErr(got_w, want_w), relErr(got_l, want_l));
+    return .{ .name = "moe_route (256 experts, top 10, shared gate)", .err = if (ids_ok) err else 1, .tolerance = 1e-5 };
+}
+
+/// rotate128 against the reference rotation: rows of 2,560 as they are, and
+/// rows of 640 from silu(gate) · up.
+fn checkRotate128(c: *Ctx) !Result {
+    const gyro_ref = @import("../ref/gyro/gyro.zig");
+    var worst: f64 = 0;
+    for ([_]u32{ 2560, 640 }, [_]u32{ 0, 1 }) |width, pair| {
+        const rows = 3;
+        const x_stride = width * (1 + pair);
+        const x = try c.random(rows * x_stride, 2);
+        const signs = try c.arena.alloc(f32, width);
+        for (signs) |*s| s.* = if (c.rand.boolean()) 1 else -1;
+        const y = try c.output(rows * width);
+        try c.launcher().launch(.rotate128, P.Rotate128{ .width = width, .x_stride = x_stride, .y_stride = width, .silu_pair = pair }, &.{ try c.upload(x), try c.upload(signs), y }, .{ width / 128, rows, 1 });
+        const got = try c.read(y);
+        const want = try c.arena.alloc(f64, rows * width);
+        const row = try c.arena.alloc(f32, width);
+        for (0..rows) |r| {
+            const xr = x[r * x_stride ..][0..x_stride];
+            for (row, 0..) |*v, i| v.* = if (pair == 1) xr[i] / (1 + @exp(-xr[i])) * xr[width + i] else xr[i];
+            gyro_ref.rotate(row, 128, signs);
+            for (want[r * width ..][0..width], row) |*w, v| w.* = v;
+        }
+        worst = @max(worst, relErr(got, want));
+    }
+    return .{ .name = "rotate128 (plain, silu pair)", .err = worst, .tolerance = 1e-6 };
+}
+
+fn checkMoeCombine(c: *Ctx) !Result {
+    const used = 10;
+    const dim = 2560;
+    const tokens = 2;
+    const down = try c.random(tokens * used * dim, 1);
+    const w = try c.random(tokens * used, 1);
+    const shared = try c.random(tokens * dim, 1);
+    const logit = try c.random(tokens, 3);
+    const out = try c.output(tokens * dim);
+    try c.launcher().launch(.moe_combine, P.MoeCombine{ .n_used = used, .dim = dim }, &.{ try c.upload(down), try c.upload(w), try c.upload(shared), try c.upload(logit), out }, .{ dim / 256, tokens, 1 });
+    const got = try c.read(out);
+    const want = try c.arena.alloc(f64, tokens * dim);
+    for (0..tokens) |t| for (0..dim) |i| {
+        var acc: f64 = 0;
+        for (0..used) |k| acc += @as(f64, w[t * used + k]) * down[(t * used + k) * dim + i];
+        want[t * dim + i] = acc + sigmoid64(logit[t]) * shared[t * dim + i];
+    };
+    return .{ .name = "moe_combine", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 fn checkSampleGreedy(c: *Ctx) !Result {

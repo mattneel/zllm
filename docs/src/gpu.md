@@ -111,6 +111,9 @@ unit decodes from one load (128 bytes per block).
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling). One more phase undoes the last draw's output count (a rejected speculative round's second sample) |
 | `draft` | The speculative draft: the first index of the maximum of a row of logits, into the next step's token input | One workgroup |
 | `gyro_matvec` | Routed-expert products on Gyro TQ2_T weights (Gyro-Coder) | Lifted from gyro-dx: the expert comes from a GPU buffer the router wrote, no readback; a lane per trellis step decodes four weights from the 2,048-pair codebook; gate and up in one dispatch |
+| `moe_route` | Expert routing, a token per workgroup: router · x (f32), softmax, top-k (ties to the lower index), normalized weights; and the shared expert's gate logit | Router rows read coalesced, a lane group per row |
+| `rotate128` | H₁₂₈ · (signs · x) per 128-value block: the basis Gyro expert weights are stored in. Optionally of silu(gate) · up | 64 butterflies a stage in workgroup memory |
+| `moe_combine` | The expert block's output: the routed experts' weighted sum plus the gated shared expert | |
 
 These are plain WGSL. M4 makes them templates tuned per GPU; the decode
 kernels above are its first part, measured with `zllm bench`
