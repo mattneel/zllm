@@ -136,8 +136,12 @@ export interface ChatRequest {
   /** Qwen thinking (default on), and its effort ("none" turns it off). */
   enable_thinking?: boolean;
   reasoning_effort?: string;
-  /** More keyword arguments for a model's own chat template (as vLLM's). */
-  chat_template_kwargs?: Record<string, unknown>;
+  /**
+   * More keyword arguments for a model's own chat template (as vLLM's).
+   * `force_nonempty_content` (Granite's reasoning parser): reasoning that
+   * never reached content is the content.
+   */
+  chat_template_kwargs?: { force_nonempty_content?: boolean; [key: string]: unknown };
   /** Each content token's log-probability, and `top_logprobs` alternatives. */
   logprobs?: boolean;
   top_logprobs?: number;
@@ -748,6 +752,16 @@ export class Engine {
     const finish = last?.choices[0]?.finish_reason;
     if (last === null || finish === null || finish === undefined || last.usage === undefined) {
       throw new Error("zllm: the request ended without finishing");
+    }
+    // Granite's reasoning parser: with force_nonempty_content, reasoning
+    // that never reached content is the content (non-streaming, as in vLLM).
+    if (
+      req.chat_template_kwargs?.force_nonempty_content === true &&
+      content === "" &&
+      toolCalls.length === 0
+    ) {
+      content = reasoning;
+      reasoning = "";
     }
     const message: ChatCompletion["choices"][number]["message"] = {
       role: "assistant",
