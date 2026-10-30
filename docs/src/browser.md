@@ -180,11 +180,32 @@ already. Loaded that way, the 27B takes 15.3 s, the warm load the spec's
 40 s bar is about, since the API takes a `FileSystemFileHandle` an app can
 keep and reopen.
 
+### Qwen3.8-Flash-Next Gyro-Coder
+
+The 125B Gyro-Coder (75.8 GB) runs in Chrome from the picked file. Only
+its 20 GB of weights go to the GPU; its 50.7 GiB per-layer embedding table
+stays in the file, and each step reads its tokens' 16 rows apiece through
+`write_file`, as the weights were read at load
+([GPU backend](gpu.md#qwen38-flash-next)). On the RTX 5090 Laptop:
+
+| Phase | Chrome | Native CLI |
+|---|---|---|
+| Load from a local file (weights 20 GB) | 19.4 s | 16–20 s, with 5 s of tuning |
+| Decode, greedy | 9.4–11.5 tok/s | 11–13 tok/s |
+| Prefill, 26–32 tokens | 19–22 tok/s | 27–32 tok/s |
+
+The host must know each token before its step, to read its rows, so the
+shim keeps one batch in flight here, not two
+([Generation](generation.md#scheduling)). Greedy, from the reference
+runtime's prompt, Chrome gives that runtime's 40 tokens; from a chat
+prompt, the same 128 tokens as `zllm generate`.
+
 ## Validation
 
 - **Same output as native.** In Chrome on the RTX 5090, greedy generation
   from a prompt gives the same 256 tokens as `zllm generate` on the native
-  D3D12 host, loaded both over HTTP and from a local file.
+  D3D12 host, loaded both over HTTP and from a local file. The Gyro-Coder
+  gives the same 128 tokens, and its reference runtime's 40.
 - **The engine logic the browser adds** is checked natively by
   `engine-check` ([Validation](validation.md#engine)). One scenario runs a
   request pipelined, with batches completed only on `wait`; it must sample
@@ -196,7 +217,8 @@ keep and reopen.
 
 ## Not yet
 
-- **Model and template coverage:** only the Qwen 3.5 BF16 GGUFs, with the
+- **Model and template coverage:** Qwen 3.5 and 3.8 GGUFs (BF16, F16 and the
+  quantized types; the Gyro-Coder up to 2,048 tokens of context), with the
   fixed Qwen template. Rendering a GGUF's own chat template with
   `@huggingface/jinja` is still to come.
 - **Plan cache:** a plan cache (M4) would skip setup work that a cached

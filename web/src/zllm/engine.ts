@@ -293,6 +293,9 @@ async function loadFrom(source: ModelSource, opts: LoadOptions): Promise<Engine>
   for await (const _ of engine.drive()) {
     // Loading emits no tokens.
   }
+  // File reads after loading are per-token rows (a Qwen3.8-Flash-Next
+  // model's per-layer embeddings), not load progress.
+  exec.onProgress = null;
   return engine;
 }
 
