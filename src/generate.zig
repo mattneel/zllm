@@ -28,6 +28,7 @@ pub const usage =
     \\  --stop S              stop string, repeatable
     \\  --system S            (chat) system prompt
     \\  --no-think            (chat) answer without a reasoning block
+    \\  --no-tune             skip the load-time tuning of the decode multiplies
     \\  --speculate, --no-speculate
     \\                        draft tokens with the model's MTP block and verify
     \\                        them two at a time, or not; the output is the same
@@ -53,6 +54,8 @@ pub const Options = struct {
     system: ?[]const u8 = null,
     think: bool = true,
     speculate: ?bool = null,
+    /// Tune the decode multiplies at load.
+    tune: bool = true,
 
     pub fn parse(arena: Allocator, args: []const []const u8) error{ InvalidUsage, OutOfMemory }!Options {
         var o: Options = .{};
@@ -62,6 +65,10 @@ pub const Options = struct {
             const flag = args[i];
             if (std.mem.eql(u8, flag, "--no-think")) {
                 o.think = false;
+                continue;
+            }
+            if (std.mem.eql(u8, flag, "--no-tune")) {
+                o.tune = false;
                 continue;
             }
             if (std.mem.eql(u8, flag, "--speculate") or std.mem.eql(u8, flag, "--no-speculate")) {
@@ -150,12 +157,17 @@ pub const Runtime = struct {
     adapter: []const u8 = "",
     /// Where loading went, in nanoseconds.
     load: Load = .{},
+    /// Shapes the sweep tuned, and how many got a variant other than the
+    /// default.
+    tuned: [2]u32 = .{ 0, 0 },
 
     pub const Load = struct {
         /// Shaders and pipelines compiled.
         pipelines: u64 = 0,
         /// Weights read from the file onto the GPU (and laid out).
         weights: u64 = 0,
+        /// The decode multiplies' tuning sweep.
+        tuning: u64 = 0,
         /// The step program: buffers and bind groups.
         program: u64 = 0,
         /// The engine's calibration batches (the first compiles nothing but
@@ -195,12 +207,29 @@ pub const Runtime = struct {
         host.file = bytes;
         rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
         try rt.executeTimed(&rec, &t, &rt.load.weights);
+        const mtp = plan.canSpeculate(&rt.model, limits);
+        var tuning: plan.Tuning = .{};
+        if (o.tune) {
+            // Decoding mostly runs steps of two where it speculates.
+            var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &rt.set, &rt.model, .{}, if (mtp and plan.speculationPays(&rt.model)) 2 else 1);
+            while (try sweep.next()) |words| {
+                const t0 = Io.Timestamp.now(io, .awake);
+                try rt.execute(words);
+                try sweep.done(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()));
+            }
+            tuning = sweep.tuning();
+            rt.tuned = .{ @intCast(sweep.shapes.len), @intCast(tuning.entries.len) };
+            const now = Io.Timestamp.now(io, .awake);
+            rt.load.tuning = @intCast(t.durationTo(now).toNanoseconds());
+            t = now;
+        }
         rt.program = try plan.Program.build(arena, gpa, &rec, &rt.set, &rt.model, .{
             .context = o.context,
             .max_tokens = @min(512, o.context),
             .kv = o.kv,
-            .mtp = plan.canSpeculate(&rt.model, limits),
+            .mtp = mtp,
             .logit_rows = 2,
+            .tuning = tuning,
         }, limits);
         try rt.executeTimed(&rec, &t, &rt.load.program);
         rt.engine = try .init(gpa, &rt.program, &rt.tok);

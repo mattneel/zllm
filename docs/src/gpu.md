@@ -115,6 +115,31 @@ These are plain WGSL. M4 makes them templates tuned per GPU; the decode
 kernels above are its first part, measured with `zllm bench`
 ([Generation](generation.md#performance)).
 
+## Tuning
+
+After the weights are on the GPU and before the step program is built,
+`src/tune` sweeps the quantized decode multiply's variants (spec §5) for
+each weight shape in the model, the MTP block's included:
+
+- **Candidates:** the 12 `MatvecVariant`s, less those past the device's
+  limits, the default first.
+- **Correctness first:** each candidate's output on the shape's real weights
+  must be within 1e-5 relative L2 of the default variant's; one that is not
+  is dropped.
+- **Timing:** 2 more warm-up batches, then the median of 7. Batches are
+  timed from submission to completion, which every host measures (the
+  spec's fallback for adapters without timestamp queries), and repeat the
+  dispatch to last about a millisecond each.
+- **Steps:** two tokens where the engine speculates by default, else one.
+
+The winners go into the step program's `Tuning`. On the RTX 5090 Laptop, all
+16 of the 27B's shapes take another variant: the K-quants 8 or 16 threads
+per row instead of 32, Q8_0 two rows per lane group. Decoding speculatively
+goes from 40.7–41.5 tok/s to 47.0–47.3, one token per step from 30.0–30.4 to
+31.3–31.9; tuned, the 27B's decode logits stay as close to the CPU reference
+(6.4e-6 relative L2 at most, against 6.2e-6). The sweep takes 13 s;
+`--no-tune` skips it.
+
 ## Step program
 
 `src/plan/qwen35.zig` builds everything a step needs once, as the spec's

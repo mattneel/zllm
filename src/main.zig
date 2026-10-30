@@ -46,7 +46,7 @@ const usage =
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
-    \\              [--path prefill|decode] [--mtp]
+    \\              [--path prefill|decode] [--mtp] [--tune]
     \\                                       as `forward`, on the GPU through Dawn, in
     \\                                       steps of N tokens (default 512; f32 KV;
     \\                                       the decode kernels for steps of up to 4)
@@ -129,9 +129,10 @@ pub fn main(init: std.process.Init) !void {
         const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
         defer rt.destroy();
         const ld = rt.load;
-        std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, program {d}, calibration {d}); context {d}, {t} KV", .{
-            rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, opts.context, opts.kv,
+        std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, tuning {d}, program {d}, calibration {d}); context {d}, {t} KV", .{
+            rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.tuning / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, opts.context, opts.kv,
         });
+        if (rt.tuned[0] > 0) std.debug.print("; {d} of {d} decode-multiply shapes tuned to another variant", .{ rt.tuned[1], rt.tuned[0] });
         if (rt.program.mtp != null) std.debug.print("; {s}", .{if (rt.engine.speculates()) "speculative" else "MTP block, not speculating by default"});
         std.debug.print("]\n", .{});
         if (is_benchmark) {
@@ -356,13 +357,15 @@ const ForwardOptions = struct {
     path: ?zllm.plan.qwen35.Path = null,
     /// Also run the MTP block and write mtp_logits.
     mtp: bool = false,
+    /// Tune the decode multiplies first, as loading for generation does.
+    tune: bool = false,
 
     fn parse(args: []const []const u8) !ForwardOptions {
         var o: ForwardOptions = .{};
         var i: usize = 0;
         while (i < args.len) : (i += 2) {
-            if (std.mem.eql(u8, args[i], "--mtp")) {
-                o.mtp = true;
+            if (std.mem.eql(u8, args[i], "--mtp") or std.mem.eql(u8, args[i], "--tune")) {
+                if (args[i][2] == 'm') o.mtp = true else o.tune = true;
                 i -= 1;
                 continue;
             }
@@ -416,6 +419,18 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     var set = try zllm.kernels.Set.create(gpa, arena, &rec);
     host.file = mapped.bytes;
     const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
+    var tuning: plan.Tuning = .{};
+    if (opts.tune) {
+        try rec.submit(gpa, 0);
+        try runBatch(&host, &rec, &completions);
+        var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &set, &model, .{}, @min(chunk, 2));
+        while (try sweep.next()) |_| {
+            const t0 = Io.Timestamp.now(io, .awake);
+            try runBatch(&host, &rec, &completions);
+            try sweep.done(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()));
+        }
+        tuning = sweep.tuning();
+    }
     var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{
         .max_tokens = chunk,
         .context = n,
@@ -424,6 +439,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
         .kv = opts.kv,
         .checkpoints = 1,
         .mtp = opts.mtp,
+        .tuning = tuning,
     }, limits);
     try program.recordReset(gpa, &rec);
     try rec.submit(gpa, 0);

@@ -7,6 +7,7 @@ pub const ref = @import("ref/ref.zig");
 pub const gpu = @import("gpu/gpu.zig");
 pub const tmpl = @import("tmpl/tmpl.zig");
 pub const kernels = @import("kernels/kernels.zig");
+pub const tune = @import("tune/tune.zig");
 pub const kernel_check = @import("kernels/check.zig");
 pub const plan = @import("plan/plan.zig");
 pub const sampler = @import("sampler/sampler.zig");
