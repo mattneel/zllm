@@ -62,6 +62,19 @@ pub fn rope(x: []f32, pos: u32, n_rot: usize, base: f32) void {
     }
 }
 
+/// Normal (GPT-J) rotary embedding on the first `n_rot` dims of one head:
+/// pairs (2i, 2i + 1) rotate by pos * base^(-2i/n_rot) / factors[i]
+/// (Llama 3's `rope_freqs`; none is 1).
+pub fn ropeNormal(x: []f32, pos: u32, n_rot: usize, base: f32, factors: ?[]const f32) void {
+    for (0..n_rot / 2) |i| {
+        const cs = ropeCosSinScaled(pos, i, n_rot, base, if (factors) |f| f[i] else 1);
+        const x0 = x[2 * i];
+        const x1 = x[2 * i + 1];
+        x[2 * i] = x0 * cs[0] - x1 * cs[1];
+        x[2 * i + 1] = x0 * cs[1] + x1 * cs[0];
+    }
+}
+
 /// (cos, sin) of the rotation applied to pair `i` at position `pos`. GPU
 /// kernels read a table of these rather than evaluating trig themselves.
 pub fn ropeCosSin(pos: u32, i: usize, n_rot: usize, base: f32) [2]f32 {

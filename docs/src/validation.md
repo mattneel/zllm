@@ -120,9 +120,10 @@ Joining merged system messages with one newline instead of two fails it.
 `check-forward` runs `zllm forward` and `llama-dump`
 (`tools/llama-dump/dump.cpp`, linked against the pinned libllama) on the same
 token ids: teacher-forced, one batch, starting from an empty state. The ids
-come from tokenizing `tools/corpus/eval.jsonl` (5 texts, 818 positions) with
-the pinned Hugging Face tokenizer. llama.cpp runs with an f32 KV cache and
-flash attention off.
+come from tokenizing `tools/corpus/eval.jsonl` (5 texts) with each model's
+pinned Hugging Face tokenizer. llama.cpp runs with an f32 KV cache and
+flash attention off. It runs on the 0.8B and on the dense models
+([Dense models](#dense-models)).
 
 Pass criteria:
 
@@ -131,13 +132,18 @@ Pass criteria:
 | Top-1 token agreement (argmax of logits) | ≥ 99% | all positions |
 | Final hidden state (`result_norm`) cosine similarity | ≥ 0.999 | every position |
 | Final hidden state norm error, \\(\lvert \lVert z \rVert / \lVert r \rVert - 1 \rvert\\) | ≤ 1% | every position |
+| Each layer's relative L2 error, median over a sequence's positions | ≤ 1e-2 | every layer and sequence |
 
 Cosine similarity can't see scale errors, so the norm-error bound covers them.
-The check prints, for every layer output, the minimum and mean cosine, the
-maximum relative L2 error and the maximum norm error. It also writes them to
-`.fixtures/reports/forward.json`.
+The per-position bounds catch an error at any position; the median bound
+catches an error in the graph, which moves most positions, where a few
+positions amplify rounding differences (Granite, below). The check prints,
+for every layer output, the minimum and mean cosine, the maximum and median
+relative L2 error and the maximum norm error. It also writes them to
+`.fixtures/reports/forward.json` (`forward-<name>.json` for the dense
+models).
 
-Results at the pins above:
+Results for the 0.8B at the pins above (worst layer median 4.7e-3):
 
 | Sequence | Tokens | Top-1 agree | Final min cosine | Final max norm error |
 |---|---|---|---|---|
@@ -478,6 +484,49 @@ the rollback after a rejected draft, or drawing the next sample afresh
 instead of with the rejected round's second draw, fails the sampled
 speculation scenario; leaving the discarded sample counted fails the one
 with penalties.
+
+## Dense models
+
+One model per dense architecture ([Dense transformers](dense.md)), each
+BF16: Qwen3-0.6B, Llama-3.2-1B-Instruct and Granite 4.2 3B (pins above).
+BF16 keeps llama.cpp's comparison continuous enough to bound position by
+position. For quantized weights, llama.cpp rounds every multiply's input
+to 8-bit blocks, and the 3B at Q4_K_M already differs by 4e-3 to 7e-3
+(median) after its first layer: Q, K and V match to 8e-7, but a few rows
+round across a step and attention spreads them to every later position.
+
+**Reference against llama.cpp** (`check-forward`, 5 sequences each):
+
+| Model | Positions | Top-1 | Final min cosine | Final max norm error | Worst layer median rel L2 |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | 839 | 839 (100%) | 0.999760 | 9.5e-3 | 4.7e-3 |
+| Llama-3.2-1B-Instruct | 839 | 831 (99.05%) | 0.999788 | 2.0e-3 | 6.7e-3 |
+| Granite 4.2 3B | 890 | 889 (99.89%) | 0.990218 | 2.7e-2 | 5.6e-3 |
+
+Granite's activations reach 14,840 in one dimension from layer 6, and a few
+positions amplify llama.cpp's BF16 rounding of activations. Position 139
+of the math sequence (a space token) tracks its neighbours at 2e-3 to 4e-3
+through layer 9, then pulls away smoothly, to 0.15 by layer 33, while
+position 138's error stays at 4e-3 and the median at 3e-3. Emulating
+llama.cpp's rounding (`--llama-activations`) does not remove it. So
+Granite's per-position bounds are cosine ≥ 0.99 and norm error ≤ 3%; the
+median bound is everyone's.
+
+Each switch is load-bearing:
+
+- **No `rope_freqs` (Llama):** final cosine 0.9987 and 144 of 149 top-1 on
+  prose, against 0.99997 and 148.
+- **1/√d instead of `attention.scale` (Granite):** layer median 0.94, final
+  cosine 0.18, 35 of 149 top-1.
+
+**GPU against the reference** (`check-gpu`, the prose sequence of each, f32
+cache): the 0.8B's bounds (cosine ≥ 0.999999, relative L2 ≤ 1e-4 at every
+position and layer, every top-1), on the prefill kernels (one step) and on
+the decode kernels (1-token steps, first 40 positions). Every dense model
+passes on llvmpipe and on the RTX 5090 (D3D12); with the 0.8B's sequences,
+the worst relative L2 is 1.7e-5 (llvmpipe) and 1.3e-5 (D3D12), and every
+top-1 agrees (1,264 prefill and 320 decode positions). The GPU program
+ignoring `rope_freqs` moves Llama's layers by 1.6e-2 within 24 tokens.
 
 ## Qwen3.8-Flash-Next (Gyro-Coder)
 

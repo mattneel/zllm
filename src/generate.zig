@@ -441,6 +441,7 @@ pub fn generate(rt: *Runtime, prompt: []const u8, o: Options, out: *Io.Writer) !
 }
 
 pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void {
+    if (!chat.supports(rt.program.architecture())) return error.NoChatTemplate;
     const gpa = rt.gpa;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();

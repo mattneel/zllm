@@ -26,6 +26,9 @@ Pass criteria (docs/src/validation.md):
   * `zllm engine-check`: requests that reuse the resident sequence or a
     checkpoint give the logits of fresh runs (bitwise where both runs use the
     same kernels for each position).
+  * Each dense model (scripts/fixtures.sh dense), on the first eval text: the
+    512-token run's bounds and top-1 agreement on both kernel paths (the
+    decode kernels over its first DECODE_TOKENS positions).
 
 Hosts: `native` runs the Linux build on the Vulkan adapter Dawn finds
 (llvmpipe in CI); `d3d12` runs the Windows build through scripts/d3d12.sh.
@@ -44,7 +47,7 @@ import numpy as np
 from tokenizers import Tokenizer
 
 from check_forward import read_records, row_stats
-from common import Failures, fixture_paths, parse_args
+from common import DENSE_MODELS, Failures, fixture_paths, parse_args
 
 EVAL = Path(__file__).parent / "corpus" / "eval.jsonl"
 ROOT = Path(__file__).resolve().parent.parent
@@ -90,7 +93,7 @@ def main() -> int:
     evals = [json.loads(line) for line in EVAL.read_text(encoding="utf-8").split("\n") if line]
 
     fail = Failures()
-    total = agree = agree16 = decode_total = decode_agree = 0
+    total = agree = agree16 = total16 = decode_total = decode_agree = 0
     worst = {"prefill": [1.0, 0.0], "decode": [1.0, 0.0]}
     worst_cos16 = 1.0
 
@@ -162,14 +165,38 @@ def main() -> int:
             cos16 = min(float(row_stats(f16[n], ref[n])[0].min()) for n in ref)
             top16 = int((f16["result_output"].argmax(axis=1) == ref["result_output"].argmax(axis=1)).sum())
             agree16 += top16
+            total16 += len(ids)
             worst_cos16 = min(worst_cos16, cos16)
             print(f"  f16 KV: top-1 agreement {top16}/{len(ids)}, min cosine {cos16:.7f}  [{timing}]")
             fail.expect(f"{ev['name']}: f16 KV cosine", cos16 >= F16_COSINE_MIN, f"{cos16:.7f} < {F16_COSINE_MIN}")
 
+        # The dense models (graph/dense.zig) run the same program with
+        # attention layers only: the first eval sequence on each kernel path.
+        for model in DENSE_MODELS:
+            gguf = model.gguf(paths.root)
+            if not gguf.is_file():
+                raise SystemExit(f"missing {gguf}; run scripts/fixtures.sh dense")
+            ids = Tokenizer.from_file(str(model.hf_tokenizer(paths.root))).encode(evals[0]["text"]).ids
+            tok = Path(tmp) / f"{model.name}.i32"
+            tok.write_bytes(np.asarray(ids, dtype="<i4").tobytes())
+            ref_path, gpu_path = Path(tmp) / "ref.bin", Path(tmp) / "gpu.bin"
+            subprocess.run([args.zllm, "forward", str(gguf), str(tok), str(ref_path)], check=True)
+            ref = read_records(ref_path)
+            timing = run_gpu(args, paths, gguf, tok, gpu_path, "--chunk", "512", "--kv", "f32", "--path", "prefill")
+            print(f"\n{gguf.name}, {evals[0]['name']}: {len(ids)} tokens  [{timing}]")
+            agree += compare(f"{model.name} {evals[0]['name']}", "prefill", read_records(gpu_path), ref, len(ids))
+            total += len(ids)
+            part = Path(tmp) / "part.i32"
+            part.write_bytes(np.asarray(ids[:DECODE_TOKENS], dtype="<i4").tobytes())
+            timing = run_gpu(args, paths, gguf, part, gpu_path, "--chunk", "1", "--kv", "f32", "--path", "decode")
+            print(f"  decode kernels, steps of 1, first {DECODE_TOKENS} tokens  [{timing}]")
+            decode_agree += compare(f"{model.name} {evals[0]['name']} (decode)", "decode", read_records(gpu_path), ref, DECODE_TOKENS)
+            decode_total += DECODE_TOKENS
+
     for path, n, a in (("prefill", total, agree), ("decode", decode_total, decode_agree)):
         print(f"\n{args.host}, f32 KV, {path} kernels: top-1 agreement {a}/{n}; min cosine {worst[path][0]:.7f} (min {COSINE_MIN}); max rel L2 {worst[path][1]:.2e} (max {REL_L2_MAX})", end="")
     print()
-    print(f"{args.host}, f16 KV: top-1 agreement {agree16}/{total} (min {F16_TOP1_MIN:.0%}); min cosine {worst_cos16:.7f} (min {F16_COSINE_MIN})")
+    print(f"{args.host}, f16 KV: top-1 agreement {agree16}/{total16} (min {F16_TOP1_MIN:.0%}); min cosine {worst_cos16:.7f} (min {F16_COSINE_MIN})")
     proc = zllm_on_host(args, paths, "engine-check", paths.gguf)
     print(f"\n{args.host}, engine-check:")
     sys.stdout.write("".join(line + "\n" for line in proc.stdout.replace("\r", "").splitlines() if line.startswith(("PASS", "FAIL"))))
@@ -178,7 +205,7 @@ def main() -> int:
     fail.expect("engine-check", proc.returncode == 0, f"exit code {proc.returncode}")
     fail.expect("top-1 agreement", agree == total, f"{agree}/{total}")
     fail.expect("decode top-1 agreement", decode_agree == decode_total, f"{decode_agree}/{decode_total}")
-    fail.expect("f16 KV top-1 agreement", agree16 >= F16_TOP1_MIN * total, f"{agree16}/{total}")
+    fail.expect("f16 KV top-1 agreement", agree16 >= F16_TOP1_MIN * total16, f"{agree16}/{total16}")
     return fail.report()
 
 

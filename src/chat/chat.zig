@@ -19,6 +19,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Whether `render` writes the prompt format of models of GGUF
+/// architecture `arch`: Qwen 3.5–3.8 and the Gyro-Coder use this template;
+/// other architectures need their own.
+pub fn supports(arch: []const u8) bool {
+    return std.mem.eql(u8, arch, "qwen35") or std.mem.eql(u8, arch, "qwen4exp");
+}
+
 pub const Role = enum { system, developer, user, assistant, tool };
 
 /// A call an assistant turn made, as in the OpenAI and transformers formats.

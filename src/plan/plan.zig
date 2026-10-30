@@ -16,7 +16,8 @@ pub const qwen35 = @import("qwen35.zig");
 pub const qwen4exp = @import("qwen4exp.zig");
 pub const cache = @import("cache.zig");
 
-/// A model's weights on the GPU.
+/// A model's weights on the GPU. `qwen35` also holds the dense
+/// architectures (graph/dense.zig), as models of attention layers only.
 pub const Model = union(enum) {
     qwen35: qwen35.Model,
     qwen4exp: qwen4exp.Model,
@@ -29,7 +30,7 @@ pub const Model = union(enum) {
         if (arch != null and arch.? == .string and std.mem.eql(u8, arch.?.string, graph.arch)) {
             return .{ .qwen4exp = try qwen4exp.Model.upload(arena, gpa, rec, set, file, limits) };
         }
-        return .{ .qwen35 = try qwen35.Model.upload(arena, gpa, rec, set, file, limits) };
+        return .{ .qwen35 = try qwen35.Model.uploadAny(arena, gpa, rec, set, file, limits) };
     }
 
     /// Calls f(context, w) for every multiply's weights (tuning).
@@ -118,7 +119,7 @@ pub const Program = union(enum) {
 
     pub fn architecture(p: *const Program) []const u8 {
         return switch (p.*) {
-            .qwen35 => "qwen35",
+            .qwen35 => |*x| x.arch,
             .qwen4exp => graph.arch,
         };
     }

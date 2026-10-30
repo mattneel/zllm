@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gguf = @import("../gguf/gguf.zig");
 const graph = @import("../graph/qwen35.zig");
+const dense = @import("../graph/dense.zig");
 const cmd = @import("../gpu/cmd.zig");
 const kernels = @import("../kernels/kernels.zig");
 const Arg = kernels.Arg;
@@ -32,6 +33,21 @@ const concat = common.concat;
 const read_token = common.read_token;
 
 pub const Hparams = graph.Hparams;
+
+/// How the full-attention layers differ between the architectures this
+/// program runs: Qwen 3.5's (the defaults), and the dense transformers of
+/// graph/dense.zig (Qwen 3, Llama, Granite), run as models of attention
+/// layers only (`Model.uploadDense`).
+pub const AttnVariant = struct {
+    /// Query heads interleaved with their output gates.
+    gated: bool = true,
+    /// Per-head Q and K RMSNorm.
+    qk_norm: bool = true,
+    /// RoPE pairs (2i, 2i + 1) rather than NeoX's (i, i + n_rot/2).
+    normal_rope: bool = false,
+    /// K·Q multiplier; null: 1/√head_dim.
+    scale: ?f32 = null,
+};
 
 const Attention = struct {
     /// Q (with the output gates) | K | V, stacked by rows.
@@ -77,6 +93,11 @@ const Mtp = struct {
 /// Weights resident on the GPU.
 pub const Model = struct {
     hp: Hparams,
+    /// GGUF general.architecture.
+    arch: []const u8 = graph.arch,
+    attn: AttnVariant = .{},
+    /// Per-pair RoPE angle divisors (`rope_freqs.weight`), on the host.
+    rope_freqs: ?[]const f32 = null,
     tok_embd: Matrix,
     output: ?Matrix,
     output_norm: Arg,
@@ -174,6 +195,83 @@ pub const Model = struct {
         return .{
             .hp = hp,
             .mtp = mtp,
+            .tok_embd = try u.matrix("token_embd.weight", null, e, hp.vocab),
+            .output = if (file.tensor("output.weight") != null) try u.matrix("output.weight", null, e, hp.vocab) else null,
+            .output_norm = try u.vector("output_norm.weight", null, e),
+            .layers = layers,
+        };
+    }
+
+    /// `upload` or `uploadDense`, by the file's architecture.
+    pub fn uploadAny(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *const kernels.Set, file: gguf.File, limits: Limits) UploadError!Model {
+        const arch = file.get("general.architecture");
+        if (arch != null and arch.? == .string and dense.Arch.fromName(arch.?.string) != null) {
+            return uploadDense(arena, gpa, rec, set, file, limits);
+        }
+        return upload(arena, gpa, rec, set, file, limits);
+    }
+
+    /// A dense transformer (graph/dense.zig) as a model of attention layers
+    /// only: no DeltaNet layers, no MTP block. The program has no embedding,
+    /// residual or logit multiplier; Granite 4.2's are 1, and a model with
+    /// others is refused (the CPU reference runs them).
+    pub fn uploadDense(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *const kernels.Set, file: gguf.File, limits: Limits) UploadError!Model {
+        const d = try dense.Hparams.fromGguf(file);
+        if (d.embd_scale != 1 or d.residual_scale != 1 or d.logit_mul != 1) return error.UnsupportedModel;
+        if (d.n_layer > graph.max_layers) return error.BadMetadata;
+        var hp: Hparams = .{
+            .vocab = d.vocab,
+            .n_embd = d.n_embd,
+            .n_ff = d.n_ff,
+            .n_layer = d.n_layer,
+            .n_layer_nextn = 0,
+            .rms_eps = d.rms_eps,
+            .n_head = d.n_head,
+            .n_head_kv = d.n_head_kv,
+            .head_dim = d.head_dim,
+            .n_rot = d.n_rot,
+            .rope_base = d.rope_base,
+            .rope_sections = @splat(0),
+            // No DeltaNet layer: an empty recurrent state.
+            .conv_kernel = 1,
+            .gdn_head_dim = 0,
+            .gdn_k_heads = 0,
+            .gdn_v_heads = 0,
+            .gdn_inner = 0,
+            .layer_kinds = undefined,
+        };
+        @memset(hp.layer_kinds[0..hp.n_layer], .attention);
+        var u: Upload = .{ .arena = arena, .gpa = gpa, .rec = rec, .set = set, .file = file, .limits = limits };
+        const e: u64 = hp.n_embd;
+        const ff: u64 = hp.n_ff;
+        const hd: u64 = hp.head_dim;
+        // Bound where a model has no Q/K norm; rope_append does not read it.
+        const no_norm: Arg = .{ .buffer = try rec.createBuffer(gpa, 16, .{ .storage = true }), .size = 16 };
+        const layers = try arena.alloc(Layer, hp.n_layer);
+        for (layers, 0..) |*layer, i| {
+            layer.* = .{
+                .attn_norm = try u.vector("blk.{d}.attn_norm.weight", i, e),
+                .post_norm = try u.vector("blk.{d}.ffn_norm.weight", i, e),
+                .ffn_gu = try u.stacked(i, e, &.{ .{ "blk.{d}.ffn_gate.weight", ff }, .{ "blk.{d}.ffn_up.weight", ff } }),
+                .ffn_down = try u.matrix("blk.{d}.ffn_down.weight", i, ff, e),
+                .mixer = .{ .attention = .{
+                    .wqkv = try u.stacked(i, e, &.{
+                        .{ "blk.{d}.attn_q.weight", hd * hp.n_head },
+                        .{ "blk.{d}.attn_k.weight", hd * hp.n_head_kv },
+                        .{ "blk.{d}.attn_v.weight", hd * hp.n_head_kv },
+                    }),
+                    .wo = try u.matrix("blk.{d}.attn_output.weight", i, hd * hp.n_head, e),
+                    .q_norm = if (d.qk_norm) try u.vector("blk.{d}.attn_q_norm.weight", i, hd) else no_norm,
+                    .k_norm = if (d.qk_norm) try u.vector("blk.{d}.attn_k_norm.weight", i, hd) else no_norm,
+                } },
+            };
+        }
+        return .{
+            .hp = hp,
+            .arch = @tagName(d.arch),
+            .attn = .{ .gated = false, .qk_norm = d.qk_norm, .normal_rope = d.rope == .normal, .scale = d.attn_scale },
+            .rope_freqs = if (file.tensor("rope_freqs.weight") != null) try u.hostVector("rope_freqs.weight", null, hp.n_rot / 2) else null,
+            .mtp = null,
             .tok_embd = try u.matrix("token_embd.weight", null, e, hp.vocab),
             .output = if (file.tensor("output.weight") != null) try u.matrix("output.weight", null, e, hp.vocab) else null,
             .output_norm = try u.vector("output_norm.weight", null, e),
@@ -300,6 +398,8 @@ pub const Path = enum {
 /// not move while a recorded batch is pending.
 pub const Program = struct {
     hp: Hparams,
+    /// The model's architecture (Model.arch).
+    arch: []const u8,
     cfg: Config,
     step: Arg,
     token_ids: Arg,
@@ -361,7 +461,7 @@ pub const Program = struct {
         var a: Alloc = .{ .gpa = gpa, .rec = rec, .limits = limits };
         const hd: u64 = hp.head_dim;
         // Row widths of the fused projections.
-        const qkv_row: u64 = 2 * hd * hp.n_head + 2 * kv_dim;
+        const qkv_row: u64 = qHead(m.attn, hd) * hp.n_head + 2 * kv_dim;
         const proj_row: u64 = conv_dim + hp.gdn_inner + 2 * @as(u64, hp.gdn_v_heads);
         const x = try a.storage(cap * e);
         const h = try a.storage(cap * e);
@@ -378,7 +478,7 @@ pub const Program = struct {
         const lm_in = try a.storage(@as(u64, cfg.logit_rows) * e);
         const logits = try a.storage(@as(u64, cfg.logit_rows) * hp.vocab);
 
-        const rope_table = try kernels.ropeTable(arena, cfg.context, hp.n_rot, hp.rope_base);
+        const rope_table = try kernels.ropeTableScaled(arena, cfg.context, hp.n_rot, hp.rope_base, m.rope_freqs);
         const rope = try a.storage(rope_table.len);
         try rec.writeBuffer(gpa, rope.buffer, 0, std.mem.sliceAsBytes(rope_table));
         const step = try a.buffer(@sizeOf(P.Step), .{ .uniform = true, .copy_dst = true });
@@ -434,6 +534,7 @@ pub const Program = struct {
             .a = &a,
             .mm = mm,
             .hp = hp,
+            .attn = m.attn,
             .kv_layer = kv_layer,
             .kv = cfg.kv,
             .max_blocks = max_blocks,
@@ -560,6 +661,7 @@ pub const Program = struct {
 
         return .{
             .hp = hp,
+            .arch = m.arch,
             .cfg = cfg,
             .prefill_tile = prefillTile(m),
             .mtp = mtp,
@@ -868,6 +970,7 @@ const LayerBuilder = struct {
     a: *Alloc,
     mm: Mm,
     hp: Hparams,
+    attn: AttnVariant,
     kv_layer: u64,
     kv: KvFormat,
     max_blocks: u32,
@@ -879,8 +982,8 @@ const LayerBuilder = struct {
     att: Arg,
     attn_part: Arg,
 
-    /// Gated full attention with a new KV cache, positioned by `rope` and
-    /// `step`.
+    /// Full attention (gated for Qwen 3.5) with a new KV cache, positioned
+    /// by `rope` and `step`.
     fn attention(lb: LayerBuilder, body: *std.ArrayList(Item), attn_norm: Arg, w: *const Attention, rope: Arg, step: Arg) Program.BuildError!void {
         const hp = lb.hp;
         const mm = lb.mm;
@@ -888,11 +991,13 @@ const LayerBuilder = struct {
         const arena = mm.arena;
         const hd: u64 = hp.head_dim;
         const kv_dim: u64 = hd * hp.n_head_kv;
-        const qkv_row: u64 = 2 * hd * hp.n_head + 2 * kv_dim;
+        const q_dim: u64 = qHead(lb.attn, hd) * hp.n_head;
+        const qkv_row: u64 = q_dim + 2 * kv_dim;
         const kc = try lb.a.buffer(lb.kv_layer, .{ .storage = true });
         const vc = try lb.a.buffer(lb.kv_layer, .{ .storage = true });
         const half: u32 = @backingInt(lb.kv);
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const scale = lb.attn.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(hd))));
+        const gated: u32 = @intFromBool(lb.attn.gated);
         const q_row: u32 = @intCast(qkv_row);
         try body.append(arena, .{ .fork = .{
             .prefill = try mm.tiled(lb.qkv, .{ .rmsnorm = .{ .x = lb.x, .w = attn_norm, .out = lb.h } }, &w.wqkv, false),
@@ -904,17 +1009,20 @@ const LayerBuilder = struct {
             .head_dim = hp.head_dim,
             .n_rot = hp.n_rot,
             .row = q_row,
-            .k_off = @intCast(2 * hd * hp.n_head),
-            .v_off = @intCast(2 * hd * hp.n_head + kv_dim),
+            .k_off = @intCast(q_dim),
+            .v_off = @intCast(q_dim + kv_dim),
             .f16 = half,
             .eps = hp.rms_eps,
+            .gated = gated,
+            .qk_norm = @intFromBool(lb.attn.qk_norm),
+            .normal = @intFromBool(lb.attn.normal_rope),
         }, &.{ lb.qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
         // Split attention over blocks of cache positions, in chunks of
         // attn_rows tokens; a step records the chunks its rows reach.
         var attn: std.ArrayList(kernels.Launch) = .empty;
         var row0: u32 = 0;
         while (row0 < mm.cap) : (row0 += kernels.attn_rows) {
-            const params: P.Attention = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .f16 = half, .scale = scale, .max_blocks = lb.max_blocks, .q_row = q_row, .row0 = row0 };
+            const params: P.Attention = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .f16 = half, .scale = scale, .max_blocks = lb.max_blocks, .q_row = q_row, .row0 = row0, .gated = gated };
             try attn.append(arena, try b.add(kernels.attnSplit(hp.n_head / hp.n_head_kv), params, &.{ lb.qkv, kc, vc, lb.attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } }));
             try attn.append(arena, try b.add(.attn_combine, params, &.{ lb.qkv, lb.attn_part, lb.att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = row0, .max_rows = kernels.attn_rows } }));
         }
@@ -940,6 +1048,11 @@ const LayerBuilder = struct {
         } });
     }
 };
+
+/// Floats between query heads in the fused projection's rows.
+fn qHead(attn: AttnVariant, hd: u64) u64 {
+    return if (attn.gated) 2 * hd else hd;
+}
 
 /// The largest token tile among the model's prefill multiplies.
 fn prefillTile(m: *const Model) u32 {

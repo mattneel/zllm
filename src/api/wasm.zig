@@ -458,6 +458,7 @@ const Runtime = struct {
         var prompt: std.ArrayList(u32) = .empty;
         var defaults = rt.defaults.raw;
         if (r.messages) |messages| {
+            if (!zllm.chat.supports(rt.program.architecture())) return error.NoChatTemplate;
             var text: std.ArrayList(u8) = .empty;
             try zllm.chat.render(arena, messages, .{ .enable_thinking = r.enable_thinking, .reasoning_effort = r.reasoning_effort, .tools = r.tools }, &text);
             try rt.tok.encode(arena, text.items, &prompt);

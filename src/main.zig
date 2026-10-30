@@ -258,12 +258,18 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
     var rec: RecordWriter = .{ .w = &fw.interface };
 
     const arch = file.get("general.architecture") orelse return error.MissingMetadata;
+    const obs: zllm.ref.dense.Observer = .{ .ctx = &rec, .emit = RecordWriter.emit };
     if (arch == .string and std.mem.eql(u8, arch.string, zllm.ref.qwen4exp.model.arch)) {
         try forwardQwen4exp(gpa, pool, file, mapped.bytes, tokens, &rec);
+    } else if (arch == .string and zllm.graph.dense.Arch.fromName(arch.string) != null) {
+        if (mtp) return error.NoMtpBlock;
+        var model = try zllm.ref.dense.Model.load(gpa, pool, file, mapped.bytes);
+        defer model.deinit();
+        try model.forward(gpa, tokens, pool, obs, act);
     } else {
         var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped.bytes);
         defer model.deinit();
-        try model.forward(gpa, tokens, pool, .{ .ctx = &rec, .emit = RecordWriter.emit }, act, mtp);
+        try model.forward(gpa, tokens, pool, obs, act, mtp);
     }
     try fw.interface.flush();
 }
@@ -568,11 +574,13 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     const chunk = @min(opts.chunk, n);
     var set = try zllm.kernels.Set.create(gpa, arena, &rec);
     host.file = mapped.bytes;
-    const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
+    const model = try plan.Model.uploadAny(arena, gpa, &rec, &set, file, limits);
+    // The upload runs before the program is built, which may read what it
+    // read back (RoPE frequency factors).
+    try rec.submit(gpa, 0);
+    try runBatch(&host, &rec, &completions);
     var tuning: plan_common.Tuning = .{};
     if (opts.tune) {
-        try rec.submit(gpa, 0);
-        try runBatch(&host, &rec, &completions);
         var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &set, &model, .{}, @min(chunk, 2));
         while (try sweep.next()) |_| {
             const t0 = Io.Timestamp.now(io, .awake);

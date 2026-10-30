@@ -11,7 +11,7 @@ const P = kernels.params;
 
 pub const BuildError = kernels.Set.Error || error{ BadConfig, TooLarge };
 
-pub const UploadError = Allocator.Error || error{ MissingTensor, BadShape, UnsupportedTensorType, TensorTooLarge };
+pub const UploadError = Allocator.Error || error{ MissingTensor, BadShape, UnsupportedTensorType, TensorTooLarge, UnsupportedModel };
 
 pub const Limits = struct {
     /// maxStorageBufferBindingSize
@@ -104,6 +104,20 @@ pub const Upload = struct {
 
     pub fn vector(u: *Upload, comptime fmt: []const u8, layer: ?usize, n: u64) !Arg {
         return u.tensor(fmt, layer, &.{n});
+    }
+
+    /// An f32 vector the host needs (to build a program from), read back
+    /// from the file through the GPU: the host only maps the GGUF header.
+    /// The values land in the returned slice when the recorded batch has
+    /// executed, which the load does before it builds a program.
+    pub fn hostVector(u: *Upload, comptime fmt: []const u8, layer: ?usize, n: u64) ![]f32 {
+        const ti = try u.info(fmt, layer, &.{n}, .f32);
+        const size = ti.byteSize();
+        const buf = try u.rec.createBuffer(u.gpa, size, .{ .copy_src = true, .copy_dst = true });
+        try u.rec.writeFile(u.gpa, buf, 0, u.fileOffset(ti), size);
+        const values = try u.arena.alloc(f32, @intCast(n));
+        try u.rec.readBuffer(u.gpa, read_token, buf, 0, std.mem.sliceAsBytes(values));
+        return values;
     }
 
     /// A tensor of type `t` as stored, in one buffer (rounded up to whole
