@@ -380,6 +380,18 @@ pub fn speculationPays(m: *const Model) bool {
     return draft.n * 8 <= main.n;
 }
 
+/// The decode-multiply variant chosen for each weight shape.
+pub const Tuning = struct {
+    entries: []const Entry = &.{},
+
+    pub const Entry = struct { type: gguf.TensorType, n: u32, k: u32, variant: kernels.MatvecVariant };
+
+    pub fn matvec(t: Tuning, ty: gguf.TensorType, n: u32, k: u32) kernels.MatvecVariant {
+        for (t.entries) |e| if (e.type == ty and e.n == n and e.k == k) return e.variant;
+        return .{};
+    }
+};
+
 pub const Config = struct {
     /// Most tokens one step processes (one prefill chunk).
     max_tokens: u32 = 512,
@@ -391,6 +403,9 @@ pub const Config = struct {
     kv: KvFormat = .f16,
     /// DeltaNet checkpoint slots.
     checkpoints: u32 = 4,
+    /// Decode-multiply variants per weight shape (tuning); the default
+    /// variant elsewhere.
+    tuning: Tuning = .{},
     /// Build the MTP block's step (recordMtp) and the two-position verify
     /// step (recordVerify); needs a model with an MTP block, logit_rows ≥ 2,
     /// and a logits row size the storage offset alignment divides.
@@ -489,11 +504,11 @@ pub const Program = struct {
     prompt_stage: []u32,
     bias_stage: [][2]u32,
 
-    pub const BuildError = Allocator.Error || error{ BadConfig, TooLarge };
+    pub const BuildError = kernels.Set.Error || error{ BadConfig, TooLarge };
 
     /// Records creation of every buffer and bind group. `arena` owns the
     /// result and the parameter staging, and must outlive the Program.
-    pub fn build(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *const kernels.Set, m: *const Model, cfg: Config, limits: Limits) BuildError!Program {
+    pub fn build(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *kernels.Set, m: *const Model, cfg: Config, limits: Limits) BuildError!Program {
         const hp = m.hp;
         if (cfg.max_tokens == 0 or cfg.logit_rows == 0 or cfg.context < cfg.max_tokens or cfg.checkpoints == 0) return error.BadConfig;
         if (hp.head_dim > kernels.max_head_dim or hp.gdn_head_dim > kernels.max_delta_head or hp.n_embd % 4 != 0) return error.BadConfig;
@@ -572,6 +587,7 @@ pub const Program = struct {
             .eps = hp.rms_eps,
             .partials = try a.storage(Mm.partialFloats(m, cap)),
             .act = .{ try Mm.actScratch(&a, m, cap, 256), try Mm.actScratch(&a, m, cap, 32) },
+            .tuning = cfg.tuning,
         };
 
         const lb: LayerBuilder = .{
@@ -1162,6 +1178,7 @@ const Mm = struct {
     /// The quantized prefill multiplies' input rounded to 8-bit blocks
     /// (quantize_q8), per block size: [0] Q8_K (256), [1] Q8_0 (32).
     act: [2]?Act,
+    tuning: Tuning,
 
     const Act = struct { qx: Arg, dx: Arg };
 
@@ -1330,7 +1347,8 @@ const Mm = struct {
             // The half-precision kernel normalizes only staged inputs.
             if (kernels.isHalf(ch.type) and fuse.norm != null and w.k > kernels.matvec_max_staged) return error.BadConfig;
             const n = fuse.silu_pair orelse ch.rows;
-            l.* = try mm.b.add(weightKernel(.matvec, ch.type), P.MatvecBf16{
+            const kernel = weightKernel(.matvec, ch.type);
+            const params: P.MatvecBf16 = .{
                 .n = n,
                 .k = w.k,
                 .col0 = if (fuse.silu_pair != null) 0 else ch.row0,
@@ -1338,11 +1356,18 @@ const Mm = struct {
                 .eps = mm.eps,
                 .flags = flags,
                 .half = fuse.silu_pair orelse 0,
-            }, &.{
+            };
+            const args = [_]Arg{
                 x,                       ch.arg, out,
                 // Unread without the norm; the weight is a read-only stand-in.
                 fuse.norm orelse ch.arg,
-            }, .{ .rows_y = std.math.divCeil(u32, n, if (kernels.isHalf(ch.type)) kernels.matvec_rows else kernels.matvec_quant_rows) catch unreachable });
+            };
+            if (kernels.isHalf(ch.type)) {
+                l.* = try mm.b.add(kernel, params, &args, .{ .rows_y = std.math.divCeil(u32, n, kernels.matvec_rows) catch unreachable });
+            } else {
+                const v = mm.tuning.matvec(ch.type, w.n, w.k);
+                l.* = try mm.b.addMatvec(kernel, v, params, &args, .{ .rows_y = std.math.divCeil(u32, n, v.groupRows()) catch unreachable });
+            }
         }
         return list;
     }

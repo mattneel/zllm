@@ -48,10 +48,11 @@ const NORM: u32 = 1u;
 const ACCUMULATE: u32 = 2u;
 const SILU_PAIR: u32 = 4u;
 
-const WG: u32 = 256u;
-const LANES: u32 = 32u;
-// Rows per lane group: a staged x tile serves ROWS · R rows.
-const R: u32 = 1u;
+// Tuned (kernels.MatvecVariant): threads, threads per row, rows per lane
+// group (a staged x tile serves ROWS · R rows).
+const WG: u32 = {{wg}}u;
+const LANES: u32 = {{lanes}}u;
+const R: u32 = {{rows}}u;
 const ROWS: u32 = WG / LANES;
 const TILE_ONE: u32 = 2048u;
 const TILE_PAIR: u32 = 1024u;

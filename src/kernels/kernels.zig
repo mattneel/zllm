@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
 const ops = @import("../ref/ops.zig");
 const gguf = @import("../gguf/gguf.zig");
+const tmpl = @import("../tmpl/tmpl.zig");
 
 pub const Kernel = enum {
     rmsnorm,
@@ -41,8 +42,9 @@ pub const Kernel = enum {
     repad,
     repack_q3_k,
     quantize_q8,
-    // Quantized weights: matvec_quant.wgsl, matmul_quant.wgsl and
-    // embed_quant.wgsl, each composed with its type's decoder.
+    // Quantized weights: matvec_quant.wgsl.hbs (a template, MatvecVariant),
+    // matmul_quant.wgsl and embed_quant.wgsl, each composed with its type's
+    // decoder.
     matvec_q8_0,
     matvec_q3_k,
     matvec_q4_k,
@@ -59,9 +61,19 @@ pub const Kernel = enum {
     embed_q5_k,
     embed_q6_k,
 
+    /// The kernel's WGSL, or for a template (`isTemplate`) its source.
     pub fn source(k: Kernel) []const u8 {
         return switch (k) {
             inline else => |tag| comptime composed(@tagName(tag)),
+        };
+    }
+
+    /// Whether the kernel's source is a template over a MatvecVariant: the
+    /// quantized decode multiplies.
+    pub fn isTemplate(k: Kernel) bool {
+        return switch (k) {
+            .matvec_q8_0, .matvec_q3_k, .matvec_q4_k, .matvec_q5_k, .matvec_q6_k => true,
+            else => false,
         };
     }
 
@@ -124,7 +136,8 @@ fn composed(comptime name: []const u8) []const u8 {
             const t = name[@tagName(op).len + 1 ..];
             // The decode multiply also takes the type's block-major decoder.
             const dot = if (op == .matvec) @embedFile("quant/" ++ t ++ "_dot.wgsl") else "";
-            return @embedFile("quant/common.wgsl") ++ @embedFile("quant/" ++ t ++ ".wgsl") ++ dot ++ @embedFile(@tagName(op) ++ "_quant.wgsl");
+            const body = if (op == .matvec) "matvec_quant.wgsl.hbs" else @tagName(op) ++ "_quant.wgsl";
+            return @embedFile("quant/common.wgsl") ++ @embedFile("quant/" ++ t ++ ".wgsl") ++ dot ++ @embedFile(body);
         }
     }
     return @embedFile(name ++ ".wgsl");
@@ -174,10 +187,58 @@ pub fn matmulTiles(t: gguf.TensorType) [2]u32 {
 pub const decode_max_rows = 4;
 /// Rows per `matvec_bf16` workgroup.
 pub const matvec_rows = 8;
-/// Rows per quantized decode-multiply workgroup (8 lane groups × R rows,
-/// matvec_quant.wgsl). More rows share each staged x tile, but the 27B's
-/// 5,120-row projections then leave too few workgroups to hide latency.
-pub const matvec_quant_rows = 8;
+/// A quantized decode multiply's tunable parameters (matvec_quant.wgsl.hbs):
+/// `wg` threads, `lanes` of them per row, `rows` rows per lane group. Any of
+/// them gives each row the same result for steps of one and two tokens; the
+/// lane count fixes the order of each row's sums.
+pub const MatvecVariant = struct {
+    wg: u32 = 256,
+    lanes: u32 = 32,
+    rows: u32 = 1,
+
+    /// Rows one workgroup computes.
+    pub fn groupRows(v: MatvecVariant) u32 {
+        return v.wg / v.lanes * v.rows;
+    }
+
+    /// Whether the device runs it: its threads per workgroup, and its
+    /// workgroup memory (x staged as 2,048 floats; two partial sums per
+    /// thread and row).
+    pub fn fits(v: MatvecVariant, d: DeviceLimits) bool {
+        return v.wg <= d.invocations and 2048 * 4 + 2 * v.wg * v.rows * 4 <= d.workgroup_storage;
+    }
+
+    /// The sweep: lanes 8, 16 or 32 per row (each divides the 32 tasks of a
+    /// tile, so token pairs keep each token's sums), 1 or 2 rows per lane
+    /// group, 128 or 256 threads.
+    pub const candidates = blk: {
+        var list: [12]MatvecVariant = undefined;
+        var i: usize = 0;
+        for ([_]u32{ 256, 128 }) |wg| for ([_]u32{ 32, 16, 8 }) |lanes| for ([_]u32{ 1, 2 }) |rows| {
+            list[i] = .{ .wg = wg, .lanes = lanes, .rows = rows };
+            i += 1;
+        };
+        break :blk list;
+    };
+
+    /// The WGSL of decode multiply `k` with these parameters, in `arena`.
+    pub fn render(v: MatvecVariant, arena: Allocator, k: Kernel) (tmpl.Error)![]const u8 {
+        std.debug.assert(k.isTemplate());
+        var out: std.ArrayList(u8) = .empty;
+        try tmpl.render(arena, k.source(), &.{
+            .{ .name = "wg", .value = .{ .int = v.wg } },
+            .{ .name = "lanes", .value = .{ .int = v.lanes } },
+            .{ .name = "rows", .value = .{ .int = v.rows } },
+        }, &.{}, &out);
+        return out.items;
+    }
+};
+
+/// Device limits kernel variants are checked against (WebGPU's defaults).
+pub const DeviceLimits = struct {
+    invocations: u32 = 256,
+    workgroup_storage: u32 = 16384,
+};
 /// Widest input `matvec_bf16` stages in workgroup memory, which its RMSNorm
 /// prologue needs.
 pub const matvec_max_staged = 3584;
@@ -441,18 +502,40 @@ pub fn ropeTable(gpa: Allocator, positions: usize, n_rot: usize, base: f32) Allo
     return table;
 }
 
-/// One pipeline per kernel.
+/// One pipeline per kernel (templates with their default parameters),
+/// plus the other decode-multiply variants the plan asks for.
 pub const Set = struct {
     pipelines: std.EnumArray(Kernel, cmd.Pipeline),
+    variants: [max_variants]Variant = undefined,
+    n_variants: usize = 0,
 
-    /// Records shader and pipeline creation for every kernel.
-    pub fn create(gpa: Allocator, rec: *cmd.Recorder) Allocator.Error!Set {
+    const Variant = struct { kernel: Kernel, v: MatvecVariant, pipeline: cmd.Pipeline };
+    /// Every candidate of every quantized type.
+    const max_variants = 5 * MatvecVariant.candidates.len;
+
+    pub const Error = Allocator.Error || tmpl.Error;
+
+    /// Records shader and pipeline creation for every kernel. Rendered
+    /// sources live in `arena`, which must outlive the batch's execution.
+    pub fn create(gpa: Allocator, arena: Allocator, rec: *cmd.Recorder) Error!Set {
         var set: Set = .{ .pipelines = undefined };
         for (std.enums.values(Kernel)) |k| {
-            const shader = try rec.createShader(gpa, k.source());
-            set.pipelines.set(k, try rec.createPipeline(gpa, shader));
+            const code = if (k.isTemplate()) try MatvecVariant.render(.{}, arena, k) else k.source();
+            set.pipelines.set(k, try rec.createPipeline(gpa, try rec.createShader(gpa, code)));
         }
         return set;
+    }
+
+    /// The pipeline of decode multiply `k` with variant `v`, recording its
+    /// creation the first time (its source in `arena`, as for `create`).
+    pub fn matvec(s: *Set, gpa: Allocator, arena: Allocator, rec: *cmd.Recorder, k: Kernel, v: MatvecVariant) Error!cmd.Pipeline {
+        if (std.meta.eql(v, MatvecVariant{})) return s.pipelines.get(k);
+        for (s.variants[0..s.n_variants]) |x| if (x.kernel == k and std.meta.eql(x.v, v)) return x.pipeline;
+        std.debug.assert(s.n_variants < max_variants);
+        const pipeline = try rec.createPipeline(gpa, try rec.createShader(gpa, try v.render(arena, k)));
+        s.variants[s.n_variants] = .{ .kernel = k, .v = v, .pipeline = pipeline };
+        s.n_variants += 1;
+        return pipeline;
     }
 };
 
@@ -480,12 +563,18 @@ pub const Launcher = struct {
     set: *const Set,
 
     pub fn launch(l: Launcher, kernel: Kernel, p: anytype, args: []const Arg, groups: [3]u32) Allocator.Error!void {
+        try l.launchPipeline(l.set.pipelines.get(kernel), p, args, groups);
+    }
+
+    /// `launch` with a given pipeline (a kernel variant, Set.matvec).
+    pub fn launchPipeline(l: Launcher, pipeline: cmd.Pipeline, p: anytype, args: []const Arg, groups: [3]u32) Allocator.Error!void {
         const P = @TypeOf(p);
         comptime std.debug.assert(@sizeOf(P) % 16 == 0);
         const bytes = try l.arena.dupe(u8, std.mem.asBytes(&p));
         const ub = try l.rec.createBuffer(l.gpa, @sizeOf(P), .{ .uniform = true, .copy_dst = true });
         try l.rec.writeBuffer(l.gpa, ub, 0, bytes);
-        try l.launchWith(kernel, .{ .buffer = ub, .size = @sizeOf(P) }, args, groups);
+        const bg = try bindGroup(l.gpa, l.rec, pipeline, .{ .buffer = ub, .size = @sizeOf(P) }, args);
+        try l.rec.dispatch(l.gpa, pipeline, groups, &.{bg});
     }
 
     /// A launch whose binding 0 is the caller's `uniform`.
@@ -577,7 +666,7 @@ pub const Builder = struct {
     /// Owns the parameter pages; must outlive execution of the recorded batch.
     arena: Allocator,
     rec: *cmd.Recorder,
-    set: *const Set,
+    set: *Set,
     pages: std.ArrayList(Page) = .empty,
 
     const page_size = 64 * 1024;
@@ -590,6 +679,11 @@ pub const Builder = struct {
 
     /// A launch with its own parameters at binding 0.
     pub fn add(b: *Builder, kernel: Kernel, p: anytype, args: []const Arg, grid: Grid) Allocator.Error!Launch {
+        return b.addWith(kernel, try b.param(p), args, grid);
+    }
+
+    /// A slot holding parameters `p`.
+    fn param(b: *Builder, p: anytype) Allocator.Error!Arg {
         const P = @TypeOf(p);
         comptime std.debug.assert(@sizeOf(P) % 16 == 0 and @sizeOf(P) <= slot);
         if (b.pages.items.len == 0 or b.pages.items[b.pages.items.len - 1].used == page_size) {
@@ -602,12 +696,21 @@ pub const Builder = struct {
         @memcpy(page.data[page.used..][0..@sizeOf(P)], std.mem.asBytes(&p));
         const uniform: Arg = .{ .buffer = page.buffer, .offset = page.used, .size = @sizeOf(P) };
         page.used += slot;
-        return b.addWith(kernel, uniform, args, grid);
+        return uniform;
     }
 
     /// A launch whose binding 0 is `uniform`, a buffer the caller rewrites.
     pub fn addWith(b: *Builder, kernel: Kernel, uniform: Arg, args: []const Arg, grid: Grid) Allocator.Error!Launch {
-        const pipeline = b.set.pipelines.get(kernel);
+        return b.addPipeline(kernel, b.set.pipelines.get(kernel), uniform, args, grid);
+    }
+
+    /// `add` with variant `v` of decode multiply `kernel`.
+    pub fn addMatvec(b: *Builder, kernel: Kernel, v: MatvecVariant, p: anytype, args: []const Arg, grid: Grid) Set.Error!Launch {
+        const pipeline = try b.set.matvec(b.gpa, b.arena, b.rec, kernel, v);
+        return b.addPipeline(kernel, pipeline, try b.param(p), args, grid);
+    }
+
+    fn addPipeline(b: *Builder, kernel: Kernel, pipeline: cmd.Pipeline, uniform: Arg, args: []const Arg, grid: Grid) Allocator.Error!Launch {
         return .{ .kernel = kernel, .pipeline = pipeline, .bind_group = try bindGroup(b.gpa, b.rec, pipeline, uniform, args), .grid = grid };
     }
 

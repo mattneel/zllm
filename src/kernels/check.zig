@@ -27,16 +27,13 @@ pub const Result = struct {
 /// Runs every check, reporting one line per check to `out`. Returns whether
 /// all passed.
 pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
-    var ctx: Ctx = .{ .gpa = gpa, .host = host, .rec = .{} };
-    defer ctx.rec.deinit(gpa);
-    ctx.set = try kernels.Set.create(gpa, &ctx.rec);
-    try ctx.flush();
-
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var prng: std.Random.DefaultPrng = .init(0x5eed);
-    ctx.arena = arena_state.allocator();
-    ctx.rand = prng.random();
+    var ctx: Ctx = .{ .gpa = gpa, .host = host, .rec = .{}, .arena = arena_state.allocator(), .rand = prng.random() };
+    defer ctx.rec.deinit(gpa);
+    ctx.set = try kernels.Set.create(gpa, ctx.arena, &ctx.rec);
+    try ctx.flush();
 
     var ok = true;
     inline for (.{
@@ -571,7 +568,8 @@ fn Quant(comptime t: gguf.TensorType) type {
 
 /// The decode multiply on quantized weights: 3 tokens, 100 outputs (a
 /// partial workgroup of rows), norm prologue and accumulate epilogue; or,
-/// with `pair`, the SiLU pair over stacked gate and up rows.
+/// with `pair`, the SiLU pair over stacked gate and up rows. Every variant
+/// tuning may pick (MatvecVariant.candidates); the error is the worst.
 fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, pair: bool) !Result {
     const rows = 3;
     const n = 100;
@@ -580,17 +578,24 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
     const nw = try c.random(k, 1);
     const w = try quantRows(c, t, if (pair) 2 * n else n, k);
     const init = try c.random(rows * n, if (pair) 0 else 4);
-    const out = try c.upload(init);
-    try c.launcher().launch(kernels.Kernel.quant(.matvec, t).?, P.MatvecBf16{
-        .n = n,
-        .k = k,
-        .col0 = 0,
-        .out_stride = n,
-        .eps = eps,
-        .flags = .{ .norm = true, .accumulate = !pair, .silu_pair = pair },
-        .half = if (pair) n else 0,
-    }, &.{ try c.upload(x), try gpuWeights(c, t, w.bytes), out, try c.upload(nw) }, .{ std.math.divCeil(u32, n, kernels.matvec_quant_rows) catch unreachable, rows, 1 });
-    const got = try c.read(out);
+    const kernel = kernels.Kernel.quant(.matvec, t).?;
+    const xa = try c.upload(x);
+    const wa = try gpuWeights(c, t, w.bytes);
+    const na = try c.upload(nw);
+    var got: [kernels.MatvecVariant.candidates.len][]f32 = undefined;
+    for (kernels.MatvecVariant.candidates, &got) |v, *g| {
+        const out = try c.upload(init);
+        try c.launcher().launchPipeline(try c.set.matvec(c.gpa, c.arena, &c.rec, kernel, v), P.MatvecBf16{
+            .n = n,
+            .k = k,
+            .col0 = 0,
+            .out_stride = n,
+            .eps = eps,
+            .flags = .{ .norm = true, .accumulate = !pair, .silu_pair = pair },
+            .half = if (pair) n else 0,
+        }, &.{ xa, wa, out, na }, .{ std.math.divCeil(u32, n, v.groupRows()) catch unreachable, rows, 1 });
+        g.* = try c.read(out);
+    }
     const want = try c.arena.alloc(f64, rows * n);
     const xn = try c.arena.alloc(f64, k);
     for (0..rows) |tk| {
@@ -605,7 +610,9 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
             want[tk * n + j] = if (pair) g * sigmoid64(g) * u else init[tk * n + j] + g;
         }
     }
-    return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
+    var worst: f64 = 0;
+    for (got) |g| worst = @max(worst, relErr(g, want));
+    return .{ .name = name, .err = worst, .tolerance = 1e-5 };
 }
 
 fn checkQuantTiles(c: *Ctx) !Result {

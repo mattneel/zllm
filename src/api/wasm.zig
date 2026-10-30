@@ -275,7 +275,7 @@ const Runtime = struct {
         };
         const arena = rt.arena_state.allocator();
         const limits: plan.Limits = .{ .max_binding = o.max_binding, .offset_align = o.offset_align };
-        rt.set = try .create(gpa, &rt.setup);
+        rt.set = try .create(gpa, arena, &rt.setup);
         rt.model = try plan.Model.upload(arena, gpa, &rt.setup, &rt.set, file, limits);
         rt.program = try plan.Program.build(arena, gpa, &rt.setup, &rt.set, &rt.model, .{
             .context = o.context,

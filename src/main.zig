@@ -413,7 +413,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
 
     const n: u32 = @intCast(tokens.len);
     const chunk = @min(opts.chunk, n);
-    const set = try zllm.kernels.Set.create(gpa, &rec);
+    var set = try zllm.kernels.Set.create(gpa, arena, &rec);
     host.file = mapped.bytes;
     const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
     var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{

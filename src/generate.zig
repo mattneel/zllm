@@ -190,7 +190,7 @@ pub const Runtime = struct {
         var rec: zllm.gpu.cmd.Recorder = .{};
         defer rec.deinit(gpa);
         var t = Io.Timestamp.now(io, .awake);
-        rt.set = try .create(gpa, &rec);
+        rt.set = try .create(gpa, arena, &rec);
         try rt.executeTimed(&rec, &t, &rt.load.pipelines);
         host.file = bytes;
         rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
