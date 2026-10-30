@@ -35,6 +35,11 @@ const n_gen = 12;
 
 const Run = struct { tokens: []u32, logits: []f32, cached: u32, usage: zllm.sched.Usage };
 
+/// The larger error; a NaN is infinitely large (@max would pass it by).
+fn worse(a: f64, b: f64) f64 {
+    return if (std.math.isNan(b)) std.math.inf(f64) else @max(a, b);
+}
+
 const Decode = struct {
     n: u32 = n_gen,
     sampling: zllm.sampler.Params = .{ .temperature = 1.0, .top_k = 50, .seed = 7 },
@@ -192,7 +197,7 @@ const Check = struct {
                     num += (@as(f64, x) - y) * (@as(f64, x) - y);
                     den += @as(f64, y) * y;
                 }
-                worst = @max(worst, @sqrt(num / den));
+                worst = worse(worst, @sqrt(num / den));
             }
             // Later steps continue from different tokens: stop comparing.
             if (reused.tokens[i] != fresh.tokens[i]) {
@@ -325,7 +330,7 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
                 for (row) |l| sum += @exp(l - max);
                 const want = row[t.id] - max - @log(sum);
                 const lp = t.logprob orelse return error.NoLogprob;
-                worst = @max(worst, @abs(lp.logprob - want));
+                worst = worse(worst, @abs(lp.logprob - want));
                 if (i < n_gen) lps[i] = lp.logprob;
                 tops_ok = tops_ok and lp.top.len == 3 and lp.top[0].id == t.id and lp.top[0].logprob >= lp.top[1].logprob and lp.top[1].logprob >= lp.top[2].logprob;
                 i += 1;

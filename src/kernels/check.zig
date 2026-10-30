@@ -162,15 +162,30 @@ const Ctx = struct {
 };
 
 /// max_i |got_i - want_i| / max_i |want_i|: error relative to the output scale.
+/// The larger error; a NaN is infinitely large (@max would pass it by).
+fn worse(a: f64, b: f64) f64 {
+    return if (std.math.isNan(b)) std.math.inf(f64) else @max(a, b);
+}
+
+/// Max |got − want| over max |want|; infinite if any output is not finite.
 fn relErr(got: []const f32, want: []const f64) f64 {
     std.debug.assert(got.len == want.len);
     var max_err: f64 = 0;
     var scale: f64 = 0;
     for (got, want) |g, w| {
+        if (!std.math.isFinite(g)) return std.math.inf(f64);
         max_err = @max(max_err, @abs(@as(f64, g) - w));
         scale = @max(scale, @abs(w));
     }
     return max_err / @max(scale, 1e-30);
+}
+
+// A NaN output must fail a check, not vanish into @max.
+test relErr {
+    const nan = std.math.nan(f32);
+    try std.testing.expect(std.math.isInf(relErr(&.{ 1, nan }, &.{ 1, 2 })));
+    try std.testing.expectEqual(0.5, relErr(&.{ 1, 1 }, &.{ 1, 2 }));
+    try std.testing.expect(std.math.isInf(worse(0, std.math.nan(f64))));
 }
 
 fn checkRmsNorm(c: *Ctx) !Result {
@@ -437,7 +452,7 @@ fn checkQuantize(c: *Ctx, t: gguf.TensorType, name: []const u8) !Result {
         const word: u32 = @bitCast(words[i / 4]);
         const q: i8 = @bitCast(@as(u8, @truncate(word >> @intCast(8 * (i % 4)))));
         const got = @as(f32, @floatFromInt(q)) * d[i / block];
-        worst = @max(worst, @abs(@as(f64, got) - v) / @max(@abs(@as(f64, v)), 1e-30));
+        worst = worse(worst, @abs(@as(f64, got) - v) / @max(@abs(@as(f64, v)), 1e-30));
     }
     return .{ .name = name, .err = worst, .tolerance = 0 };
 }
@@ -471,7 +486,7 @@ fn checkQuantizeFused(c: *Ctx, mode: u32, name: []const u8) !Result {
             const word: u32 = @bitCast(words[j / 4]);
             const q: i8 = @bitCast(@as(u8, @truncate(word >> @intCast(8 * (j % 4)))));
             const step: f64 = @abs(d[j / 256]);
-            worst = @max(worst, @abs(@as(f64, @floatFromInt(q)) * d[j / 256] - want) / (step / 2));
+            worst = worse(worst, @abs(@as(f64, @floatFromInt(q)) * d[j / 256] - want) / (step / 2));
         }
     }
     return .{ .name = name, .err = worst, .tolerance = 1.0001 };
