@@ -155,6 +155,17 @@ hit every tile and chunk remainder:
   attention covers three query tokens over three blocks. Both run with
   groups of 4 query heads a KV head (`attn_split`) and 12
   (`attn_split_wide`).
+- **Sparse attention** (Qwen3.8-Flash-Next): the indexer runs 230
+  positions in steps of 3, 4, 1 and 2. Every query head of a token is the
+  same, so about half the blocks score exactly 0, and rows just past the
+  width must break those ties by index. The key cache and every row's
+  selection must be exact, against the raw keys rounded and a sort of the
+  GPU's own scores; the queries, pooled blocks and scores within 1e-5 of
+  float64 (4.3e-6). `attn_split_sparse` runs with a whole 64-key block
+  excluded, and with a width past every row, which attends to all, against
+  float64 (2.6e-7). Ranking ties from an inclusive scan, taking the last
+  block whole, rotating pooled blocks at the wrong position, and taking one
+  cell too many each fail.
 - **`rope_append`** is checked over the whole projection, including the
   gates, K and V it must leave untouched, and over the cache, including the
   positions before the step, which must stay zero. Its f16 cache must hold
