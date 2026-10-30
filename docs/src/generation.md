@@ -82,14 +82,18 @@ budget:
 - **Checkpoint boundaries:** chunks also end at multiples of 512 and just
   before the prompt's last token. That token then runs as its own step, which
   measures the fixed cost and produces the logits to sample.
-- **Alignment:** otherwise chunks end only at multiples of 8. Steps of at
-  most 4 tokens run the decode kernels, which round differently from the
-  prefill kernels ([GPU backend](gpu.md#step-program)). Every aligned step
-  is longer than that, and the prefill kernels give the same result however
-  a prompt is split, so the kernels each prompt position goes through depend
-  on the prompt alone, not on step timings. The alignment was 64 until the
-  27B: its 64-token steps alone took seconds, past Windows' 2 s GPU
-  watchdog.
+- **Alignment:** otherwise chunks end only at multiples of 8. The alignment
+  was 64 until the 27B: its 64-token steps alone took seconds, past
+  Windows' 2 s GPU watchdog.
+- **Kernels:** every prefill chunk runs the prefill kernels, however few
+  tokens it has, and only the prompt's last token takes the decode kernels,
+  which round differently ([GPU backend](gpu.md#two-kernel-paths)). The
+  prefill kernels give the same result however a prompt is split, so the
+  kernels each prompt position goes through depend on the prompt alone, not
+  on step timings. Steps of a few tokens used to take the decode kernels by
+  their size, and the chunk just before the last token can be a short tail:
+  whether it ran alone depended on where timing had put the previous
+  boundary.
 - **Decode:** one token per step. The sampler writes the token straight into
   the next step's input on the GPU, so the CPU only reads back the token id
   and its stop flag.
