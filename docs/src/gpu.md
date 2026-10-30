@@ -107,7 +107,6 @@ unit decodes from one load (128 bytes per block).
 | `silu_mul` | SwiGLU over the stacked gate and up projection, prefill | Elementwise |
 | `rope_append` | Q/K RMSNorm, partial NeoX RoPE at positions pos0 + t, and the K/V cache write | One workgroup per (head, token) of the stacked Q, K, V projection. Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π]. The cache holds f16 pairs (`pack2x16float`) or f32 |
 | `attn_split`, `attn_combine` | Causal GQA over the cache, with the sigmoid output gate (flash-decoding) | One workgroup per (KV head, 64 cache positions, token) scores the block for the whole GQA group and takes a local softmax (groups of up to 8 query heads; `attn_split_wide` takes up to 12, whose queries fill WebGPU's 16 KB of workgroup memory, which costs the 27B's prefill 2% if used for its groups of 6); the combine merges the blocks. Prefill steps run them in chunks of 32 tokens, so the partials hold one chunk; a token's result depends only on its position. The 27B's prefill attention at position 5,000 dropped from 96 to 61 ms a step when this replaced a kernel with one workgroup per (head, query) |
-| `qsa_keys`, `qsa_pool`, `qsa_score`, `qsa_select`, `attn_split_sparse` | Qwen3.8-Flash-Next's sparse attention: the indexer's queries (norm, RoPE) and keys (an f16 cache), each block of `ratio` keys pooled (mean, norm, RoPE at its start), every block's score Σ_heads relu(q · block), the top blocks, and attention over the selected cells | Exact selection: the scores are never negative, so their bits order as their values; one workgroup per row finds the K-th largest bit by bit and breaks ties by index with a scan. `attn_split_sparse` is `attn_split_wide` with an inclusion test composed in (`attn_sparse.wgsl`; `attn_dense.wgsl` for the others). An excluded key weighs 0, even where a whole 64-key block is excluded |
 | `delta_prep` | DeltaNet front end: causal conv and SiLU, L2 norm of q and k, β and decay gates | One workgroup per (head of channels, token); inputs before the step come from the conv history |
 | `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups. Also advances the conv history, and can keep the state and history as after one row of the step (for rolling back a rejected speculative token) |
 | `gated_norm` | The SiLU(z)-gated RMSNorm after it; sigmoid(z)-gated for Qwen4Exp | One workgroup per (head, token); z read from the stacked projection |
@@ -258,9 +257,12 @@ A decode layer is 7 dispatches. A decode step is 182, down from 441.
 the parts it shares with Qwen 3.5's (`src/plan/common.zig`: weight upload,
 buffers, the multiplies' launches, the sampler). The engine drives either
 through `plan.Program`. This program runs the decode kernels only, in steps
-of up to 4 tokens, and caps the context at 2,048. Up to 2,051 visible cells
-the sparse attention's indexer selects every cell, so dense attention
-computes the same thing.
+of up to 4 tokens, with up to 32,768 positions of context. Its attention
+is sparse: past 2,051 visible cells (top-k 2,048 + ratio 4 − 1) each query
+attends to its tail and the 4-cell blocks its indexer scores highest, about
+2,051 cells in all, whatever the position. Each attention layer has its
+indexer's weights (query heads and key, one BF16 multiply), an f16 key
+cache and its pooled blocks; the rows' scores and selections are shared.
 
 - **Weights:** the dense Q8_0 matrices as Qwen 3.5 uploads them, stacked
   where they share an input (the DeltaNet projections; Q, K and V; the

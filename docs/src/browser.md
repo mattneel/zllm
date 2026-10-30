@@ -221,7 +221,7 @@ prompt, the same 128 tokens as `zllm generate`.
 ## Not yet
 
 - **Model and template coverage:** Qwen 3.5 and 3.8 GGUFs (BF16, F16 and the
-  quantized types; the Gyro-Coder up to 2,048 tokens of context), with the
+  quantized types; the Gyro-Coder up to 32,768 tokens of context), with the
   fixed Qwen template. Rendering a GGUF's own chat template with
   `@huggingface/jinja` is still to come.
 - **Plan cache:** a plan cache (M4) would skip setup work that a cached

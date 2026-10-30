@@ -1,9 +1,10 @@
 //! The Qwen4Exp (Qwen3.8-Flash-Next) step program: its weights on the GPU
 //! and every launch of a step, built once (src/ref/qwen4exp/engine.zig is
-//! the graph it follows). This first version runs the decode kernels only,
-//! in steps of at most kernels.decode_max_rows tokens, and caps the context
-//! at the sparse attention's budget: up to 2,048 + 3 cells the indexer
-//! selects every cell, so dense attention is the same computation.
+//! the graph it follows). It runs the decode kernels only, in steps of at
+//! most kernels.decode_max_rows tokens. Attention is sparse: past `width`
+//! visible cells (top-k + ratio − 1, 2,051 for the released model) each
+//! query attends to its tail and the blocks its indexer scores highest
+//! (qsa_*.wgsl, attn_split_sparse).
 //!
 //! The per-layer embedding (PLE) table stays in the file: each step hashes
 //! its tokens' histories (ple.History) and records `write_file`s of their
@@ -33,7 +34,7 @@ pub const Hparams = graph.Hparams;
 
 /// Contexts the program allows: the sparse attention's cell budget, below
 /// which it is dense (the indexer is not built yet).
-pub const max_context = 2048;
+pub const max_context = 32768;
 /// PLE rows a token reads.
 pub const ple_heads = ple.heads;
 
@@ -61,6 +62,12 @@ const Full = struct {
     wo: Matrix,
     q_norm: Arg,
     k_norm: Arg,
+    /// The sparse attention's indexer: its query heads | its key.
+    idx: Matrix,
+    idx_q_norm: Arg,
+    idx_k_norm: Arg,
+    /// Cells per indexed block.
+    ratio: u32,
 };
 
 const Ple = struct {
@@ -118,6 +125,7 @@ pub const Model = struct {
                 .full => |*w| {
                     f(context, &w.qkv);
                     f(context, &w.wo);
+                    f(context, &w.idx);
                 },
             }
             if (l.ple) |*p| {
@@ -141,6 +149,10 @@ pub const Model = struct {
         var u: Upload = .{ .arena = arena, .gpa = gpa, .rec = rec, .set = set, .file = file, .limits = limits };
         const e: u64 = hp.n_embd;
         const hd: u64 = hp.hcDim();
+        const id: u64 = hp.idx_dim;
+        const ratios = file.get(graph.arch ++ ".attention.compress_ratios") orelse return error.MissingMetadata;
+        if (ratios != .array or ratios.array.len < hp.n_layer) return error.BadMetadata;
+        if (ratios.array.elem_type != .i32 and ratios.array.elem_type != .u32) return error.BadMetadata;
         const layers = try arena.alloc(Layer, hp.n_layer);
         for (layers, 0..) |*l, i| {
             const fe: u64 = hp.n_ff_exp;
@@ -169,6 +181,17 @@ pub const Model = struct {
                     .wo = try u.matrix("blk.{d}.attn_output.weight", i, @as(u64, hp.head_dim) * hp.n_head, e),
                     .q_norm = try u.vector("blk.{d}.attn_q_norm.weight", i, hp.head_dim),
                     .k_norm = try u.vector("blk.{d}.attn_k_norm.weight", i, hp.head_dim),
+                    .idx = try u.stacked(i, e, &.{
+                        .{ "blk.{d}.indexer.q_proj.weight", id * hp.idx_heads },
+                        .{ "blk.{d}.indexer.k_proj.weight", id },
+                    }),
+                    .idx_q_norm = try u.vector("blk.{d}.indexer.q_norm.weight", i, id),
+                    .idx_k_norm = try u.vector("blk.{d}.indexer.k_norm.weight", i, id),
+                    .ratio = blk: {
+                        const r = ratios.array.get(u32, i);
+                        if (r == 0 or r > 64) return error.Unsupported;
+                        break :blk r;
+                    },
                 } },
                 .ple = if (i == hp.ple_layer) .{
                     .key = try u.matrix("blk.{d}.ple_key.weight", i, e, hd),
@@ -361,6 +384,7 @@ pub const Program = struct {
         const hp = m.hp;
         if (cfg.context == 0 or cfg.context > max_context) return error.BadConfig;
         if (hp.head_dim > kernels.max_head_dim or hp.ssm_state > kernels.max_delta_head) return error.BadConfig;
+        if (hp.idx_dim > 256 or hp.idx_dim % 2 != 0 or hp.idx_heads * hp.idx_dim > 2048) return error.BadConfig;
         if (hp.n_head % hp.n_head_kv != 0 or hp.n_head / hp.n_head_kv > kernels.attn_max_group_wide or hp.n_embd > 2560 or hp.n_ff_exp > 2560) return error.BadConfig;
         const cap: u32 = kernels.decode_max_rows;
         const e: u64 = hp.n_embd;
@@ -396,6 +420,19 @@ pub const Program = struct {
         const att = try a.storage(cap * hdim * hp.n_head);
         const max_blocks: u32 = std.math.divCeil(u32, cfg.context, kernels.attn_block) catch unreachable;
         const attn_part = try a.storage(cap * hp.n_head * @as(u64, max_blocks) * (hdim + 2));
+        // The sparse attention's indexer: each row's projection, block
+        // scores and selection (shared by the layers; per layer, its key
+        // cache and pooled blocks, below).
+        const id: u64 = hp.idx_dim;
+        const idx_row: u32 = @intCast((hp.idx_heads + 1) * id);
+        var min_ratio: u32 = std.math.maxInt(u32);
+        for (m.layers) |*layer| if (layer.mixer == .full) {
+            min_ratio = @min(min_ratio, layer.mixer.full.ratio);
+        };
+        const qsa_stride: u32 = cfg.context / min_ratio + 1;
+        const idx_rows = try a.storage(cap * @as(u64, idx_row));
+        const qsa_scores = try a.storage(cap * @as(u64, qsa_stride));
+        const qsa_sel = try a.storage(cap * @as(u64, qsa_stride));
         // Experts.
         const ids = try a.storage(cap * used);
         const weights = try a.storage(cap * used);
@@ -548,6 +585,28 @@ pub const Program = struct {
                     const vc = try a.buffer(kv_layer, .{ .storage = true });
                     const half: u32 = @backingInt(cfg.kv);
                     const q_row: u32 = @intCast(qkv_row);
+                    // The indexer: its keys (f16) and pooled blocks, the
+                    // queries' scores and the cells each row attends to.
+                    const qsa = try arena.create(P.Qsa);
+                    qsa.* = .{
+                        .heads = hp.idx_heads,
+                        .dim = hp.idx_dim,
+                        .ratio = w.ratio,
+                        .width = hp.idx_top_k + w.ratio - 1,
+                        .stride = qsa_stride,
+                        .n_rot = hp.n_rot,
+                        .eps = hp.eps,
+                        .row = idx_row,
+                    };
+                    const qsa_params = try a.buffer(@sizeOf(P.Qsa), .{ .uniform = true, .copy_dst = true });
+                    try rec.writeBuffer(gpa, qsa_params.buffer, 0, std.mem.asBytes(qsa));
+                    const idx_keys = try a.buffer(@as(u64, cfg.context) * id * 2, .{ .storage = true });
+                    const pooled = try a.storage((cfg.context / w.ratio + 1) * id);
+                    try add(&body, arena, try mm.vector(idx_rows, cur, &w.idx, .{}));
+                    try body.append(arena, .{ .launch = try b.add(.qsa_keys, qsa.*, &.{ idx_rows, w.idx_q_norm, rope, idx_keys, step }, .{ .rows_y = hp.idx_heads + 1 }) });
+                    try body.append(arena, .{ .launch = try b.add(.qsa_pool, qsa.*, &.{ idx_keys, w.idx_k_norm, rope, pooled, step }, .{ .fixed = .{ 2, 1, 1 } }) });
+                    try body.append(arena, .{ .launch = try b.add(.qsa_score, qsa.*, &.{ idx_rows, pooled, qsa_scores, step }, .{ .rows_y = std.math.divCeil(u32, qsa_stride, 256) catch unreachable }) });
+                    try body.append(arena, .{ .launch = try b.add(.qsa_select, qsa.*, &.{ qsa_scores, qsa_sel, step }, .{ .rows_y = 1 }) });
                     try add(&body, arena, try mm.vector(qkv, cur, &w.qkv, .{}));
                     try body.append(arena, .{ .launch = try b.add(.rope_append, P.RopeAppend{
                         .heads = hp.n_head,
@@ -570,7 +629,7 @@ pub const Program = struct {
                         .q_row = q_row,
                         .row0 = 0,
                     };
-                    try body.append(arena, .{ .launch = try b.add(kernels.attnSplit(hp.n_head / hp.n_head_kv), params, &.{ qkv, kc, vc, attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = 0, .max_rows = kernels.attn_rows } }) });
+                    try body.append(arena, .{ .launch = try b.add(.attn_split_sparse, params, &.{ qkv, kc, vc, attn_part, step, qsa_sel, qsa_params }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = 0, .max_rows = kernels.attn_rows } }) });
                     try body.append(arena, .{ .launch = try b.add(.attn_combine, params, &.{ qkv, attn_part, att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = 0, .max_rows = kernels.attn_rows } }) });
                     try add(&body, arena, try mm.vector(block, att, &w.wo, .{}));
                 },

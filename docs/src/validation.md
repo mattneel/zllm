@@ -155,17 +155,6 @@ hit every tile and chunk remainder:
   attention covers three query tokens over three blocks. Both run with
   groups of 4 query heads a KV head (`attn_split`) and 12
   (`attn_split_wide`).
-- **Sparse attention** (Qwen3.8-Flash-Next): the indexer runs 230
-  positions in steps of 3, 4, 1 and 2. Every query head of a token is the
-  same, so about half the blocks score exactly 0, and rows just past the
-  width must break those ties by index. The key cache and every row's
-  selection must be exact, against the raw keys rounded and a sort of the
-  GPU's own scores; the queries, pooled blocks and scores within 1e-5 of
-  float64 (4.3e-6). `attn_split_sparse` runs with a whole 64-key block
-  excluded, and with a width past every row, which attends to all, against
-  float64 (2.6e-7). Ranking ties from an inclusive scan, taking the last
-  block whole, rotating pooled blocks at the wrong position, and taking one
-  cell too many each fail.
 - **`rope_append`** is checked over the whole projection, including the
   gates, K and V it must leave untouched, and over the cache, including the
   positions before the step, which must stay zero. Its f16 cache must hold
@@ -477,6 +466,7 @@ greedy tokens.
 | The same vs the reference runtime's dumps | 1.5% relative L2 after layer 0, growing to 25% at layer 47 |
 | GPU (`zllm gpu-forward`, D3D12, f16 cache) vs the CPU reference, the same 66 tokens | every layer's expert sets identical; streams within 1.3e-4 relative L2 (median 1.8e-5 at the last layer); logits median 1.9e-5, max 1.5e-4; top-1 66/66, so greedy 40/40 |
 | GPU in 1-token vs 4-token steps | bitwise identical |
+| Greedy, on the reference runtime's 6,430-token prompt (a fact buried in filler), past the sparse attention's width from position 2,051 on, with `zllm generate` and in Chrome | the runtime's 10 tokens: `PURPLE-ELEPHANT-42`, then end of turn |
 | `zllm generate`, greedy, on the same prompt, tuned and untuned | the reference runtime's 40 tokens; the text is identical |
 | `zllm engine-check` | every reuse scenario bitwise identical to a fresh run (one kernel path, so the cross-path cases too), and the asynchronous stop, the cancellations and logprobs pass; no speculation (no MTP block) |
 
