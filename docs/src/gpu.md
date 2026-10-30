@@ -243,3 +243,33 @@ three more:
   over the whole vocabulary.
 
 A decode layer is 7 dispatches. A decode step is 182, down from 441.
+
+## Qwen3.8-Flash-Next
+
+`src/plan/qwen4exp.zig` is the Gyro-Coder's step program. It is built from
+the parts it shares with Qwen 3.5's (`src/plan/common.zig`: weight upload,
+buffers, the multiplies' launches). It runs the decode kernels only, in
+steps of up to 4 tokens, and caps the context at 2,048. Up to 2,051 visible
+cells the sparse attention's indexer selects every cell, so dense attention
+computes the same thing.
+
+- **Weights:** the dense Q8_0 matrices as Qwen 3.5 uploads them, stacked
+  where they share an input (the DeltaNet projections; Q, K and V; the
+  shared expert's gate and up; the hyper-connection matrices). The routed
+  experts go up as stored, TQ2_T, read by `gyro_matvec` at the ids the
+  router wrote; then the router, the codebook and the Hadamard sign
+  vectors. Everything but the PLE table is about 21 GB of GPU memory.
+- **PLE:** the 50.7 GiB n-gram table stays in the file. For each token the
+  host hashes its history, reads its 16 Q8_0 rows (16 × 170 bytes) and
+  sends them with the step; `embed_q8_0` decodes them as a 16-row table.
+- **A layer:** the four streams' norms and the low-rank mix into the
+  block's input (`hc_act`, `hc_mix`), the mixer (DeltaNet with a sigmoid
+  gate, or attention with `attn_split_wide`), `hc_combine` back into the
+  streams; again for the experts: `moe_route`, `rotate128`, the gate and up
+  experts, `rotate128` of their SiLU pair, the down experts, the shared
+  expert, `moe_combine`, `hc_combine`.
+
+Through `zllm gpu-forward` on the RTX 5090 Laptop, a warm load takes 14 to
+20 s, and a token through all 48 layers about 90 ms. Each step there is its
+own synchronous submission, with 96 readbacks for the checks
+([Validation](validation.md#qwen38-flash-next-gyro-coder)).

@@ -49,7 +49,10 @@ const usage =
     \\              [--path prefill|decode] [--mtp] [--tune]
     \\                                       as `forward`, on the GPU through Dawn, in
     \\                                       steps of N tokens (default 512; f32 KV;
-    \\                                       the decode kernels for steps of up to 4)
+    \\                                       the decode kernels for steps of up to 4).
+    \\                                       Qwen4Exp: decode kernels only, up to 2,048
+    \\                                       tokens; writes each layer's streams and
+    \\                                       experts (l_last, ffn_moe_topk) and logits
     \\
 ++ gen.usage ++
     \\environment:
@@ -420,6 +423,112 @@ const ForwardOptions = struct {
     }
 };
 
+/// gpu-forward for Qwen4Exp: the decode kernels in steps of up to
+/// min(chunk, decode_max_rows) tokens, the host reading each token's PLE
+/// rows from the mapped file. Writes the records the reference names alike:
+/// each layer's streams (`l_last-<layer>`) and chosen experts
+/// (`ffn_moe_topk-<layer>`), and every position's logits.
+fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file: zllm.gguf.File, bytes: []const u8, tokens: []const u32, out_path: []const u8, opts: ForwardOptions) !void {
+    const plan = zllm.plan.qwen4exp;
+    if (opts.path == .prefill or opts.mtp or opts.tune) {
+        std.log.err("gpu-forward runs Qwen4Exp with the decode kernels only, without --mtp or --tune", .{});
+        return error.InvalidUsage;
+    }
+    const t_start = Io.Timestamp.now(io, .awake);
+    const d = host.d;
+    const limits: zllm.plan.common.Limits = .{
+        .max_binding = d.limits.maxStorageBufferBindingSize,
+        .offset_align = d.limits.minStorageBufferOffsetAlignment,
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var rec: zllm.gpu.cmd.Recorder = .{};
+    defer rec.deinit(gpa);
+    var completions: std.ArrayList(zllm.gpu.cmd.Completion) = .empty;
+    defer completions.deinit(gpa);
+
+    const n: u32 = @intCast(tokens.len);
+    if (n > plan.max_context) return error.ContextTooLong;
+    const chunk: u32 = @min(opts.chunk, zllm.kernels.decode_max_rows, n);
+    var set = try zllm.kernels.Set.create(gpa, arena, &rec);
+    host.file = bytes;
+    const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
+    var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{ .context = @max(n, 1), .kv = opts.kv }, limits);
+    try program.recordReset(gpa, &rec);
+    try rec.submit(gpa, 0);
+    try runBatch(host, &rec, &completions);
+    const t_loaded = Io.Timestamp.now(io, .awake);
+
+    // The PLE table's rows, read from the mapped file per token.
+    const ple = zllm.ref.qwen4exp.ple;
+    const config = try ple.Config.fromGguf(file);
+    const table = file.tensor("per_layer_token_embd.weight") orelse return error.MissingTensor;
+    const row_bytes = table.byteSize() / table.dims[1];
+    var history: ple.History = .{};
+    const rows = try arena.alloc(u8, chunk * plan.ple_heads * row_bytes);
+
+    const vocab: usize = model.hp.vocab;
+    const logits = try arena.alloc(f32, @as(usize, n) * vocab);
+    // Every layer's streams and experts, for every position; each step
+    // reads back into its rows.
+    const hd: usize = model.hp.hcDim();
+    const used: usize = model.hp.n_expert_used;
+    const streams = try arena.alloc([]f32, model.hp.n_layer);
+    const experts = try arena.alloc([]u32, model.hp.n_layer);
+    for (streams, experts) |*s, *x| {
+        s.* = try arena.alloc(f32, n * hd);
+        x.* = try arena.alloc(u32, n * used);
+    }
+    const step_streams = try arena.alloc([]f32, model.hp.n_layer);
+    const step_experts = try arena.alloc([]u32, model.hp.n_layer);
+    var pos0: u32 = 0;
+    var steps: u32 = 0;
+    while (pos0 < n) : (steps += 1) {
+        const m = @min(chunk, n - pos0);
+        for (tokens[pos0..][0..m], 0..) |t, i| {
+            for (try history.accept(config, t), 0..) |r, head| {
+                const src = file.data_offset + table.offset + r * row_bytes;
+                @memcpy(rows[(i * plan.ple_heads + head) * row_bytes ..][0..row_bytes], bytes[src..][0..row_bytes]);
+            }
+        }
+        for (streams, experts, step_streams, step_experts) |s, x, *ss, *sx| {
+            ss.* = s[pos0 * hd ..][0 .. m * hd];
+            sx.* = x[pos0 * used ..][0 .. m * used];
+        }
+        const readback: plan.Program.Readback = .{ .streams = step_streams, .experts = step_experts };
+        try program.recordStep(gpa, &rec, .{
+            .pos0 = pos0,
+            .tokens = tokens[pos0..][0..m],
+            .ple_rows = rows[0 .. m * plan.ple_heads * row_bytes],
+            .logits = logits[pos0 * vocab ..][0 .. m * vocab],
+            .readback = &readback,
+        });
+        try rec.submit(gpa, steps + 1);
+        try runBatch(host, &rec, &completions);
+        pos0 += m;
+    }
+    const t_done = Io.Timestamp.now(io, .awake);
+    std.debug.print("gpu-forward: {d} tokens in {d} steps of up to {d} ({t} KV); load {d} ms, forward {d} ms\n", .{
+        n, steps, chunk, opts.kv, t_start.durationTo(t_loaded).toMilliseconds(), t_loaded.durationTo(t_done).toMilliseconds(),
+    });
+
+    const out_file = try Io.Dir.cwd().createFile(io, out_path, .{});
+    defer out_file.close(io);
+    var buf: [1 << 16]u8 = undefined;
+    var fw: Io.File.Writer = .init(out_file, io, &buf);
+    var rw: RecordWriter = .{ .w = &fw.interface };
+    var name_buf: [32]u8 = undefined;
+    const ids_f = try arena.alloc(f32, n * used);
+    for (streams, experts, 0..) |s, x, il| {
+        try RecordWriter.emit(&rw, try std.fmt.bufPrint(&name_buf, "l_last-{d}", .{il}), s, hd, n);
+        for (ids_f, x) |*f, id| f.* = @floatFromInt(id);
+        try RecordWriter.emit(&rw, try std.fmt.bufPrint(&name_buf, "ffn_moe_topk-{d}", .{il}), ids_f, used, n);
+    }
+    try RecordWriter.emit(&rw, "result_output", logits, vocab, n);
+    try fw.interface.flush();
+}
+
 /// The GPU forward pass, with the same arguments and activation records as
 /// `forward`, run as steps of `chunk` tokens against the KV cache and the
 /// recurrent state. Load and forward timings go to stderr.
@@ -438,6 +547,10 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     defer d.deinit(gpa);
     var host = zllm.gpu.Host.init(gpa, d);
     defer host.deinit();
+    const arch = file.get("general.architecture") orelse return error.MissingMetadata;
+    if (arch == .string and std.mem.eql(u8, arch.string, zllm.graph.qwen4exp.arch)) {
+        return gpuForwardQwen4exp(gpa, io, &host, file, mapped.bytes, tokens, out_path, opts);
+    }
     const limits: plan_common.Limits = .{
         .max_binding = d.limits.maxStorageBufferBindingSize,
         .offset_align = d.limits.minStorageBufferOffsetAlignment,

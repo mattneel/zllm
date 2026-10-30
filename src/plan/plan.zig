@@ -2,3 +2,4 @@
 
 pub const common = @import("common.zig");
 pub const qwen35 = @import("qwen35.zig");
+pub const qwen4exp = @import("qwen4exp.zig");

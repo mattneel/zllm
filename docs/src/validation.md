@@ -459,6 +459,8 @@ greedy tokens.
 | CPU reference (`zllm forward`), 26 prompt tokens and the reference runtime's 40 greedy tokens, teacher-forced | argmax at each of the 40 positions is the runtime's greedy token: 40/40 |
 | The same vs gyro-dx's CPU engine | every layer's expert routing identical; layer outputs within 3.4e-5 relative L2; PLE rows exact |
 | The same vs the reference runtime's dumps | 1.5% relative L2 after layer 0, growing to 25% at layer 47 |
+| GPU (`zllm gpu-forward`, D3D12, f16 cache) vs the CPU reference, the same 66 tokens | every layer's expert sets identical; streams within 1.3e-4 relative L2 (median 1.8e-5 at the last layer); logits median 1.9e-5, max 1.5e-4; top-1 66/66, so greedy 40/40 |
+| GPU in 1-token vs 4-token steps | bitwise identical |
 
 The last row is the reference runtime's own rounding: it computes its
 multiplies from activations rounded to 8-bit blocks, and through 48 layers
