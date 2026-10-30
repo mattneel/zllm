@@ -2,7 +2,7 @@
 //! in the model, every MatvecVariant candidate the device fits runs on the
 //! shape's real weights. Each is checked against the default variant first
 //! (diverging candidates are dropped), then timed: 2 warm-up batches more,
-//! then the median of 7. The fastest per shape goes into plan.Tuning.
+//! then the median of 7. The fastest per shape goes into plan_common.Tuning.
 //!
 //! A non-blocking state machine, like the engine: the host runs each batch
 //! `next` returns and passes its time to `done`, until `next` returns null.
@@ -16,6 +16,7 @@ const cmd = @import("../gpu/cmd.zig");
 const gguf = @import("../gguf/gguf.zig");
 const kernels = @import("../kernels/kernels.zig");
 const plan = @import("../plan/qwen35.zig");
+const plan_common = @import("../plan/common.zig");
 
 const P = kernels.params;
 const Variant = kernels.MatvecVariant;
@@ -31,7 +32,7 @@ pub const tolerance = 1e-5;
 
 /// One shape to tune: the first chunk of a matrix of its (type, n, k).
 const Shape = struct {
-    key: plan.Tuning.Entry,
+    key: plan_common.Tuning.Entry,
     chunk: Arg,
     rows: u32,
     /// Times each batch repeats the dispatch.
@@ -66,7 +67,7 @@ pub const Sweep = struct {
     times: [timed]u64 = undefined,
     diverged: bool = false,
     best: ?struct { v: Variant, ns: u64 } = null,
-    entries: std.ArrayList(plan.Tuning.Entry) = .empty,
+    entries: std.ArrayList(plan_common.Tuning.Entry) = .empty,
     /// Candidates dropped for diverging from the default.
     dropped: u32 = 0,
 
@@ -81,10 +82,10 @@ pub const Sweep = struct {
             k_max: u32 = 0,
             n_max: u32 = 0,
             failed: bool = false,
-            fn add(c: *@This(), w: *const plan.Matrix) void {
+            fn add(c: *@This(), w: *const plan_common.Matrix) void {
                 for (w.chunks) |ch| {
                     if (kernels.isHalf(ch.type)) continue;
-                    const key: plan.Tuning.Entry = .{ .type = ch.type, .n = w.n, .k = w.k, .variant = .{} };
+                    const key: plan_common.Tuning.Entry = .{ .type = ch.type, .n = w.n, .k = w.k, .variant = .{} };
                     const seen = for (c.list.items) |s| {
                         if (s.key.type == key.type and s.key.n == key.n and s.key.k == key.k) break true;
                     } else false;
@@ -202,7 +203,7 @@ pub const Sweep = struct {
     }
 
     /// The winners (valid while the arena is).
-    pub fn tuning(s: *const Sweep) plan.Tuning {
+    pub fn tuning(s: *const Sweep) plan_common.Tuning {
         return .{ .entries = s.entries.items };
     }
 

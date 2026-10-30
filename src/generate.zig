@@ -7,6 +7,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const zllm = @import("zllm");
 const plan = zllm.plan.qwen35;
+const plan_common = zllm.plan.common;
 const chat = zllm.chat;
 const sampler = zllm.sampler;
 
@@ -41,7 +42,7 @@ pub const usage =
 pub const Options = struct {
     max_tokens: u32 = 4096,
     context: u32 = 8192,
-    kv: plan.KvFormat = .f16,
+    kv: plan_common.KvFormat = .f16,
     temperature: ?f32 = null,
     top_k: ?u32 = null,
     top_p: ?f32 = null,
@@ -83,7 +84,7 @@ pub const Options = struct {
             } else if (std.mem.eql(u8, flag, "--ctx")) {
                 o.context = try int(u32, v);
             } else if (std.mem.eql(u8, flag, "--kv")) {
-                o.kv = std.meta.stringToEnum(plan.KvFormat, v) orelse return error.InvalidUsage;
+                o.kv = std.meta.stringToEnum(plan_common.KvFormat, v) orelse return error.InvalidUsage;
             } else if (std.mem.eql(u8, flag, "--temperature")) {
                 o.temperature = try float(v);
             } else if (std.mem.eql(u8, flag, "--top-k")) {
@@ -195,7 +196,7 @@ pub const Runtime = struct {
         const info = d.info(&raw);
         rt.adapter = try std.fmt.allocPrint(arena, "{s} ({s})", .{ info.device, info.backend });
         d.freeInfo(raw);
-        const limits: plan.Limits = .{
+        const limits: plan_common.Limits = .{
             .max_binding = d.limits.maxStorageBufferBindingSize,
             .offset_align = d.limits.minStorageBufferOffsetAlignment,
         };
@@ -208,7 +209,7 @@ pub const Runtime = struct {
         rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
         try rt.executeTimed(&rec, &t, &rt.load.weights);
         const mtp = plan.canSpeculate(&rt.model, limits);
-        var tuning: plan.Tuning = .{};
+        var tuning: plan_common.Tuning = .{};
         if (o.tune) {
             // Decoding mostly runs steps of two where it speculates.
             var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &rt.set, &rt.model, .{}, if (mtp and plan.speculationPays(&rt.model)) 2 else 1);

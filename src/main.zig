@@ -388,7 +388,7 @@ fn gpuCheck(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *I
 const ForwardOptions = struct {
     /// Tokens per step; 1 runs the sequence the way decoding does.
     chunk: u32 = 512,
-    kv: zllm.plan.qwen35.KvFormat = .f32,
+    kv: zllm.plan.common.KvFormat = .f32,
     /// Force the prefill or decode kernels (decode: steps of at most 4).
     path: ?zllm.plan.qwen35.Path = null,
     /// Also run the MTP block and write mtp_logits.
@@ -410,7 +410,7 @@ const ForwardOptions = struct {
                 o.chunk = std.fmt.parseInt(u32, args[i + 1], 10) catch return fail(usage);
                 if (o.chunk == 0) return fail(usage);
             } else if (std.mem.eql(u8, args[i], "--kv")) {
-                o.kv = std.meta.stringToEnum(zllm.plan.qwen35.KvFormat, args[i + 1]) orelse return fail(usage);
+                o.kv = std.meta.stringToEnum(zllm.plan.common.KvFormat, args[i + 1]) orelse return fail(usage);
             } else if (std.mem.eql(u8, args[i], "--path")) {
                 o.path = std.meta.stringToEnum(zllm.plan.qwen35.Path, args[i + 1]) orelse return fail(usage);
             } else return fail(usage);
@@ -425,6 +425,7 @@ const ForwardOptions = struct {
 /// recurrent state. Load and forward timings go to stderr.
 fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, model_path: []const u8, tokens_path: []const u8, out_path: []const u8, opts: ForwardOptions) !void {
     const plan = zllm.plan.qwen35;
+    const plan_common = zllm.plan.common;
     const t_start = Io.Timestamp.now(io, .awake);
     const mapped = try FileBytes.open(gpa, io, model_path);
     defer mapped.close(gpa);
@@ -437,7 +438,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     defer d.deinit(gpa);
     var host = zllm.gpu.Host.init(gpa, d);
     defer host.deinit();
-    const limits: plan.Limits = .{
+    const limits: plan_common.Limits = .{
         .max_binding = d.limits.maxStorageBufferBindingSize,
         .offset_align = d.limits.minStorageBufferOffsetAlignment,
     };
@@ -455,7 +456,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     var set = try zllm.kernels.Set.create(gpa, arena, &rec);
     host.file = mapped.bytes;
     const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
-    var tuning: plan.Tuning = .{};
+    var tuning: plan_common.Tuning = .{};
     if (opts.tune) {
         try rec.submit(gpa, 0);
         try runBatch(&host, &rec, &completions);

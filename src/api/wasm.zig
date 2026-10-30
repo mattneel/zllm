@@ -21,6 +21,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const zllm = @import("zllm");
 const plan = zllm.plan.qwen35;
+const plan_common = zllm.plan.common;
 const sampler = zllm.sampler;
 const sched = zllm.sched;
 
@@ -122,7 +123,7 @@ export fn zllm_open(ptr: [*]u8, len: usize) i32 {
 
 const LoadOptions = struct {
     context: u32 = 8192,
-    kv: plan.KvFormat = .f16,
+    kv: plan_common.KvFormat = .f16,
     max_binding: u64,
     offset_align: u32,
 };
@@ -274,7 +275,7 @@ const Runtime = struct {
             .engine = undefined,
         };
         const arena = rt.arena_state.allocator();
-        const limits: plan.Limits = .{ .max_binding = o.max_binding, .offset_align = o.offset_align };
+        const limits: plan_common.Limits = .{ .max_binding = o.max_binding, .offset_align = o.offset_align };
         rt.set = try .create(gpa, arena, &rt.setup);
         rt.model = try plan.Model.upload(arena, gpa, &rt.setup, &rt.set, file, limits);
         rt.program = try plan.Program.build(arena, gpa, &rt.setup, &rt.set, &rt.model, .{
