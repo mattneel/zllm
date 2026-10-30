@@ -377,7 +377,10 @@ llama.cpp, but it drives the per-layer relative L2 error to 6.3e-2, and
 ## Engine
 
 `check-gpu` also runs `zllm engine-check`. It sends requests through the
-real engine after earlier requests left state behind. Then it repeats each
+real engine after earlier requests left state behind. With an MTP block
+(the 0.8B has one), they speculate, except the pipelined and cancelled
+ones, so the reuse scenarios start from states that speculative rounds
+left, rolled back or not. Then it repeats each
 one after dropping all state. Each sampled step's logits must match, and the
 reused prompt length must be what the reuse rules say. Logits must be
 bitwise identical wherever both runs put each position through the same
@@ -398,6 +401,7 @@ relative L2.
 | After a 300-token prompt cancelled after 3 tokens: it, those 3, and 30 more | 302: the prompt and the 2 processed tokens | relative L2 8.8e-5 |
 | After a 700-token prompt cancelled after its first prefill step: the same prompt | 448: the chunk that ran | bitwise identical |
 | Logprobs: a 300-token prompt, greedy, top 3 | (fresh) | each token's logprob within 1.2e-7 of the log-softmax of its read-back logits, the top entry the sampled token; identical without the check's readback |
+| Speculation: a prompt repeating a random 24-token phrase, 48 tokens, greedy, sampled, and sampled with penalties, with and without speculation | (fresh) | the same tokens and bitwise identical logits; 52 drafts accepted and 34 rejected across the three |
 
 The pipelined run completes each batch only when the engine asks for it
 (`wait`), so every decode step is recorded before the previous token is
@@ -417,7 +421,11 @@ run the prefill kernels. On llvmpipe the extended turn still lands at
 Skipping the checkpoint restore fails both checkpoint scenarios, and an
 earlier bug that left the state dirty after dropping the sequence
 failed all five. Leaving the pipelined placeholder unfilled fails the
-scenario after the pipelined stop (699 of 736 reused, want 706).
+scenario after the pipelined stop (699 of 736 reused, want 706). Skipping
+the rollback after a rejected draft, or drawing the next sample afresh
+instead of with the rejected round's second draw, fails the sampled
+speculation scenario; leaving the discarded sample counted fails the one
+with penalties.
 
 ## GPU safety
 

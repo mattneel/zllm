@@ -129,9 +129,11 @@ pub fn main(init: std.process.Init) !void {
         const rt = try gen.Runtime.create(gpa, io, &host, file, mapped.bytes, opts);
         defer rt.destroy();
         const ld = rt.load;
-        std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, program {d}, calibration {d}); context {d}, {t} KV]\n", .{
+        std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, program {d}, calibration {d}); context {d}, {t} KV", .{
             rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, opts.context, opts.kv,
         });
+        if (rt.program.mtp != null) std.debug.print("; {s}", .{if (rt.engine.speculates()) "speculative" else "MTP block, not speculating by default"});
+        std.debug.print("]\n", .{});
         if (is_benchmark) {
             try benchmark.run(rt, args[2], mapped.bytes.len, @intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()), out);
         } else if (is_soak) {

@@ -2,7 +2,7 @@
 //! each, and their results into tokens and text. It never blocks; the host
 //! drives it:
 //!
-//!     calibrate twice: run engine.calibration(), then engine.calibrated(ns, warm)
+//!     while (try engine.calibration()) |words| { execute words; engine.calibrated(ns); }
 //!     try engine.start(request);
 //!     while (true) switch (try engine.next()) {
 //!         .submit => |words| { execute words; try engine.complete(elapsed_ns); },
@@ -41,6 +41,22 @@
 //! that only changes what follows it, restart one token before the end.
 //! Decode is one token per submission, and only the sampled token id (and
 //! its stop flag) comes back.
+//!
+//! Speculative decoding, with a program built with the model's MTP block:
+//! each round is one batch that runs the MTP block over the last step's
+//! positions (drafting the token after next), then verifies the sampled
+//! token and the draft in one two-position step, sampling at both. The
+//! draft is accepted when the first sample equals it; then both samples are
+//! emitted, else only the first, and the DeltaNet state rolls back to the
+//! kept first row at the start of the next batch. Every emitted token is the
+//! model's own sample with the draw it would get without speculation, and
+//! the decode kernels give each row the same result in a step of two as in
+//! a step of one, so the output is the same, bitwise. Rounds run one batch
+//! at a time: the next round's positions depend on the verdict. Prefill
+//! runs the MTP block over each chunk too, so drafts see the whole prompt.
+//! The rollback also uncounts the discarded second sample in the sampler's
+//! output counts, which the penalties read. Steps that would cross a
+//! checkpoint position or the last sample max_tokens allows decode one token.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -86,6 +102,9 @@ pub const Request = struct {
     /// and the `logprobs` most likely tokens' (at most max_top_logprobs), as
     /// vLLM reports them by default. Null: none.
     logprobs: ?u32 = null,
+    /// Speculate with the MTP block, where the program has it; null: where
+    /// it pays for the model (`speculates`).
+    speculate: ?bool = null,
 };
 
 /// The most top log-probabilities a request may ask for.
@@ -116,6 +135,9 @@ pub const Usage = struct {
     prefill_steps: u32 = 0,
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
+    /// Speculative rounds, and how many of their drafts were accepted.
+    drafted: u32 = 0,
+    accepted: u32 = 0,
 };
 
 pub const Event = union(enum) {
@@ -150,6 +172,8 @@ pub const Engine = struct {
     token_ns: u64 = 0,
     /// Tokens in the step `token_ns` was measured on.
     rate_tokens: u32 = 0,
+    /// Calibration batches run.
+    calibrations: u32 = 0,
     submits: u32 = 0,
 
     // Per request.
@@ -187,12 +211,31 @@ pub const Engine = struct {
     lp_top: [max_top_logprobs]Logprob.Top = undefined,
     finish: ?Finish = null,
     cancelled: bool = false,
+    /// Speculating in this request.
+    spec: bool = false,
+    /// The last step's positions the MTP block has yet to run over (their
+    /// final hidden states are rows 0.. of the program's `h`).
+    mtp_pos: u32 = 0,
+    mtp_rows: u32 = 0,
+    /// The last draft was rejected: roll the DeltaNet state back, and
+    /// uncount the second sample, before anything else runs.
+    rollback: bool = false,
+    /// The draws of the verify step in flight.
+    verify_draws: [2]f32 = .{ 0, 0 },
+    /// The second draw of a rejected verify step, for the next sample.
+    spare_draw: ?f32 = null,
+    /// The verify step's draft, read back.
+    draft: u32 = 0,
+    /// An accepted verify step's second sample, emitted after the first.
+    second: ?Second = null,
+    take_second: bool = false,
     /// `rec` holds a batch already handed to the host: the next recording
     /// starts a fresh one. (`start` leaves commands for the first batch.)
     handed: bool = false,
 
     const Phase = enum { idle, prefill, decode, emit };
-    const Pending = struct { tokens: u32, prefill: bool, slot: ?u32 };
+    const Pending = struct { tokens: u32, prefill: bool, slot: ?u32, verify: bool = false };
+    const Second = struct { token: u32, stop: bool, logits: []const f32 };
 
     /// The engine keeps pointers to itself in recorded batches: it must not
     /// move while a batch is pending.
@@ -214,14 +257,16 @@ pub const Engine = struct {
         return e.seq.tokens.items;
     }
 
-    /// One calibration step: a single token processed on a zeroed state,
-    /// which is zeroed again after, dropping the resident sequence. The host
-    /// runs it twice before the first request, passing each run's time to
-    /// `calibrated`: the first warms up the pipelines and is discarded, the
-    /// second measures the fixed cost of a step, which the prefill cost
-    /// model needs from the start. The batch is valid until `calibrated`.
-    pub fn calibration(e: *Engine) Error![]const u32 {
+    /// The next calibration batch, or null when calibration is done: a
+    /// single token processed on a zeroed state, which is zeroed again after,
+    /// dropping the resident sequence. The host runs each before the first
+    /// request and passes its time to `calibrated`: the first warms up the
+    /// pipelines and is discarded, the second measures the fixed cost of a
+    /// step, which the prefill cost model needs from the start. The batch is
+    /// valid until `calibrated`.
+    pub fn calibration(e: *Engine) Error!?[]const u32 {
         if (e.queued != 0 or e.phase != .idle) return error.Busy;
+        if (e.calibrations == 2) return null;
         e.forget();
         e.rec.clear();
         try e.program.recordReset(e.gpa, &e.rec);
@@ -232,9 +277,15 @@ pub const Engine = struct {
         return e.rec.batch();
     }
 
-    pub fn calibrated(e: *Engine, elapsed_ns: u64, warm: bool) void {
+    pub fn calibrated(e: *Engine, elapsed_ns: u64) void {
         e.rec.clear();
-        if (warm) e.step_ns = elapsed_ns;
+        if (e.calibrations == 1) e.step_ns = elapsed_ns;
+        e.calibrations += 1;
+    }
+
+    /// Whether requests speculate by default (plan.speculationPays).
+    pub fn speculates(e: *const Engine) bool {
+        return e.program.mtp != null and e.program.speculation_pays;
     }
 
     const calibration_token = [_]u32{0};
@@ -259,6 +310,8 @@ pub const Engine = struct {
 
         e.rec.clear();
         e.handed = false;
+        if (e.rollback) try e.program.recordRollback(e.gpa, &e.rec);
+        e.rollback = false;
         const r = e.seq.plan(req.prompt);
         switch (r.from) {
             .current => {},
@@ -279,6 +332,11 @@ pub const Engine = struct {
         e.placeholder = null;
         e.finish = null;
         e.cancelled = false;
+        e.spec = e.program.mtp != null and (req.speculate orelse e.speculates());
+        e.mtp_rows = 0;
+        e.spare_draw = null;
+        e.second = null;
+        e.take_second = false;
         e.phase = .prefill;
     }
 
@@ -288,10 +346,17 @@ pub const Engine = struct {
     }
 
     pub fn next(e: *Engine) Error!Event {
+        if (e.take_second) {
+            e.take_second = false;
+            const s = e.second.?;
+            e.second = null;
+            try e.takeSample(s.token, s.stop, s.logits);
+        }
         switch (e.phase) {
             .idle => return error.NotSubmitted,
             .emit => {
                 e.phase = .decode;
+                e.take_second = e.second != null;
                 return .{ .token = .{ .id = e.emit_token, .text = e.text.items, .logprob = e.emit_logprob } };
             },
             .prefill, .decode => {},
@@ -307,6 +372,9 @@ pub const Engine = struct {
             // previous one's measured cost.
             if (e.queued > 0) return .wait;
             try e.recordPrefill();
+        } else if (e.spec) {
+            if (e.queued > 0 or !e.canDecode()) return .wait;
+            try e.recordRound();
         } else {
             if (e.queued == max_in_flight or !e.canDecode()) return .wait;
             try e.recordDecode();
@@ -349,22 +417,52 @@ pub const Engine = struct {
             e.token_ns = (elapsed_ns - e.step_ns) / std.mem.alignForward(u64, p.tokens, e.program.prefill_tile);
             e.rate_tokens = p.tokens;
         }
+        if (p.verify) return e.completeVerify();
         const slot = p.slot orelse return;
 
         const token = e.sampled[slot][0];
-        e.last_token = token;
-        e.emit_logprob = if (e.req.logprobs) |n| e.logprob(e.lp_src[slot], token, n) else null;
         if (e.placeholder) |i| {
             // A later step already processes this token.
             e.seq.tokens.items[i] = token;
             e.placeholder = null;
         }
+        try e.takeSample(token, e.sampled[slot][1] != 0, e.lp_src[slot]);
+    }
+
+    /// Settles a verify step: keeps the draft or drops it (rolling the
+    /// state back at the next batch), then emits the first sample, and the
+    /// second after it when the draft was right.
+    fn completeVerify(e: *Engine) Error!void {
+        const pos = e.seq.len() - 2;
+        const first = e.sampled[0];
+        const accepted = first[0] == e.draft;
+        e.usage.drafted += 1;
+        if (accepted) {
+            e.usage.accepted += 1;
+            e.seq.tokens.items[pos + 1] = e.draft;
+        } else {
+            e.seq.tokens.shrinkRetainingCapacity(pos + 1);
+            e.rollback = true;
+            e.spare_draw = e.verify_draws[1];
+            e.samples_recorded -= 1;
+        }
+        e.mtp_pos = pos;
+        e.mtp_rows = if (accepted) 2 else 1;
+        try e.takeSample(first[0], first[1] != 0, e.lp_src[0]);
+        if (accepted and e.finish == null) e.second = .{ .token = e.sampled[1][0], .stop = e.sampled[1][1] != 0, .logits = e.lp_src[1] };
+    }
+
+    /// Makes a sample the latest token and, unless the request has
+    /// finished, the next one to emit, deciding whether it finishes it.
+    fn takeSample(e: *Engine, token: u32, stop: bool, logits: []const f32) Error!void {
+        e.last_token = token;
+        e.emit_logprob = if (e.req.logprobs) |n| e.logprob(logits, token, n) else null;
         // Recorded before the request finished: the step processed its
         // token, but its sample is not part of the reply.
         if (e.finish != null) return;
         e.usage.completion_tokens += 1;
         e.text.clearRetainingCapacity();
-        if (e.sampled[slot][1] != 0) {
+        if (stop) {
             try e.stream.flush(e.gpa, &e.text);
             e.finish = .stop;
         } else if (try e.stream.push(e.gpa, e.tok, token, &e.text)) {
@@ -429,11 +527,23 @@ pub const Engine = struct {
             .pos0 = pos0,
             .tokens = tokens,
             .logit_rows = @intFromBool(last),
-            .draw = if (last) e.draws.next() else null,
+            .draw = if (last) e.takeDraw() else null,
             .sampled = if (slot) |s| &e.sampled[s] else null,
             .readback = if (slot) |s| e.logitsReadback(s) else null,
             .path = if (last) null else .prefill,
+            .hidden = e.spec,
         });
+        if (e.spec) {
+            // Each position's MTP row takes the token after it; the prompt's
+            // last token waits for its sample (the first round runs it).
+            std.debug.assert(!last or m == 1);
+            if (last) {
+                e.mtp_pos = pos0;
+                e.mtp_rows = 1;
+            } else {
+                try e.program.recordMtp(e.gpa, &e.rec, .{ .pos0 = pos0, .tokens = e.req.prompt[pos0 + 1 ..][0..m] });
+            }
+        }
         try e.seq.append(e.gpa, tokens);
         e.prefill_pos += m;
         if (e.seq.len() + 1 == e.req.prompt.len or e.seq.len() % state.checkpoint_interval == 0) try e.save();
@@ -451,7 +561,7 @@ pub const Engine = struct {
             .pos0 = pos0,
             .tokens = null,
             .logit_rows = 1,
-            .draw = e.draws.next(),
+            .draw = e.takeDraw(),
             .sampled = &e.sampled[slot],
             .readback = e.logitsReadback(slot),
         });
@@ -462,6 +572,76 @@ pub const Engine = struct {
         try e.seq.append(e.gpa, &.{if (unknown) 0 else e.last_token});
         if (e.seq.len() % state.checkpoint_interval == 0) try e.save();
         try e.submitBatch(.{ .tokens = 1, .prefill = false, .slot = slot });
+    }
+
+    /// A speculative round: the MTP block over the last step's positions,
+    /// drafting the token after next, then the sampled token and the draft
+    /// verified in one step; or, where a round may not verify (see the top),
+    /// the sampled token alone, through the same kernels.
+    fn recordRound(e: *Engine) Error!void {
+        e.freshBatch();
+        if (e.rollback) try e.program.recordRollback(e.gpa, &e.rec);
+        e.rollback = false;
+        const pos = e.seq.len();
+        const token = e.last_token;
+        const interval = state.checkpoint_interval;
+        const verify = e.mtp_rows > 0 and e.samples_recorded + 2 <= e.req.max_tokens and
+            pos + 2 <= e.program.cfg.context and (pos + 1) % interval != 0 and (pos + 2) % interval != 0;
+        if (e.mtp_rows > 0) {
+            // Each row takes the token after its position: resident, or the
+            // latest sample for the last.
+            var tokens: [2]u32 = undefined;
+            for (tokens[0..e.mtp_rows], 0..) |*t, i| {
+                const at = e.mtp_pos + i + 1;
+                t.* = if (at < pos) e.seq.tokens.items[at] else token;
+            }
+            try e.program.recordMtp(e.gpa, &e.rec, .{
+                .pos0 = e.mtp_pos,
+                .tokens = tokens[0..e.mtp_rows],
+                .draft = verify,
+            });
+            e.mtp_rows = 0;
+        }
+        if (verify) {
+            e.verify_draws = .{ e.takeDraw(), e.takeDraw() };
+            e.samples_recorded += 2;
+            const k = e.samples_recorded - 2;
+            try e.program.recordVerify(e.gpa, &e.rec, .{
+                .pos0 = pos,
+                .token = token,
+                .draws = e.verify_draws,
+                .sampled = &e.sampled,
+                .draft = &e.draft,
+                .logits = .{ e.logitsRow(0, k), e.logitsRow(1, k + 1) },
+            });
+            try e.seq.append(e.gpa, &.{ token, 0 });
+            try e.submitBatch(.{ .tokens = 2, .prefill = false, .slot = null, .verify = true });
+            return;
+        }
+        const slot = e.takeSlot();
+        try e.program.recordStep(e.gpa, &e.rec, .{
+            .pos0 = pos,
+            .tokens = (&token)[0..1],
+            .logit_rows = 1,
+            .draw = e.takeDraw(),
+            .sampled = &e.sampled[slot],
+            .readback = e.logitsReadback(slot),
+            .hidden = true,
+        });
+        try e.seq.append(e.gpa, &.{token});
+        e.mtp_pos = pos;
+        e.mtp_rows = 1;
+        if (e.seq.len() % interval == 0) try e.save();
+        try e.submitBatch(.{ .tokens = 1, .prefill = false, .slot = slot });
+    }
+
+    /// The next sample's draw: a rejected verify step's unused one first.
+    fn takeDraw(e: *Engine) f32 {
+        if (e.spare_draw) |u| {
+            e.spare_draw = null;
+            return u;
+        }
+        return e.draws.next();
     }
 
     /// The readback slot for a new sampling step.
@@ -475,15 +655,22 @@ pub const Engine = struct {
     /// Where the logits of the sampling step being recorded (in `slot`) go:
     /// the request's buffer, for checks, or the slot's row for logprobs.
     fn logitsReadback(e: *Engine, slot: u32) ?plan.Program.Readback {
+        return .{ .logits = e.logitsRow(slot, e.samples_recorded - 1) orelse return null };
+    }
+
+    /// The row sample `k` (of the request) reads its logits back to, in
+    /// `slot`: the request's buffer, for checks, or the slot's row for
+    /// logprobs.
+    fn logitsRow(e: *Engine, slot: u32, k: u32) ?[]f32 {
         const vocab = e.program.hp.vocab;
         const row: []f32 = if (e.req.logits) |all|
-            all[(e.samples_recorded - 1) * vocab ..][0..vocab]
+            all[k * vocab ..][0..vocab]
         else if (e.req.logprobs != null)
             e.lp_rows[slot * vocab ..][0..vocab]
         else
             return null;
         e.lp_src[slot] = row;
-        return .{ .logits = row };
+        return row;
     }
 
     /// The log-probability of `token` under `logits`, and the `n` most likely

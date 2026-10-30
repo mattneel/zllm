@@ -28,6 +28,11 @@ pub const usage =
     \\  --stop S              stop string, repeatable
     \\  --system S            (chat) system prompt
     \\  --no-think            (chat) answer without a reasoning block
+    \\  --speculate, --no-speculate
+    \\                        draft tokens with the model's MTP block and verify
+    \\                        them two at a time, or not; the output is the same
+    \\                        (default: where the draft's weights are at most an
+    \\                        eighth of the model's)
     \\
     \\
 ;
@@ -47,6 +52,7 @@ pub const Options = struct {
     stops: []const []const u8 = &.{},
     system: ?[]const u8 = null,
     think: bool = true,
+    speculate: ?bool = null,
 
     pub fn parse(arena: Allocator, args: []const []const u8) error{ InvalidUsage, OutOfMemory }!Options {
         var o: Options = .{};
@@ -56,6 +62,10 @@ pub const Options = struct {
             const flag = args[i];
             if (std.mem.eql(u8, flag, "--no-think")) {
                 o.think = false;
+                continue;
+            }
+            if (std.mem.eql(u8, flag, "--speculate") or std.mem.eql(u8, flag, "--no-speculate")) {
+                o.speculate = std.mem.eql(u8, flag, "--speculate");
                 continue;
             }
             if (i + 1 == args.len) return error.InvalidUsage;
@@ -148,8 +158,8 @@ pub const Runtime = struct {
         weights: u64 = 0,
         /// The step program: buffers and bind groups.
         program: u64 = 0,
-        /// The engine's two calibration steps (the first compiles nothing
-        /// but warms every pipeline up).
+        /// The engine's calibration batches (the first compiles nothing but
+        /// warms every pipeline up).
         calibration: u64 = 0,
     };
 
@@ -189,13 +199,15 @@ pub const Runtime = struct {
             .context = o.context,
             .max_tokens = @min(512, o.context),
             .kv = o.kv,
+            .mtp = plan.canSpeculate(&rt.model, limits),
+            .logit_rows = 2,
         }, limits);
         try rt.executeTimed(&rec, &t, &rt.load.program);
         rt.engine = try .init(gpa, &rt.program, &rt.tok);
-        for ([_]bool{ false, true }) |warm| {
+        while (try rt.engine.calibration()) |words| {
             const t0 = Io.Timestamp.now(io, .awake);
-            try rt.execute(try rt.engine.calibration());
-            rt.engine.calibrated(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()), warm);
+            try rt.execute(words);
+            rt.engine.calibrated(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()));
         }
         rt.load.calibration = @intCast(t.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds());
 
@@ -276,10 +288,12 @@ fn reportTurn(t: Runtime.Turn) void {
             return if (ns == 0) 0 else @as(f64, @floatFromInt(n)) * std.time.ns_per_s / @as(f64, @floatFromInt(ns));
         }
     }.f;
-    std.debug.print("\n[{t}; prompt {d} tokens ({d} reused), prefill {d} in {d} steps, {d:.0} ms ({d:.0} tok/s); {d} generated in {d:.0} ms ({d:.1} tok/s)]\n", .{
+    std.debug.print("\n[{t}; prompt {d} tokens ({d} reused), prefill {d} in {d} steps, {d:.0} ms ({d:.0} tok/s); {d} generated in {d:.0} ms ({d:.1} tok/s)", .{
         t.finish,            u.prompt_tokens, u.cached_tokens,                             prefilled, u.prefill_steps, ms(u.prefill_ns), rate(prefilled, u.prefill_ns),
         u.completion_tokens, ms(u.decode_ns), rate(u.completion_tokens -| 1, u.decode_ns),
     });
+    if (u.drafted > 0) std.debug.print("; {d} of {d} drafts accepted", .{ u.accepted, u.drafted });
+    std.debug.print("]\n", .{});
 }
 
 pub fn generate(rt: *Runtime, prompt: []const u8, o: Options, out: *Io.Writer) !void {
@@ -297,6 +311,7 @@ pub fn generate(rt: *Runtime, prompt: []const u8, o: Options, out: *Io.Writer) !
         .sampling = o.sampling(.{}, o.seed orelse defaultSeed(rt.io)),
         .stop_tokens = rt.stop_tokens.items,
         .stop = o.stops,
+        .speculate = o.speculate,
     }, out, &text, null);
     try out.writeByte('\n');
     try out.flush();
@@ -342,6 +357,7 @@ pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void
             .sampling = o.sampling(defaults, seed +% turn_index),
             .stop_tokens = rt.stop_tokens.items,
             .stop = o.stops,
+            .speculate = o.speculate,
         }, out, &reply, null);
         try out.writeByte('\n');
         try out.flush();

@@ -9,7 +9,7 @@
 //!     zllm_start(request)    a generation request (raw text, ids or chat)
 //!
 //! Loading runs through `zllm_next` too: the setup batch (buffers, weights,
-//! pipelines), then the engine's two calibration steps, then idle; each is
+//! pipelines), then the engine's calibration batches, then idle; each is
 //! completed before the next. During a request the shim may keep up to two
 //! batches in flight: after `submit` it calls `zllm_next` again, and on
 //! `wait` it completes its oldest batch (see sched.zig). Results
@@ -231,6 +231,8 @@ const RequestJson = struct {
     frequency_penalty: ?f32 = null,
     seed: u64 = 0,
     logit_bias: []const sampler.Bias = &.{},
+    /// zllm.sched.Request.speculate.
+    speculate: ?bool = null,
 };
 
 /// The model on the GPU and the engine over it. Heap-allocated: the engine
@@ -255,9 +257,9 @@ const Runtime = struct {
     ids: std.ArrayList(u32) = .empty,
     text: std.ArrayList(u8) = .empty,
 
-    /// Setup batch, cold calibration (warms pipelines up), warm calibration
-    /// (measures a step), then ready for requests.
-    const Phase = enum { setup, cold, warm, ready };
+    /// Setup batch, the engine's calibration batches, then ready for
+    /// requests.
+    const Phase = enum { setup, calibrate, ready };
 
     fn create(file: zllm.gguf.File, o: LoadOptions) !*Runtime {
         const rt = try gpa.create(Runtime);
@@ -279,6 +281,8 @@ const Runtime = struct {
             .context = o.context,
             .max_tokens = @min(512, o.context),
             .kv = o.kv,
+            .mtp = plan.canSpeculate(&rt.model, limits),
+            .logit_rows = 2,
         }, limits);
         try rt.setup.submit(gpa, 0);
         rt.engine = try .init(gpa, &rt.program, &rt.tok);
@@ -310,7 +314,9 @@ const Runtime = struct {
         if (rt.phase != .ready and rt.pending) return .wait;
         switch (rt.phase) {
             .setup => return rt.submit(rt.setup.batch()),
-            .cold, .warm => return rt.submit(try rt.engine.calibration()),
+            .calibrate => if (try rt.engine.calibration()) |words| return rt.submit(words) else {
+                rt.phase = .ready;
+            },
             .ready => {},
         }
         if (!rt.running) return .idle;
@@ -352,16 +358,9 @@ const Runtime = struct {
             .setup => {
                 rt.setup.deinit(gpa);
                 rt.setup = .{};
-                rt.phase = .cold;
+                rt.phase = .calibrate;
             },
-            .cold => {
-                rt.engine.calibrated(elapsed_ns, false);
-                rt.phase = .warm;
-            },
-            .warm => {
-                rt.engine.calibrated(elapsed_ns, true);
-                rt.phase = .ready;
-            },
+            .calibrate => rt.engine.calibrated(elapsed_ns),
             .ready => unreachable,
         }
     }
@@ -406,6 +405,7 @@ const Runtime = struct {
             .sampling = p,
             .stop_tokens = rt.stop_tokens.items,
             .stop = r.stop,
+            .speculate = r.speculate,
         });
         rt.running = true;
     }

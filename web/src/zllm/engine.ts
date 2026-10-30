@@ -58,6 +58,12 @@ export interface GenerateRequest {
    * (0 to 20), under the model's raw logits.
    */
   logprobs?: number;
+  /**
+   * Draft tokens with the model's MTP block and verify them two at a time
+   * (true), or not (false); the output is the same. By default the engine
+   * speculates where its load-time calibration found it pays.
+   */
+  speculate?: boolean;
   signal?: AbortSignal;
 }
 
@@ -198,6 +204,7 @@ interface RequestJson extends SamplingJson {
   enable_thinking?: boolean;
   reasoning_effort?: string | null;
   logprobs?: number;
+  speculate?: boolean;
   max_tokens: number;
   stop: string[];
 }
@@ -344,6 +351,9 @@ export class Engine {
     };
     if (req.logprobs !== undefined) {
       body.logprobs = req.logprobs;
+    }
+    if (req.speculate !== undefined) {
+      body.speculate = req.speculate;
     }
     if (req.tokens !== undefined) {
       body.tokens = req.tokens;

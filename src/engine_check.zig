@@ -12,6 +12,13 @@
 //! cancelled request must finish with `abort`, and the next prompt must
 //! reuse exactly the tokens its completed steps processed.
 //!
+//! With a model that has an MTP block, every request speculates unless it
+//! says otherwise, so the scenarios above reuse state that speculative
+//! rounds left (rolled back or not). Three more run the same prompt with
+//! and without speculation, greedy, sampled, and sampled with penalties:
+//! the tokens must be the same and every sampled step's logits bitwise
+//! identical, and the drafts must have been both accepted and rejected.
+//!
 //! One runs a request pipelined, as the browser does: each batch executes
 //! at once but completes only when the engine asks (`.wait`), so every
 //! decode step is recorded before the previous token is known. Stopped by a
@@ -26,7 +33,13 @@ const gen = @import("generate.zig");
 
 const n_gen = 12;
 
-const Run = struct { tokens: []u32, logits: []f32, cached: u32 };
+const Run = struct { tokens: []u32, logits: []f32, cached: u32, usage: zllm.sched.Usage };
+
+const Decode = struct {
+    n: u32 = n_gen,
+    sampling: zllm.sampler.Params = .{ .temperature = 1.0, .top_k = 50, .seed = 7 },
+    speculate: bool = true,
+};
 
 const Check = struct {
     rt: *gen.Runtime,
@@ -35,8 +48,12 @@ const Check = struct {
     ok: bool = true,
 
     fn run(c: *Check, prompt: []const u32) !Run {
+        return c.decode(prompt, .{});
+    }
+
+    fn decode(c: *Check, prompt: []const u32, o: Decode) !Run {
         const vocab = c.rt.program.hp.vocab;
-        const logits = try c.arena.alloc(f32, n_gen * vocab);
+        const logits = try c.arena.alloc(f32, @as(usize, o.n) * vocab);
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(c.rt.gpa);
         var ids: std.ArrayList(u32) = .empty;
@@ -44,12 +61,32 @@ const Check = struct {
         var discard: Io.Writer.Discarding = .init(&.{});
         const t = try c.rt.turn(.{
             .prompt = prompt,
-            .max_tokens = n_gen,
-            .sampling = .{ .temperature = 1.0, .top_k = 50, .seed = 7 },
+            .max_tokens = o.n,
+            .sampling = o.sampling,
             .logits = logits,
+            .speculate = o.speculate,
         }, &discard.writer, &text, &ids);
-        if (t.usage.completion_tokens != n_gen) return error.ShortGeneration;
-        return .{ .tokens = try c.arena.dupe(u32, ids.items), .logits = logits, .cached = t.usage.cached_tokens };
+        if (t.usage.completion_tokens != o.n) return error.ShortGeneration;
+        return .{ .tokens = try c.arena.dupe(u32, ids.items), .logits = logits, .cached = t.usage.cached_tokens, .usage = t.usage };
+    }
+
+    /// `prompt` with and without speculation, each from a zeroed state:
+    /// the same tokens, with bitwise identical logits. Returns the
+    /// speculative run's usage.
+    fn speculative(c: *Check, name: []const u8, prompt: []const u32, sampling: zllm.sampler.Params) !zllm.sched.Usage {
+        const n = 48;
+        c.rt.engine.forget();
+        const spec = try c.decode(prompt, .{ .n = n, .sampling = sampling });
+        c.rt.engine.forget();
+        const plain = try c.decode(prompt, .{ .n = n, .sampling = sampling, .speculate = false });
+        const same = std.mem.eql(u32, spec.tokens, plain.tokens) and std.mem.eql(u32, @ptrCast(spec.logits), @ptrCast(plain.logits));
+        const u = spec.usage;
+        c.ok = c.ok and same and u.drafted > 0;
+        try c.out.print("{s} {s:<34} {d} tokens and logits {s} decoding without it; {d} drafts, {d} accepted\n", .{
+            if (same and u.drafted > 0) "PASS" else "FAIL", name, n, if (same) "bitwise identical to" else "DIFFER from", u.drafted, u.accepted,
+        });
+        try c.out.flush();
+        return u;
     }
 
     /// Runs `prompt` with batches completed only on `.wait`, stopping at
@@ -66,6 +103,7 @@ const Check = struct {
             .sampling = .{ .temperature = 1.0, .top_k = 50, .seed = 7 },
             .stop_tokens = &.{stop},
             .logits = logits,
+            .speculate = false,
         });
         // GPU times of executed batches not yet completed, oldest first.
         var times: [zllm.sched.max_in_flight]u64 = undefined;
@@ -89,7 +127,7 @@ const Check = struct {
         };
         if (most != zllm.sched.max_in_flight) return error.NotPipelined;
         return .{
-            .run = .{ .tokens = ids.items, .logits = logits, .cached = d.usage.cached_tokens },
+            .run = .{ .tokens = ids.items, .logits = logits, .cached = d.usage.cached_tokens, .usage = d.usage },
             .finish = d.finish,
             .resident = @intCast(e.resident().len),
         };
@@ -102,7 +140,7 @@ const Check = struct {
     fn cancelled(c: *Check, name: []const u8, prompt: []const u32, tokens: ?u32) !?struct { tokens: []u32, resident: u32 } {
         const e = &c.rt.engine;
         var ids: std.ArrayList(u32) = .empty;
-        try e.start(.{ .prompt = prompt, .max_tokens = n_gen, .sampling = .{ .temperature = 1.0, .top_k = 50, .seed = 7 } });
+        try e.start(.{ .prompt = prompt, .max_tokens = n_gen, .sampling = .{ .temperature = 1.0, .top_k = 50, .seed = 7 }, .speculate = false });
         var steps: u32 = 0;
         const d = while (true) switch (try e.next()) {
             .submit => |words| {
@@ -242,6 +280,25 @@ pub fn run(rt: *gen.Runtime, out: *Io.Writer) !bool {
     // Cancelled after the first prefill step: that chunk is resident.
     if (try c.cancelled("cancel in prefill", p1, null)) |r| {
         _ = try c.scenario("prompt after a cancelled prefill", p1, r.resident, true);
+    }
+
+    // Speculation: a prompt that repeats a random phrase, so that the model
+    // continues it and drafts are often right, greedy and sampled.
+    if (rt.program.mtp != null) {
+        const phrase = try random(arena, prng.random(), 24, vocab);
+        const repeated = try arena.alloc(u32, 8 * phrase.len);
+        for (0..8) |i| @memcpy(repeated[i * phrase.len ..][0..phrase.len], phrase);
+        const greedy = try c.speculative("speculative = plain, greedy", repeated, .{ .temperature = 0 });
+        const sampled = try c.speculative("speculative = plain, sampled", repeated, .{ .temperature = 1.0, .top_k = 50, .seed = 7 });
+        // Chat's defaults: the penalties read output counts, which a
+        // rejected draft's discarded sample must not change.
+        const penalized = try c.speculative("speculative = plain, penalties", repeated, .{ .temperature = 1.0, .top_k = 20, .presence_penalty = 1.5, .repetition_penalty = 1.1, .frequency_penalty = 0.5, .seed = 9 });
+        // Both verdicts must have been exercised.
+        const accepted = greedy.accepted + sampled.accepted + penalized.accepted;
+        const rejected = greedy.drafted + sampled.drafted + penalized.drafted - accepted;
+        const both = accepted > 0 and rejected > 0;
+        c.ok = c.ok and both;
+        try out.print("{s} {s:<34} {d} accepted, {d} rejected\n", .{ if (both) "PASS" else "FAIL", "drafts accepted and rejected", accepted, rejected });
     }
 
     // Logprobs, greedy, with the logits read back too: each token's must be

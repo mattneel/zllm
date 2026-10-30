@@ -98,6 +98,52 @@ budget:
   the next step's input on the GPU, so the CPU only reads back the token id
   and its stop flag.
 
+## Speculative decoding
+
+Qwen 3.8's GGUFs carry a multi-token prediction (MTP) block: from position
+i's final hidden state and token i + 1, it drafts token i + 2
+([Qwen 3.5](qwen35.md)). With it, each decode round is one batch:
+
+1. **Roll back** if the previous round's draft was rejected: copy the kept
+   DeltaNet state back and uncount the discarded sample.
+2. **Draft:** the MTP block over the last step's positions (its own KV cache
+   gets their rows), then the head and an argmax over the last row, into
+   the next step's input on the GPU.
+3. **Verify:** the sampled token and the draft in one two-position step,
+   keeping the state after the token, and a sample at both positions with
+   consecutive draws.
+
+The draft is accepted when the first sample equals it. Then both samples
+are emitted; otherwise only the first, and the second's draw goes to the
+next sample. Every emitted token is the model's own sample with the draw it
+would get without speculation, and the decode kernels give each row the
+same result in a step of two as in a step of one, so the output is
+bitwise the same, for any sampling settings, penalties included
+([Validation](validation.md#engine)). Prefill also runs the MTP block over
+each chunk, so drafts see the whole prompt.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Draft: last step's hidden states, sampled token
+  Draft --> Verify: draft in the next step's input
+  Verify --> Accepted: first sample = draft
+  Verify --> Rejected: first sample ≠ draft
+  Accepted --> Draft: emit both samples
+  Rejected --> Draft: emit the first; roll back the draft's position
+```
+
+- **One batch at a time:** the next round's positions depend on the
+  verdict, so rounds do not pipeline (see [Engine](#engine)).
+- **Single-token steps:** where the two positions would include a
+  checkpoint position, or the last sample `max_tokens` allows.
+- **When it pays:** a round costs about a step plus a draft, which runs the
+  MTP block and the whole output head. The engine speculates by default
+  where the draft's weights are at most an eighth of the model's: the 27B,
+  not the 0.8B, whose head alone is about 30% of its weights (there,
+  speculating ran at 277 tok/s greedy against 276, and 232 sampled against
+  265). `speculate` in a request, or `--speculate` and `--no-speculate`,
+  override the default.
+
 ## State and prefix reuse
 
 The resident sequence is every token the GPU has processed. The KV cache
@@ -263,9 +309,20 @@ Qwen 3.8 27B at Q3_K_M (13.75 GB) on the same GPU, `zllm generate`, greedy:
 | Phase | First run | Now | Spec bar |
 |---|---|---|---|
 | Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 288–300 tok/s, in 31 steps | 300 tok/s |
-| Decode | 6 tok/s | 28–29 tok/s | 20 tok/s |
+| Decode | 6 tok/s | 29–31 tok/s | 20 tok/s |
+| Decode, speculative | | 37–41 tok/s | |
 
 The quantized kernels made the difference ([GPU backend](gpu.md#kernels)).
+Speculation, on 256 tokens continuing a code prompt, interleaved runs:
+
+| Sampling | Drafts accepted | Speculative | One token per step |
+|---|---|---|---|
+| Greedy | 124 of 131 | 41.4, 38.8 tok/s | 30.6, 29.0 tok/s |
+| Temperature 1 | 111 of 143 | 37.1, 36.9 tok/s | 29.8, 29.6 tok/s |
+
+A round costs about 1.4 steps (`zllm profile`): the two-position step
+about 1.3 (two tokens decode each weight once), the draft the rest.
+
 `zllm bench` at position 288 measured the steps:
 
 | Change | ms per decode step |
@@ -299,7 +356,8 @@ inputs. Its multiplies are bound by decoding the weights rather than by
 reading them: the largest, a Q3_K 5,120 × 17,408 matrix, takes 179 µs, about
 210 GB/s, a quarter of this GPU's bandwidth. Two tokens per step at first
 cost 1.9 times one, since each token decoded every weight again; decoding
-each weight vector once for both tokens brought that to about 1.3.
+each weight vector once for both tokens brought that to about 1.3 (the
+speculative step, [Speculative decoding](#speculative-decoding)).
 
 `zllm profile` (below) shows where a step goes now: of about 88 ms of GPU
 time, the Q3_K multiplies take 43 ms and the Q4_K ones 29 ms, both at about

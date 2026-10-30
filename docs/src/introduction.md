@@ -50,6 +50,12 @@ Decode runs at 28–29 tok/s, past the spec's bar of 20; prefill at
 Chrome it decodes at 27.3 tok/s and loads in 15.3 s from a local file
 (25.8 s over localhost; [Browser](browser.md#the-27b)).
 
+M7 has started with MTP speculative decoding: the 27B drafts tokens with its
+own MTP block and verifies them two at a time, which takes native decode to
+37–41 tok/s with output bitwise identical to decoding one token at a time
+([Generation](generation.md#speculative-decoding)). Llama and Qwen3 dense
+models are still to come.
+
 See [Validation](validation.md), [GPU backend](gpu.md),
 [Generation](generation.md) and [Browser](browser.md).
 
@@ -62,7 +68,7 @@ See [Validation](validation.md), [GPU backend](gpu.md),
 | M4 | Templates, tuning, plan cache | |
 | M5 | Fuser | |
 | M6 | 27B on an RTX 5090 Laptop meets the performance bar | done |
-| M7 | Llama and Qwen3 dense, MTP speculative decoding | |
+| M7 | Llama and Qwen3 dense, MTP speculative decoding | started |
 
 ## Reading this book
 
