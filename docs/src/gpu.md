@@ -78,6 +78,13 @@ host copies a range of the model file it opened into the buffer. Natively
 that range comes from a mapping of the file; in the browser it comes from
 range reads of a URL or a local file. The core needs only the GGUF header.
 
+Dawn stages each queued write in system memory until the GPU has copied
+it. A load is one batch, so the native host flushes after every 256 MiB of
+writes: it submits what is encoded and waits for the previous flush, which
+keeps staging under 512 MiB while reading continues. Unflushed, the
+Gyro-Coder's 20 GB of weights held 17 GB of staging at once, which Windows
+counts as shared GPU memory, on top of 22 GB of dedicated memory.
+
 ## Kernels
 
 Kernels live in `src/kernels/*.wgsl`, each with a uniform `Params` struct

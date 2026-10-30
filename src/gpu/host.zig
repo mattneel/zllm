@@ -23,10 +23,20 @@ pub const Host = struct {
     encoder: c.WGPUCommandEncoder = null,
     pass: c.WGPUComputePassEncoder = null,
     reads: std.ArrayList(Read) = .empty,
+    /// Bytes queued by write_buffer and write_file since the last flush
+    /// (flush_bytes), and the work-done future of that flush.
+    staged: u64 = 0,
+    flushed: ?c.WGPUFuture = null,
     /// Per-dispatch GPU time, while profiling (startProfile).
     profile: ?Profile = null,
 
     const Read = struct { token: u32, staging: c.WGPUBuffer, dst: []u8 };
+
+    /// Queued writes past this many bytes are flushed to the GPU: Dawn
+    /// stages each write in system memory until the GPU has copied it, so
+    /// loading 20 GB of weights as one batch held 17 GB of staging (shared
+    /// GPU memory) at once, past the card's budget.
+    pub const flush_bytes = 256 << 20;
 
     /// While profiling, each dispatch runs in its own compute pass with
     /// timestamps at its start and end, which serializes dispatches a
@@ -139,6 +149,7 @@ pub const Host = struct {
                 const data = command.ptrAt([*]const u8, 3);
                 const len: usize = @intCast(command.u64At(5));
                 p.QueueWriteBuffer(h.d.queue, try get(c.WGPUBuffer, h.buffers, a[0]), command.u64At(1), data, len);
+                try h.queued(len);
             },
             .write_file => {
                 try need(a, 7);
@@ -147,6 +158,7 @@ pub const Host = struct {
                 if (start > h.file.len or len > h.file.len - start) return error.BadCommand;
                 const data = h.file[@intCast(start)..][0..@intCast(len)];
                 p.QueueWriteBuffer(h.d.queue, try get(c.WGPUBuffer, h.buffers, a[0]), command.u64At(1), data.ptr, data.len);
+                try h.queued(data.len);
             },
             .create_shader => {
                 try need(a, 4);
@@ -297,6 +309,35 @@ pub const Host = struct {
         h.pass = null;
     }
 
+    /// Counts `len` more queued bytes; past flush_bytes, submits what is
+    /// encoded so far (with the queued writes ahead of it), then waits for
+    /// the previous flush: staging stays under two flushes' worth while the
+    /// next writes are read in as the GPU copies these. Later commands still
+    /// follow the writes, as one submit at the batch's end would have them.
+    fn queued(h: *Host, len: u64) Error!void {
+        h.staged += len;
+        if (h.staged < flush_bytes) return;
+        const p = &h.d.p;
+        h.endPass();
+        if (h.encoder) |enc| {
+            const buf = p.CommandEncoderFinish(enc, null);
+            p.CommandEncoderRelease(enc);
+            h.encoder = null;
+            p.QueueSubmit(h.d.queue, 1, &buf);
+            p.CommandBufferRelease(buf);
+        } else {
+            p.QueueSubmit(h.d.queue, 0, null);
+        }
+        var done = std.mem.zeroes(c.WGPUQueueWorkDoneCallbackInfo);
+        done.mode = c.WGPUCallbackMode_WaitAnyOnly;
+        done.callback = onWorkDone;
+        const future = p.QueueOnSubmittedWorkDone(h.d.queue, done);
+        if (h.flushed) |previous| h.d.wait(previous);
+        h.flushed = future;
+        try h.d.takeError();
+        h.staged = 0;
+    }
+
     /// Submits the open encoder (if any), waits for the queue, then maps and
     /// copies out every pending read.
     fn submit(h: *Host) Error!void {
@@ -316,6 +357,9 @@ pub const Host = struct {
             p.QueueSubmit(h.d.queue, 1, &buf);
             p.CommandBufferRelease(buf);
         }
+        if (h.flushed) |previous| h.d.wait(previous);
+        h.flushed = null;
+        h.staged = 0;
         var done = std.mem.zeroes(c.WGPUQueueWorkDoneCallbackInfo);
         done.mode = c.WGPUCallbackMode_WaitAnyOnly;
         done.callback = onWorkDone;
