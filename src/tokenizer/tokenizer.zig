@@ -149,6 +149,19 @@ pub const Tokenizer = struct {
     pub const EncodeError = unicode.NormalizeError;
 
     /// Appends the token ids of `text` to `out`. Adds BOS when the model asks for it.
+    /// The tokens that end generation, as llama.cpp picks them: those named
+    /// like an end of turn, message or text (llama-vocab.cpp's list, without
+    /// its model-specific entries), and the end-of-sequence token.
+    pub fn endOfGeneration(t: *const Tokenizer, gpa: Allocator, out: *std.ArrayList(Id)) Allocator.Error!void {
+        const names = [_][]const u8{
+            "<|eot_id|>", "<|eot|>", "<|im_end|>", "<|end|>", "<end_of_turn>",   "<|endoftext|>",
+            "<|eom_id|>", "<EOT>",   "_<EOT>",     "[EOT]",   "<|end_of_text|>", "<end_of_utterance>",
+            "<｜end▁of▁sentence｜>",
+        };
+        for (names) |n| if (t.ids.get(n)) |id| try out.append(gpa, id);
+        if (t.eos) |id| if (std.mem.indexOfScalar(Id, out.items, id) == null) try out.append(gpa, id);
+    }
+
     pub fn encode(t: *const Tokenizer, gpa: Allocator, text: []const u8, out: *std.ArrayList(Id)) EncodeError!void {
         if (t.add_bos) if (t.bos) |b| try out.append(gpa, b);
 

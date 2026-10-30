@@ -214,7 +214,10 @@ runs in phases, one dispatch each, chosen per request:
 | top-p otherwise | 32 × (one per 1,024 tokens, then 1) | Bisection on the key threshold |
 
 With the chat defaults (top-k 20, top-p 0.95) a draw is 12 dispatches and
-0.2 ms on the RTX 5090. Stop tokens are checked on the GPU. Two differences
+0.2 ms on the RTX 5090. Stop tokens are checked on the GPU: the
+end-of-sequence token and every token named like an end of turn, message or
+text (`<|im_end|>`, `<|eot_id|>`, `<|eom_id|>`, `<|end_of_text|>`, ...), as
+llama.cpp picks its end-of-generation tokens. Two differences
 from vLLM, both deliberate:
 
 - **Ties:** tokens tied at a top-k or top-p threshold are all kept. vLLM

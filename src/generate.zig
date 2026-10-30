@@ -160,7 +160,7 @@ pub const Runtime = struct {
     program: plan.Program,
     engine: zllm.sched.Engine,
     completions: std.ArrayList(zllm.gpu.cmd.Completion) = .empty,
-    /// <|im_end|> and the end-of-sequence token.
+    /// The tokens that end generation (Tokenizer.endOfGeneration).
     stop_tokens: std.ArrayList(u32) = .empty,
     /// "<device> (<backend>)".
     adapter: []const u8 = "",
@@ -227,8 +227,7 @@ pub const Runtime = struct {
         if (arch == null or arch.? != .string or !chat.supports(arch.?.string)) {
             rt.template = try chat.Template.fromGguf(rt.template_arena.allocator(), file, &rt.tok);
         }
-        if (rt.tok.ids.get("<|im_end|>")) |id| try rt.stop_tokens.append(gpa, id);
-        if (rt.tok.eos) |id| if (std.mem.indexOfScalar(u32, rt.stop_tokens.items, id) == null) try rt.stop_tokens.append(gpa, id);
+        try rt.tok.endOfGeneration(gpa, &rt.stop_tokens);
         try rt.open();
         errdefer rt.close();
         try rt.build();

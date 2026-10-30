@@ -320,7 +320,7 @@ const Runtime = struct {
     pending: bool = false,
     /// A request is running.
     running: bool = false,
-    /// <|im_end|> and the end-of-sequence token.
+    /// The tokens that end generation (Tokenizer.endOfGeneration).
     stop_tokens: std.ArrayList(u32) = .empty,
     ids: std.ArrayList(u32) = .empty,
     text: std.ArrayList(u8) = .empty,
@@ -358,8 +358,7 @@ const Runtime = struct {
         const cached = if (o.plan) |bytes| plan.cache.parse(arena, bytes, key) else null;
         if (cached) |t| rt.config.tuning = t;
         rt.will_sweep = o.tune and cached == null;
-        if (rt.tok.ids.get("<|im_end|>")) |id| try rt.stop_tokens.append(gpa, id);
-        if (rt.tok.eos) |id| if (std.mem.indexOfScalar(u32, rt.stop_tokens.items, id) == null) try rt.stop_tokens.append(gpa, id);
+        try rt.tok.endOfGeneration(gpa, &rt.stop_tokens);
         return rt;
     }
 
