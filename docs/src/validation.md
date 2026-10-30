@@ -152,7 +152,9 @@ hit every tile and chunk remainder:
   prefill step runs them, in chunks of 32, 32 and 6 tokens over six
   64-position blocks, the last partial, with f32 and f16 caches, query
   rows padded past their gates as in the fused Q, K, V projection. Decode
-  attention covers three query tokens over three blocks.
+  attention covers three query tokens over three blocks. Both run with
+  groups of 4 query heads a KV head (`attn_split`) and 12
+  (`attn_split_wide`).
 - **`rope_append`** is checked over the whole projection, including the
   gates, K and V it must leave untouched, and over the cache, including the
   positions before the step, which must stay zero.
@@ -171,8 +173,8 @@ errors to within a factor of 2.
 | embed_bf16, embed_f16 | 0 | 0 |
 | rope_append, f32 cache | 9.3e-8 | 1e-5 |
 | rope_append, f16 cache | 5.6e-4 | 1e-3 (one f16 step) |
-| attention in 3 chunks, f32 and f16 cache | 3.0e-7 | 1e-5 |
-| attn_split + attn_combine | 2.8e-7 | 1e-5 |
+| attention in 3 chunks, f32 and f16 cache; groups of 12 | 3.6e-7 | 1e-5 |
+| attn_split + attn_combine; groups of 12 | 3.2e-7 | 1e-5 |
 | delta_prep (4 steps) | 4.0e-8 | 1e-5 |
 | delta_rule + gated_norm (2 steps) | 2.5e-7 | 1e-5 |
 
