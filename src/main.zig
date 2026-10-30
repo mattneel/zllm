@@ -72,15 +72,15 @@ pub fn main(init: std.process.Init) !void {
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "gguf-index")) {
         if (args.len != 3) return fail(usage);
-        const mapped = try FileBytes.open(gpa, io, args[2]);
-        defer mapped.close(gpa);
+        var mapped = try FileBytes.open(io, args[2]);
+        defer mapped.close(io);
         var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
         defer file.deinit(gpa);
         try writeIndexJson(out, file);
     } else if (std.mem.eql(u8, cmd, "tokenize")) {
         if (args.len != 4) return fail(usage);
-        const mapped = try FileBytes.open(gpa, io, args[2]);
-        defer mapped.close(gpa);
+        var mapped = try FileBytes.open(io, args[2]);
+        defer mapped.close(io);
         // The tokenizer needs only metadata, so a header-only prefix suffices.
         var file = try zllm.gguf.parse(gpa, mapped.bytes, false);
         defer file.deinit(gpa);
@@ -117,8 +117,8 @@ pub fn main(init: std.process.Init) !void {
             else => return err,
         };
         if (is_check) opts.context = 2048;
-        const mapped = try FileBytes.open(gpa, io, args[2]);
-        defer mapped.close(gpa);
+        var mapped = try FileBytes.open(io, args[2]);
+        defer mapped.close(io);
         var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
         defer file.deinit(gpa);
         const d = try openDawn(gpa, init.environ_map);
@@ -240,8 +240,8 @@ fn chatRender(gpa: std.mem.Allocator, cases: []const u8, out: *Io.Writer) !void 
 }
 
 fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u8, tokens_path: []const u8, out_path: []const u8, act: zllm.ref.matmul.Activations, mtp: bool) !void {
-    const mapped = try FileBytes.open(gpa, io, model_path);
-    defer mapped.close(gpa);
+    var mapped = try FileBytes.open(io, model_path);
+    defer mapped.close(io);
     var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
     defer file.deinit(gpa);
     const pool = try zllm.ref.Pool.init(gpa, io, threads);
@@ -341,24 +341,24 @@ fn fail(msg: []const u8) error{InvalidUsage} {
     return error.InvalidUsage;
 }
 
-/// A whole file in memory: mapped read-only on POSIX, read into the heap on
-/// Windows (where std has no mmap).
+/// A whole file mapped read-only; pages are read as they are touched, so a
+/// model larger than memory (the 75 GB Gyro-Coder) still opens.
 const FileBytes = struct {
-    bytes: []align(std.heap.page_size_min) const u8,
+    file: Io.File,
+    map: Io.File.MemoryMap,
+    bytes: []const u8,
 
-    fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !FileBytes {
-        if (builtin.os.tag == .windows) {
-            const data = try Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .unlimited, .fromByteUnits(std.heap.page_size_min), null);
-            return .{ .bytes = data };
-        }
+    fn open(io: Io, path: []const u8) !FileBytes {
         const file = try Io.Dir.cwd().openFile(io, path, .{});
-        defer file.close(io);
+        errdefer file.close(io);
         const len = try file.length(io);
-        return .{ .bytes = try std.posix.mmap(null, @intCast(len), .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0) };
+        const map = try Io.File.MemoryMap.create(io, file, .{ .len = @intCast(len), .protection = .{ .read = true }, .populate = false });
+        return .{ .file = file, .map = map, .bytes = map.memory };
     }
 
-    fn close(f: FileBytes, gpa: std.mem.Allocator) void {
-        if (builtin.os.tag == .windows) gpa.free(f.bytes) else std.posix.munmap(f.bytes);
+    fn close(f: *FileBytes, io: Io) void {
+        f.map.destroy(io);
+        f.file.close(io);
     }
 };
 
@@ -427,8 +427,8 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     const plan = zllm.plan.qwen35;
     const plan_common = zllm.plan.common;
     const t_start = Io.Timestamp.now(io, .awake);
-    const mapped = try FileBytes.open(gpa, io, model_path);
-    defer mapped.close(gpa);
+    var mapped = try FileBytes.open(io, model_path);
+    defer mapped.close(io);
     var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
     defer file.deinit(gpa);
     const tokens = try readTokens(gpa, io, tokens_path);
