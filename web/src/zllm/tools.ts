@@ -1,12 +1,26 @@
-// Tool calling in the OpenAI chat format, over the Qwen template's XML calls:
+// Tool calling in the OpenAI chat format, over the calls each model family
+// writes (src/chat/chat.zig `ToolFormat`, named as vLLM's tool parsers):
 //
-//   <tool_call>
-//   <function=get_weather>
-//   <parameter=city>
-//   Paris
-//   </parameter>
-//   </function>
-//   </tool_call>
+//   xml          <tool_call>                  the fixed Qwen template, Granite 4
+//                <function=get_weather>
+//                <parameter=city>
+//                Paris
+//                </parameter>
+//                </function>
+//                </tool_call>
+//   hermes       <tool_call>                  Qwen 3
+//                {"name": "get_weather", "arguments": {"city": "Paris"}}
+//                </tool_call>
+//   llama3_json  {"name": "get_weather", "parameters": {"city": "Paris"}}
+//                the whole reply, optionally after <|python_tag|>, calls
+//                separated by ";" (Llama 3)
+
+/** How a model writes calls, as zllm_info's `tool_format` names it. */
+export type ToolFormat = "xml" | "hermes" | "llama3_json";
+
+export function isToolFormat(v: unknown): v is ToolFormat {
+  return v === "xml" || v === "hermes" || v === "llama3_json";
+}
 
 /** A function the model may call. */
 export interface Tool {
@@ -36,18 +50,29 @@ export interface ToolCallResult {
  * Splits reply content into text and the calls after it: text streams until
  * a `<tool_call>` tag, and everything from the first tag on is parsed at the
  * end. Text that could be the start of a tag, and whitespace before one, is
- * held back until it can't be.
+ * held back until it can't be. In `llama3_json`, a reply is calls if it
+ * starts with `{` or `<|python_tag|>`, else text.
  */
 export class ToolCallSplitter {
   static readonly START = "<tool_call>";
+  static readonly PYTHON_TAG = "<|python_tag|>";
   #held = "";
   #calls: string | null = null;
+  /** llama3_json: no text seen yet but whitespace. */
+  #leading = true;
 
-  constructor(readonly tools: readonly Tool[]) {}
+  constructor(
+    readonly tools: readonly Tool[],
+    readonly format: ToolFormat = "xml",
+  ) {}
 
   *push(text: string): Generator<string> {
     if (this.#calls !== null) {
       this.#calls += text;
+      return;
+    }
+    if (this.format === "llama3_json") {
+      yield* this.#pushJson(text);
       return;
     }
     this.#held += text;
@@ -76,6 +101,26 @@ export class ToolCallSplitter {
     }
   }
 
+  *#pushJson(text: string): Generator<string> {
+    if (!this.#leading) {
+      yield text;
+      return;
+    }
+    this.#held += text;
+    const lead = this.#held.trimStart();
+    if (lead === "" || ToolCallSplitter.PYTHON_TAG.startsWith(lead)) {
+      return;
+    }
+    this.#leading = false;
+    const held = this.#held;
+    this.#held = "";
+    if (lead.startsWith("{") || lead.startsWith(ToolCallSplitter.PYTHON_TAG)) {
+      this.#calls = held;
+    } else {
+      yield held;
+    }
+  }
+
   /**
    * The calls, or none if the reply made none (or none that parse); text
    * still held back is returned as `rest`.
@@ -86,21 +131,38 @@ export class ToolCallSplitter {
       this.#held = "";
       return { calls: [], rest };
     }
-    const calls = parseToolCalls(this.#calls, this.tools);
+    const calls = parseToolCalls(this.#calls, this.tools, this.format);
     return calls.length > 0 ? { calls, rest: "" } : { calls: [], rest: this.#calls };
   }
 }
 
 const CALL = /<tool_call>\s*<function=([^>\n]+)>([\s\S]*?)<\/function>\s*(?:<\/tool_call>|$)/g;
 const PARAM = /<parameter=([^>\n]+)>\n?([\s\S]*?)\n?<\/parameter>/g;
+const HERMES = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g;
 
 /**
- * Every complete call in `text`. Parameter values are converted by the
- * tool's JSON Schema type, as vLLM's Qwen3 XML parser does: strings stay as
- * written; integers, numbers and booleans are parsed; anything else is
- * parsed as JSON where it is JSON and kept as text where it isn't.
+ * Every complete call in `text`, in `format`. XML parameter values are
+ * converted by the tool's JSON Schema type, as vLLM's Qwen3 XML parser does:
+ * strings stay as written; integers, numbers and booleans are parsed;
+ * anything else is parsed as JSON where it is JSON and kept as text where it
+ * isn't. JSON calls (vLLM's hermes and llama3_json parsers) that don't parse
+ * are not calls.
  */
-export function parseToolCalls(text: string, tools: readonly Tool[]): ToolCall[] {
+export function parseToolCalls(
+  text: string,
+  tools: readonly Tool[],
+  format: ToolFormat = "xml",
+): ToolCall[] {
+  if (format === "hermes") {
+    return [...text.matchAll(HERMES)].flatMap((m) => jsonCall(parseJson(m[1] ?? ""), "arguments"));
+  }
+  if (format === "llama3_json") {
+    let rest = text.trimStart();
+    if (rest.startsWith(ToolCallSplitter.PYTHON_TAG)) {
+      rest = rest.slice(ToolCallSplitter.PYTHON_TAG.length);
+    }
+    return jsonObjects(rest).flatMap((o) => jsonCall(o, "parameters"));
+  }
   const calls: ToolCall[] = [];
   for (const m of text.matchAll(CALL)) {
     const name = (m[1] ?? "").trim();
@@ -111,12 +173,97 @@ export function parseToolCalls(text: string, tools: readonly Tool[]): ToolCall[]
       args[key] = convert(p[2] ?? "", props[key]);
     }
     calls.push({
-      id: `call_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`,
+      id: newId(),
       type: "function",
       function: { name, arguments: JSON.stringify(args) },
     });
   }
   return calls;
+}
+
+function newId(): string {
+  return `call_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text.trim());
+  } catch {
+    return undefined;
+  }
+}
+
+/** A call from {"name", <args>}: `args` names the arguments' key ("arguments" is also taken). */
+function jsonCall(v: unknown, args: "arguments" | "parameters"): ToolCall[] {
+  if (!isRecord(v)) {
+    return [];
+  }
+  const { name, arguments: fallback } = v;
+  if (typeof name !== "string") {
+    return [];
+  }
+  const a = v[args] ?? fallback ?? {};
+  return [
+    {
+      id: newId(),
+      type: "function",
+      function: { name, arguments: typeof a === "string" ? a : JSON.stringify(a) },
+    },
+  ];
+}
+
+/**
+ * The JSON objects `text` starts with, separated by whitespace or ";" (as
+ * vLLM's llama3_json parser decodes them); parsing stops at what isn't one.
+ */
+function jsonObjects(text: string): unknown[] {
+  const out: unknown[] = [];
+  let i = 0;
+  while (i < text.length) {
+    while (i < text.length && /[\s;]/.test(text[i] ?? "")) {
+      i++;
+    }
+    if (text[i] !== "{") {
+      break;
+    }
+    const end = objectEnd(text, i);
+    if (end < 0) {
+      break;
+    }
+    const v = parseJson(text.slice(i, end));
+    if (v === undefined) {
+      break;
+    }
+    out.push(v);
+    i = end;
+  }
+  return out;
+}
+
+/** The index after the JSON object at `start`, or -1 if it doesn't close. */
+function objectEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (c === "\\") {
+        i++;
+      } else if (c === '"') {
+        inString = false;
+      }
+    } else if (c === '"') {
+      inString = true;
+    } else if (c === "{" || c === "[") {
+      depth++;
+    } else if (c === "}" || c === "]") {
+      depth--;
+      if (depth === 0) {
+        return i + 1;
+      }
+    }
+  }
+  return -1;
 }
 
 function schemaProperties(tool: Tool | undefined): Record<string, unknown> {

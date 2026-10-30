@@ -61,14 +61,24 @@ await zllm.cacheUsage(); await zllm.clearCache();
   whole conversation stays resident and a new turn prefills only its new
   message.
 - **Tools** are offered as the template offers them, in the system turn
-  with its XML call format. An assistant turn's `tool_calls` (arguments
-  as JSON text, decoded first, as vLLM does) and `tool` messages render
-  as the template renders them. A reply's `<tool_call>` blocks become
-  `tool_calls`, with `finish_reason` `"tool_calls"`. Parameter values are
-  converted by the tool's schema type, as vLLM's Qwen3 XML parser does.
-  Streamed text stops at the first call, and the calls arrive in one
-  `tool_calls` delta at the end. `tool_choice: "none"` leaves the tools
-  out; forcing a call (`"required"` or a named function) isn't supported.
+  with its XML call format (or as the model's own template offers them).
+  An assistant turn's `tool_calls` (arguments as JSON text, decoded first,
+  as vLLM does) and `tool` messages render as the template renders them.
+  A reply's calls become `tool_calls`, with `finish_reason`
+  `"tool_calls"`, parsed in the format the model writes them
+  (`stats().model.tool_format`, from its template), as vLLM's parser of
+  that name does:
+  - `xml` (Qwen 3.5–3.8, Granite 4): `<tool_call><function=…>` blocks,
+    parameter values converted by the tool's schema type;
+  - `hermes` (Qwen 3): `<tool_call>` blocks of JSON `{"name", "arguments"}`;
+  - `llama3_json` (Llama 3): a reply that is JSON `{"name", "parameters"}`
+    objects, optionally after `<|python_tag|>`, separated by `;`.
+
+  A call that doesn't parse leaves the reply as text. Streamed text stops at
+  the first call, and the calls arrive in one `tool_calls` delta at the end.
+  `tool_choice: "none"` leaves the tools out; forcing a call (`"required"`
+  or a named function) needs grammar-constrained decoding, which the spec
+  leaves out of v1.
 - **Logprobs:** `logprobs: true` with `top_logprobs` (0 to 20) returns
   each generated token's log-probability under the model's raw logits and
   its most likely alternatives, in OpenAI's `choices[].logprobs.content`

@@ -240,6 +240,8 @@ export fn zllm_info() i32 {
         .kv = p.kv(),
         .sampling = .{ .thinking = rt.defaults.thinking, .instruct = rt.defaults.instruct, .raw = rt.defaults.raw },
         .resident_tokens = rt.engine.resident().len,
+        // How replies carry tool calls (zllm.chat.ToolFormat); null: no tools.
+        .tool_format = if (zllm.chat.supports(p.architecture())) zllm.chat.ToolFormat.xml else if (rt.template) |t| t.tools else null,
     }, .{})}) catch |err| return fail("info", err);
     setText(rt.text.items);
     return 0;

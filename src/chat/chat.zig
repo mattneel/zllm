@@ -29,6 +29,26 @@ pub fn supports(arch: []const u8) bool {
     return std.mem.eql(u8, arch, "qwen35") or std.mem.eql(u8, arch, "qwen4exp");
 }
 
+/// The format a model writes tool calls in, as vLLM's tool parsers name it.
+pub const ToolFormat = enum {
+    /// <tool_call><function=NAME><parameter=KEY>VALUE</parameter>...: the
+    /// fixed Qwen template's, Granite 4's.
+    xml,
+    /// <tool_call>{"name": ..., "arguments": {...}}</tool_call>: Qwen 3's.
+    hermes,
+    /// {"name": ..., "parameters": {...}} as the whole reply, optionally
+    /// after <|python_tag|>: Llama 3's.
+    llama3_json,
+
+    /// The format a chat template's instructions ask for.
+    pub fn of(template: []const u8) ?ToolFormat {
+        if (has(template, "<function=")) return .xml;
+        if (has(template, "<tool_call>")) return .hermes;
+        if (has(template, "\"parameters\": dictionary") or has(template, "<|python_tag|>")) return .llama3_json;
+        return null;
+    }
+};
+
 /// A model's own chat template (GGUF `tokenizer.chat_template`), rendered by
 /// zllm.chat.jinja as transformers' apply_chat_template renders it. For the
 /// models `supports` does not cover.
@@ -36,11 +56,13 @@ pub const Template = struct {
     tmpl: jinja.Template,
     bos: ?[]const u8,
     eos: ?[]const u8,
+    /// How the template asks the model to call tools; null if it offers none.
+    tools: ?ToolFormat,
 
     /// Parses `source`, which the template borrows, from `arena`. `bos` and
     /// `eos` are the special tokens' text (transformers' bos_token, eos_token).
     pub fn parse(arena: Allocator, source: []const u8, bos: ?[]const u8, eos: ?[]const u8) jinja.Error!Template {
-        return .{ .tmpl = try jinja.Template.parse(arena, source), .bos = bos, .eos = eos };
+        return .{ .tmpl = try jinja.Template.parse(arena, source), .bos = bos, .eos = eos, .tools = ToolFormat.of(source) };
     }
 
     pub const Input = struct {
@@ -534,4 +556,11 @@ test "trim strips Unicode whitespace like Python" {
     try std.testing.expectEqualStrings("a b", trim("\u{3000} \ta b\u{a0}\n"));
     try std.testing.expectEqualStrings("", trim(" \u{2028} "));
     try std.testing.expectEqualStrings("€", trim("€"));
+}
+
+test "tool formats from templates" {
+    try std.testing.expectEqual(ToolFormat.xml, ToolFormat.of("<tool_call>\n<function=example_function_name>"));
+    try std.testing.expectEqual(ToolFormat.hermes, ToolFormat.of("<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>"));
+    try std.testing.expectEqual(ToolFormat.llama3_json, ToolFormat.of("Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}."));
+    try std.testing.expectEqual(@as(?ToolFormat, null), ToolFormat.of("{{ messages }}"));
 }

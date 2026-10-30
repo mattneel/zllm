@@ -7,7 +7,14 @@ import { type Cached, loadPlan, openCached, storePlan } from "./cache";
 import { Executor, type LoadProgress, planLimits, requestDevice } from "./gpu";
 import { ReasoningSplitter } from "./reasoning";
 import { fileSource, type ModelSource, urlSource } from "./source";
-import { argumentsValue, type Tool, type ToolCall, ToolCallSplitter } from "./tools";
+import {
+  argumentsValue,
+  isToolFormat,
+  type Tool,
+  type ToolCall,
+  ToolCallSplitter,
+  type ToolFormat,
+} from "./tools";
 
 /** First read of the model file for its header; doubled until it parses. */
 const HEADER_PREFIX = 8 << 20;
@@ -479,6 +486,12 @@ export class Engine {
     }
   }
 
+  /** How the model writes tool calls; null if its template offers none. */
+  #toolFormat(): ToolFormat | null {
+    const { tool_format: format } = this.stats().model;
+    return isToolFormat(format) ? format : null;
+  }
+
   stats(): Stats {
     this.#live();
     check(this.#x, this.#x.zllm_info());
@@ -682,7 +695,8 @@ export class Engine {
     yield chunk({ role: "assistant", content: "" }, null);
     const split = new ReasoningSplitter();
     // Content passes through the tool-call splitter when tools are offered.
-    const calls = offersTools(req) ? new ToolCallSplitter(req.tools ?? []) : null;
+    const format = offersTools(req) ? this.#toolFormat() : null;
+    const calls = format !== null ? new ToolCallSplitter(req.tools ?? [], format) : null;
     function* parts(
       deltas: Iterable<{ content?: string; reasoning_content?: string }>,
     ): Generator<ChatCompletionChunk> {
