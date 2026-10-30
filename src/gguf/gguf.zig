@@ -47,6 +47,15 @@ pub const TensorType = enum(u32) {
     tq1_0 = 34,
     tq2_0 = 35,
     mxfp4 = 39,
+    // The AgentionAI Gyro trellis formats (src/ref/gyro): 128 weights a block.
+    tq2_t = 144,
+    tqk6 = 145,
+    tqk7 = 146,
+    tqp5 = 147,
+    tqp6 = 148,
+    tqp7 = 149,
+    tqk5 = 150,
+    tqk4 = 151,
     _,
 
     pub const Layout = struct {
@@ -87,6 +96,14 @@ pub const TensorType = enum(u32) {
             .iq4_xs => .{ .block_elems = 256, .block_bytes = 136 },
             .tq1_0 => .{ .block_elems = 256, .block_bytes = 54 },
             .tq2_0 => .{ .block_elems = 256, .block_bytes = 66 },
+            .tq2_t => .{ .block_elems = 128, .block_bytes = 34 },
+            .tqk6 => .{ .block_elems = 128, .block_bytes = 26 },
+            .tqk7 => .{ .block_elems = 128, .block_bytes = 30 },
+            .tqp5 => .{ .block_elems = 128, .block_bytes = 42 },
+            .tqp6 => .{ .block_elems = 128, .block_bytes = 50 },
+            .tqp7 => .{ .block_elems = 128, .block_bytes = 58 },
+            .tqk5 => .{ .block_elems = 128, .block_bytes = 22 },
+            .tqk4 => .{ .block_elems = 128, .block_bytes = 18 },
             _ => null,
         };
     }

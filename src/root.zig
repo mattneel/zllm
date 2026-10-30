@@ -22,6 +22,7 @@ test {
     _ = @import("tokenizer/pretokenize.zig");
     _ = ref.ops;
     _ = ref.tensor;
+    _ = ref.gyro;
     _ = @import("ref/pool.zig");
     _ = ref.matmul;
     _ = gpu.cmd;

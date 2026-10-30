@@ -5,4 +5,5 @@ pub const ops = @import("ops.zig");
 pub const tensor = @import("tensor.zig");
 pub const matmul = @import("matmul.zig");
 pub const qwen35 = @import("qwen35.zig");
+pub const gyro = @import("gyro/gyro.zig");
 pub const Pool = @import("pool.zig").Pool;
