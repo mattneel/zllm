@@ -55,7 +55,10 @@ async function start(model: LoadOptions["model"], name: string): Promise<void> {
     window.zllmEngine = engine;
     const s = engine.stats();
     const from = { hit: "from the cache", filled: "and cached", off: "uncached" }[s.cache];
-    status.textContent = `${name} on ${s.adapter}, loaded in ${(s.loadMs / 1000).toFixed(1)} s (${from}).`;
+    const tuned = { cached: "tuning from the plan cache", swept: "tuned", off: "untuned" }[
+      s.tuning
+    ];
+    status.textContent = `${name} on ${s.adapter}, loaded in ${(s.loadMs / 1000).toFixed(1)} s (${from}; ${tuned}).`;
     progress.hidden = true;
     form.hidden = false;
     promptBox.focus();

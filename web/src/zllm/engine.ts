@@ -3,7 +3,7 @@
 // its events into async iterables.
 
 import { Event, type Exports, FINISH, type FinishReason, NEED_MORE, Out } from "./abi";
-import { type Cached, openCached } from "./cache";
+import { type Cached, loadPlan, openCached, storePlan } from "./cache";
 import { Executor, type LoadProgress, planLimits, requestDevice } from "./gpu";
 import { fileSource, type ModelSource, urlSource } from "./source";
 import { argumentsValue, type Tool, type ToolCall, ToolCallSplitter } from "./tools";
@@ -27,6 +27,11 @@ export interface LoadOptions {
   cache?: boolean;
   /** An existing device; by default the high-performance adapter's. */
   device?: GPUDevice;
+  /**
+   * Tune the decode multiplies for this GPU at load (default true), unless
+   * the plan cache holds the tuning for this GPU, browser, model and build.
+   */
+  tune?: boolean;
   onProgress?: (p: LoadProgress) => void;
 }
 
@@ -230,6 +235,8 @@ export interface Stats {
   loadMs: number;
   /** Where the weights came from: the cache, the network while filling it, or uncached. */
   cache: "hit" | "filled" | "off";
+  /** Where the decode multiplies' tuning came from: the plan cache, a sweep at this load, or none. */
+  tuning: "cached" | "swept" | "off";
   /** The last request's usage. */
   last: Usage | null;
 }
@@ -286,16 +293,32 @@ async function loadFrom(source: ModelSource, opts: LoadOptions): Promise<Engine>
     : await requestDevice();
   const exec = new Executor(device, x.memory, source);
   exec.onProgress = opts.onProgress ?? null;
-  callJson(x, x.zllm_load, {
+  const info = device.adapterInfo;
+  const tune = opts.tune ?? true;
+  const options = {
     context: opts.context ?? 8192,
     kv: opts.kv ?? "f16",
     ...planLimits(device),
-  });
+    adapter: [info.vendor, info.architecture, info.device, info.description],
+    runtime: navigator.userAgent,
+    tune,
+  };
+  callJson(x, x.zllm_plan_key, options);
+  const key = outText(x);
+  const plan = tune ? await loadPlan(key) : null;
+  callJson(x, x.zllm_load, { ...options, plan });
   const engine = new Engine(x, exec, adapter);
-  // The setup batch (buffers, weights, pipelines) and calibration.
+  // The setup batch (buffers, weights, pipelines), the tuning sweep, the
+  // step program and calibration.
   for await (const _ of engine.drive()) {
     // Loading emits no tokens.
   }
+  check(x, x.zllm_plan());
+  const swept = outText(x);
+  if (swept !== "") {
+    await storePlan(key, swept);
+  }
+  engine.tuning = !tune ? "off" : swept !== "" ? "swept" : "cached";
   // File reads after loading are per-token rows (a Qwen3.8-Flash-Next
   // model's per-layer embeddings), not load progress.
   exec.onProgress = null;
@@ -331,6 +354,7 @@ export class Engine {
   readonly #inFlight: Promise<number>[] = [];
   loadMs = 0;
   cache: Stats["cache"] = "off";
+  tuning: Stats["tuning"] = "off";
 
   readonly chat = {
     completions: {
@@ -418,6 +442,7 @@ export class Engine {
       model: JSON.parse(info),
       loadMs: this.loadMs,
       cache: this.cache,
+      tuning: this.tuning,
       last: this.#last,
     };
   }
@@ -847,6 +872,12 @@ function check(x: Exports, r: number): void {
   throw new Error(
     `zllm: ${readText(x, out.getUint32(Out.ptr, true), out.getUint32(Out.len, true))}`,
   );
+}
+
+/** The text an export left at `Out.ptr`, `Out.len`. */
+function outText(x: Exports): string {
+  const out = new DataView(x.memory.buffer, x.zllm_out());
+  return readText(x, out.getUint32(Out.ptr, true), out.getUint32(Out.len, true));
 }
 
 function readText(x: Exports, ptr: number, len: number): string {

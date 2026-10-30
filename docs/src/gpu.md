@@ -170,6 +170,13 @@ under another key, or one naming an unknown variant or type, is ignored, and
 the sweep's result replaces it. On the Gyro-Coder the cached load skips
 2.5 s of tuning and decodes as fast, with the same output.
 
+The browser tunes at load too, through the same sweep, between the
+weights and the step program. The shim gets the key from the core
+(`zllm_plan_key`, with the adapter's strings from `GPUDevice.adapterInfo`
+and the browser's user agent as the runtime) and keeps the file in the
+origin private file system, under `zllm/plans/`. In Chrome the Gyro-Coder's
+sweep adds 8 s to its first load and none to later ones.
+
 ## Step program
 
 `src/plan/qwen35.zig` builds everything a step needs once, as the spec's

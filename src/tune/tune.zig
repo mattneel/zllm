@@ -130,7 +130,7 @@ pub const Sweep = struct {
         s.out = .{ .buffer = try s.rec.createBuffer(gpa, out_bytes, .{ .storage = true, .copy_src = true }), .size = out_bytes };
         s.params = .{ .buffer = try s.rec.createBuffer(gpa, @sizeOf(P.MatvecBf16), .{ .uniform = true, .copy_dst = true }), .size = @sizeOf(P.MatvecBf16) };
         // Deterministic inputs of RMS about 1, as normed activations are.
-        const xs = try arena.alloc(f32, x_count);
+        const xs = try arena.alloc(f32, @intCast(x_count));
         for (xs, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.7);
         try s.rec.writeBuffer(gpa, s.x.buffer, 0, std.mem.sliceAsBytes(xs));
         return s;

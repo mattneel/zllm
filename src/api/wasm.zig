@@ -3,14 +3,17 @@
 //! only the GGUF header and hands back command batches.
 //!
 //!     zllm_open(header)      parse the header (asks for a longer prefix)
+//!     zllm_plan_key(options) the plan cache's key for this load
 //!     zllm_load(options)     build the model, the step program, the engine
+//!     zllm_plan()            after loading: the tuning to cache, if it swept
 //!     zllm_next()            submit | token | done | idle | wait
 //!     zllm_complete(ms)      the oldest batch the shim has executed
 //!     zllm_start(request)    a generation request (raw text, ids or chat)
 //!
 //! Loading runs through `zllm_next` too: the setup batch (buffers, weights,
-//! pipelines), then the engine's calibration batches, then idle; each is
-//! completed before the next. During a request the shim may keep up to two
+//! pipelines), the decode multiplies' tuning sweep (unless the options carry
+//! the plan cache's tuning), the step program's batch, then the engine's
+//! calibration batches, then idle; each is completed before the next. During a request the shim may keep up to two
 //! batches in flight: after `submit` it calls `zllm_next` again, and on
 //! `wait` it completes its oldest batch (see sched.zig). Results
 //! land in one block (`Out`, at `zllm_out()`); any negative return leaves
@@ -126,14 +129,52 @@ const LoadOptions = struct {
     kv: plan_common.KvFormat = .f16,
     max_binding: u64,
     offset_align: u32,
+    /// The adapter's vendor, architecture, device and description, and the
+    /// browser (its user agent): what the plan cache's key covers besides
+    /// the model and the build.
+    adapter: []const []const u8 = &.{},
+    runtime: []const u8 = "",
+    /// Tune the decode multiplies at load, unless `plan` holds the tuning.
+    tune: bool = true,
+    /// The plan cache's file for this load's key (zllm_plan_key), if any.
+    plan: ?[]const u8 = null,
 };
+
+fn planKey(h: anytype, o: LoadOptions) plan.cache.Key {
+    return plan.cache.key(.{
+        .adapter = o.adapter,
+        .runtime = o.runtime,
+        .limits = &.{ o.max_binding, o.offset_align },
+        .model_header = h.bytes[0..@min(h.bytes.len, @as(usize, @intCast(h.file.data_offset)))],
+    });
+}
+
+/// The plan cache's key for a load with these options, as hex.
+export fn zllm_plan_key(ptr: [*]const u8, len: usize) i32 {
+    const h = header orelse return fail("plan key", error.NotOpen);
+    const opts = std.json.parseFromSlice(LoadOptions, gpa, ptr[0..len], .{ .ignore_unknown_fields = true }) catch |err| return fail("load options", err);
+    defer opts.deinit();
+    const k = planKey(h, opts.value);
+    message.clearRetainingCapacity();
+    message.print(gpa, "{x}", .{&k}) catch |err| return fail("plan key", err);
+    setText(message.items);
+    return 0;
+}
+
+/// After loading: the plan cache's file for this load, if it swept (empty
+/// text if the tuning came from the cache or was skipped).
+export fn zllm_plan() i32 {
+    const rt = runtime orelse return fail("plan", error.NotLoaded);
+    setText(rt.plan_file.items);
+    return 0;
+}
 
 export fn zllm_load(ptr: [*]const u8, len: usize) i32 {
     if (runtime != null) return fail("load", error.AlreadyLoaded);
     const h = header orelse return fail("load", error.NotOpen);
     const opts = std.json.parseFromSlice(LoadOptions, gpa, ptr[0..len], .{ .ignore_unknown_fields = true }) catch |err| return fail("load options", err);
     defer opts.deinit();
-    runtime = Runtime.create(h.file, opts.value) catch |err| return fail("load", err);
+    runtime = Runtime.create(h.file, opts.value, planKey(h, opts.value)) catch |err| return fail("load", err);
     return 0;
 }
 
@@ -156,7 +197,7 @@ export fn zllm_start(ptr: [*]const u8, len: usize) i32 {
 }
 
 export fn zllm_cancel() void {
-    if (runtime) |rt| rt.engine.cancel();
+    if (runtime) |rt| if (rt.phase == .ready) rt.engine.cancel();
 }
 
 export fn zllm_tokenize(ptr: [*]const u8, len: usize) i32 {
@@ -178,6 +219,7 @@ export fn zllm_detokenize(ptr: [*]const u32, count: usize) i32 {
 
 export fn zllm_info() i32 {
     const rt = runtime orelse return fail("info", error.NotLoaded);
+    if (rt.phase != .ready) return fail("info", error.Loading);
     const p = &rt.program;
     rt.text.clearRetainingCapacity();
     rt.text.print(gpa, "{f}", .{std.json.fmt(.{
@@ -247,6 +289,18 @@ const Runtime = struct {
     engine: sched.Engine,
     setup: zllm.gpu.cmd.Recorder = .{},
     phase: Phase = .setup,
+    /// What the step program is built from, once tuning is settled.
+    limits: plan_common.Limits,
+    config: plan.Config,
+    /// The tuning sweep, while it runs (`tune` phase). Its batches come from
+    /// `setup` too: one recorder for every object the load creates, so ids
+    /// never repeat.
+    sweep: ?zllm.tune.Sweep = null,
+    /// Sweep after the setup batch (no usable plan in the options).
+    will_sweep: bool = false,
+    plan_key: plan.cache.Key,
+    /// The plan cache's file for what the sweep found (zllm_plan).
+    plan_file: std.ArrayList(u8) = .empty,
     /// A setup or calibration batch is out for execution.
     pending: bool = false,
     /// A request is running.
@@ -256,11 +310,11 @@ const Runtime = struct {
     ids: std.ArrayList(u32) = .empty,
     text: std.ArrayList(u8) = .empty,
 
-    /// Setup batch, the engine's calibration batches, then ready for
-    /// requests.
-    const Phase = enum { setup, calibrate, ready };
+    /// The setup batch, the tuning sweep's batches, the step program's
+    /// batch, the engine's calibration batches, then ready for requests.
+    const Phase = enum { setup, tune, program, calibrate, ready };
 
-    fn create(file: zllm.gguf.File, o: LoadOptions) !*Runtime {
+    fn create(file: zllm.gguf.File, o: LoadOptions, key: plan.cache.Key) !*Runtime {
         const rt = try gpa.create(Runtime);
         errdefer gpa.destroy(rt);
         rt.* = .{
@@ -272,26 +326,28 @@ const Runtime = struct {
             .model = undefined,
             .program = undefined,
             .engine = undefined,
+            .limits = .{ .max_binding = o.max_binding, .offset_align = o.offset_align },
+            .config = .{ .context = o.context, .kv = o.kv },
+            .plan_key = key,
         };
         const arena = rt.arena_state.allocator();
-        const limits: plan_common.Limits = .{ .max_binding = o.max_binding, .offset_align = o.offset_align };
         rt.set = try .create(gpa, arena, &rt.setup);
-        rt.model = try plan.Model.upload(arena, gpa, &rt.setup, &rt.set, file, limits);
-        rt.program = try plan.Program.build(arena, gpa, &rt.setup, &rt.set, &rt.model, .{
-            .context = o.context,
-            .kv = o.kv,
-            .mtp = rt.model.canSpeculate(limits),
-        }, limits);
+        rt.model = try plan.Model.upload(arena, gpa, &rt.setup, &rt.set, file, rt.limits);
+        rt.config.mtp = rt.model.canSpeculate(rt.limits);
         try rt.setup.submit(gpa, 0);
-        rt.engine = try .init(gpa, &rt.program, &rt.tok);
+        // The cached tuning, if it is this load's; else a sweep, if asked.
+        const cached = if (o.plan) |bytes| plan.cache.parse(arena, bytes, key) else null;
+        if (cached) |t| rt.config.tuning = t;
+        rt.will_sweep = o.tune and cached == null;
         if (rt.tok.ids.get("<|im_end|>")) |id| try rt.stop_tokens.append(gpa, id);
         if (rt.tok.eos) |id| if (std.mem.indexOfScalar(u32, rt.stop_tokens.items, id) == null) try rt.stop_tokens.append(gpa, id);
         return rt;
     }
 
     fn destroy(rt: *Runtime) void {
-        rt.engine.deinit();
+        if (@backingInt(rt.phase) >= @backingInt(Phase.calibrate)) rt.engine.deinit();
         rt.setup.deinit(gpa);
+        rt.plan_file.deinit(gpa);
         rt.stop_tokens.deinit(gpa);
         rt.ids.deinit(gpa);
         rt.text.deinit(gpa);
@@ -312,6 +368,14 @@ const Runtime = struct {
         if (rt.phase != .ready and rt.pending) return .wait;
         switch (rt.phase) {
             .setup => return rt.submit(rt.setup.batch()),
+            .tune => if (try rt.sweep.?.next()) |words| return rt.submit(words) else {
+                // Done: the winners, and the plan cache's file for them.
+                rt.config.tuning = rt.sweep.?.tuning();
+                try plan.cache.serialize(gpa, rt.plan_key, rt.config.tuning, &rt.plan_file);
+                rt.sweep = null;
+                return rt.buildProgram();
+            },
+            .program => return rt.buildProgram(),
             .calibrate => if (try rt.engine.calibration()) |words| return rt.submit(words) else {
                 rt.phase = .ready;
             },
@@ -354,13 +418,33 @@ const Runtime = struct {
         rt.pending = false;
         switch (rt.phase) {
             .setup => {
-                rt.setup.deinit(gpa);
-                rt.setup = .{};
+                rt.setup.clear();
+                if (rt.will_sweep) {
+                    // Decoding mostly runs steps of two where it speculates.
+                    const tokens: u32 = if (rt.config.mtp and rt.model.speculationPays()) 2 else 1;
+                    rt.sweep = try zllm.tune.Sweep.init(gpa, rt.arena_state.allocator(), &rt.setup, &rt.set, &rt.model, .{}, tokens);
+                    rt.phase = .tune;
+                } else {
+                    rt.phase = .program;
+                }
+            },
+            .tune => try rt.sweep.?.done(elapsed_ns),
+            .program => {
+                rt.setup.clear();
+                rt.engine = try .init(gpa, &rt.program, &rt.tok);
                 rt.phase = .calibrate;
             },
             .calibrate => rt.engine.calibrated(elapsed_ns),
             .ready => unreachable,
         }
+    }
+
+    /// Records the step program's batch, with the settled tuning.
+    fn buildProgram(rt: *Runtime) !Event {
+        rt.program = try plan.Program.build(rt.arena_state.allocator(), gpa, &rt.setup, &rt.set, &rt.model, rt.config, rt.limits);
+        try rt.setup.submit(gpa, 0);
+        rt.phase = .program;
+        return rt.submit(rt.setup.batch());
     }
 
     fn start(rt: *Runtime, json: []const u8) !void {

@@ -176,3 +176,40 @@ export async function clearCache(): Promise<void> {
   const root = await navigator.storage.getDirectory();
   await root.removeEntry(DIR, { recursive: true }).catch(() => undefined);
 }
+
+// The plan cache (src/plan/cache.zig): what load-time tuning found for a
+// GPU, browser, model and build, under zllm/plans/<key>.json. The key is
+// the core's; a file under another key is never read.
+
+async function planDir(): Promise<FileSystemDirectoryHandle | null> {
+  const dir = await cacheDir();
+  return dir === null ? null : dir.getDirectoryHandle("plans", { create: true });
+}
+
+/** The plan cache's file for `key`, or null. */
+export async function loadPlan(key: string): Promise<string | null> {
+  try {
+    const dir = await planDir();
+    if (dir === null) {
+      return null;
+    }
+    return await (await (await dir.getFileHandle(`${key}.json`)).getFile()).text();
+  } catch {
+    return null;
+  }
+}
+
+/** Stores the plan cache's file for `key`; a failure only costs a later sweep. */
+export async function storePlan(key: string, text: string): Promise<void> {
+  try {
+    const dir = await planDir();
+    if (dir === null) {
+      return;
+    }
+    const w = await (await dir.getFileHandle(`${key}.json`, { create: true })).createWritable();
+    await w.write(text);
+    await w.close();
+  } catch {
+    // Quota or storage access: tune again next time.
+  }
+}

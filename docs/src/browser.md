@@ -138,6 +138,17 @@ The cached load's output was identical to the native host's after each of:
 a fill, a reload, a changed file (refilled, one entry left), and a fill
 interrupted halfway.
 
+### Tuning and the plan cache
+
+Loading tunes the decode multiplies for the GPU as the native CLI does
+([GPU backend](gpu.md#tuning)), unless the plan cache holds the tuning for
+this GPU, browser, model and build: the core computes the key, and the shim
+keeps the cache's files in OPFS under `zllm/plans/` and passes the one for
+the key to the load. `tune: false` skips tuning, and `stats().tuning` says
+where it came from (`cached`, `swept` or `off`). In Chrome the Gyro-Coder's
+first load sweeps for 8 s (29.4 s in all); later loads read the tuning from
+the cache (21.8 s).
+
 ### Two steps in flight
 
 A mapped readback in Chrome resolves about 3 ms after its submit, even on

@@ -13,8 +13,12 @@ export interface Exports {
    * the allocation: `NEED_MORE` asks for a longer prefix of the file.
    */
   zllm_open(ptr: number, len: number): number;
+  /** The plan cache's key (hex at `Out.ptr`, `Out.len`) for JSON `LoadOptions` at `ptr`. */
+  zllm_plan_key(ptr: number, len: number): number;
   /** Builds the model and step program from a JSON `LoadOptions` at `ptr`. */
   zllm_load(ptr: number, len: number): number;
+  /** After loading: the plan cache's file for what tuning found (`Out.ptr`, `Out.len`), empty if none. */
+  zllm_plan(): number;
   /** Advances the engine: one of `Event`, or a negative error. */
   zllm_next(): number;
   /** Reports that the oldest batch in flight finished after `ms` GPU milliseconds. */
