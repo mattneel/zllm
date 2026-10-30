@@ -37,10 +37,13 @@ zig build gpu-check          # every GPU kernel vs a CPU computation
 zig build check-gpu          # GPU forward pass vs the CPU reference, step splits, engine
 zig build check-dequant      # CPU dequantization vs ggml, bit for bit
 zig build check-quant        # the quantized 27B: GPU vs reference vs llama.cpp
+zig build check-gyro -Dgyro-model=<gguf>   # the Gyro-Coder: GPU vs reference vs its runtime
 ```
 
-Add `-Dgpu-host=d3d12` to either GPU check to run it on the Windows D3D12
-host from WSL; see [GPU backend](gpu.md).
+Add `-Dgpu-host=d3d12` to any GPU check (`gpu-check`, `check-gpu`,
+`check-quant`, `check-gyro`) to run it on the Windows D3D12 host from WSL;
+see [GPU backend](gpu.md). The host is the checks' one parameter: a new
+backend adds a value, and every gate runs on it unchanged.
 
 The checks need [uv](https://docs.astral.sh/uv/). It runs the harness in
 `tools/` from its lockfile. `-Dfixtures=<dir>` points the checks at another
@@ -482,7 +485,22 @@ greedy tokens.
 | `zllm generate`, greedy, on the same prompt, tuned and untuned | the reference runtime's 40 tokens; the text is identical |
 | `zllm engine-check` | every reuse scenario bitwise identical to a fresh run (one kernel path, so the cross-path cases too), and the asynchronous stop, the cancellations and logprobs pass; no speculation (no MTP block) |
 
-The last row is the reference runtime's own rounding: it computes its
+`zig build check-gyro -Dgyro-model=<gguf>` runs the GPU rows of this table
+on the selected host. The prompts and greedy tokens are the reference
+runtime's, kept in `tools/corpus/gyro_*.json`. It requires:
+
+- the same experts as the CPU reference in every layer and position;
+- streams within 1e-3 relative L2, and logits within 1e-4 (median) and 1e-3
+  (max);
+- every position's top-1 agreeing, which makes the greedy tokens the
+  runtime's 40;
+- one-token and four-token steps bitwise identical;
+- the long prompt's 10 tokens through `generate`.
+
+The bounds leave room for another backend's summation order, but not for a
+wrong kernel: a routing flip moves a row by about 1e-2.
+
+The row against the runtime's dumps reflects the runtime's own rounding: it computes its
 multiplies from activations rounded to 8-bit blocks, and through 48 layers
 of hyper-connected streams the difference grows, as it did for the 27B
 before the reference learned that rounding ([The 27B](#the-27b)). The

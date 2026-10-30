@@ -64,6 +64,9 @@ pub fn build(b: *std.Build) void {
     gpu_run.addArgs(&.{ "--host", @tagName(gpu_host) });
     const quant_run = addCheck(b, check_exe, fixtures, "check-quant", "Compare the GPU forward pass on the quantized 27B with llama.cpp", "check_quant.py");
     quant_run.addArgs(&.{ "--host", @tagName(gpu_host) });
+    // The Gyro-Coder is read in place (75.8 GB): its path is an option.
+    const gyro_run = addCheck(b, check_exe, fixtures, "check-gyro", "Compare the Qwen3.8-Flash-Next Gyro-Coder on the GPU with the CPU reference and its runtime's greedy tokens", "check_gyro.py");
+    gyro_run.addArgs(&.{ "--host", @tagName(gpu_host), "--model", b.option([]const u8, "gyro-model", "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf for check-gyro") orelse "" });
 
     const kernel_step = b.step("gpu-check", "Check every GPU kernel against a CPU computation");
     switch (gpu_host) {
