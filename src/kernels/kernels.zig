@@ -44,6 +44,7 @@ pub const Kernel = enum {
     sample,
     draft,
     gyro_matvec,
+    moe_logits,
     moe_route,
     rotate128,
     moe_combine,

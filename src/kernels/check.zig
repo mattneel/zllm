@@ -1374,9 +1374,9 @@ fn checkGyroMatvec(c: *Ctx) !Result {
     return .{ .name = "gyro_matvec tq2_t (routed, gate+up, down)", .err = worst, .tolerance = 1e-5 };
 }
 
-/// Routing for 3 tokens over 256 experts, the model's top 10: softmax of
-/// router · x, the 10 largest (ids exact), their normalized weights, and the
-/// shared gate's logit.
+/// Routing for 3 tokens over 256 experts, the model's top 10, through
+/// moe_logits and moe_route: softmax of router · x, the 10 largest (ids
+/// exact), their normalized weights, and the shared gate's logit.
 fn checkMoeRoute(c: *Ctx) !Result {
     const n_expert = 256;
     const used = 10;
@@ -1388,9 +1388,11 @@ fn checkMoeRoute(c: *Ctx) !Result {
     const ids = try c.output(tokens * used);
     const weights = try c.output(tokens * used);
     const logit = try c.output(tokens);
-    try c.launcher().launch(.moe_route, P.MoeRoute{ .n_expert = n_expert, .n_used = used, .cols = cols, .x_stride = cols }, &.{
-        try c.upload(router), try c.upload(shared), try c.upload(x), ids, weights, logit,
-    }, .{ tokens, 1, 1 });
+    const logits = try c.output(tokens * (n_expert + 1));
+    const params: P.MoeRoute = .{ .n_expert = n_expert, .n_used = used, .cols = cols, .x_stride = cols };
+    const l = c.launcher();
+    try l.launch(.moe_logits, params, &.{ try c.upload(router), try c.upload(shared), try c.upload(x), logits }, .{ (n_expert + 1 + 7) / 8, tokens, 1 });
+    try l.launch(.moe_route, params, &.{ logits, ids, weights, logit }, .{ tokens, 1, 1 });
     const got_ids = try c.readWords(ids);
     const got_w = try c.read(weights);
     const got_l = try c.read(logit);

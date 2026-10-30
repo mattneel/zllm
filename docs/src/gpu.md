@@ -111,7 +111,7 @@ unit decodes from one load (128 bytes per block).
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling). One more phase undoes the last draw's output count (a rejected speculative round's second sample) |
 | `draft` | The speculative draft: the first index of the maximum of a row of logits, into the next step's token input | One workgroup |
 | `gyro_matvec` | Routed-expert products on Gyro TQ2_T weights (Gyro-Coder) | Lifted from gyro-dx: the expert comes from a GPU buffer the router wrote, no readback; a lane per trellis step decodes four weights from the 2,048-pair codebook; gate and up in one dispatch |
-| `moe_route` | Expert routing, a token per workgroup: router · x (f32), softmax, top-k (ties to the lower index), normalized weights; and the shared expert's gate logit | Router rows read coalesced, a lane group per row |
+| `moe_logits`, `moe_route` | Expert routing: router · x (f32) and the shared expert's gate logit, then a token per workgroup: softmax, top-k (ties to the lower index), normalized weights | Router rows read coalesced, a lane group per row, 8 rows per workgroup. Computed in `moe_route`'s one workgroup per token, the product took 1.08 ms a layer, 52 of the 87 ms of a decode step |
 | `rotate128` | H₁₂₈ · (signs · x) per 128-value block: the basis Gyro expert weights are stored in. Optionally of silu(gate) · up | 64 butterflies a stage in workgroup memory |
 | `moe_combine` | The expert block's output: the routed experts' weighted sum plus the gated shared expert | |
 | `hc_act`, `hc_mix`, `hc_combine` | The hyper-connection mixer around Q8_0 down, up and inject products: silu(lo / hc); the streams' gated mean into a block's input; a block's output added to each stream, weighted 2·sigmoid(inject / hc) | The streams' norms are `rmsnorm` with a weight row per stream |
@@ -273,10 +273,10 @@ computes the same thing.
 - **A layer:** the four streams' norms and the low-rank mix into the
   block's input (`hc_act`, `hc_mix`), the mixer (DeltaNet with a sigmoid
   gate, or attention with `attn_split_wide`), `hc_combine` back into the
-  streams; again for the experts: `moe_route`, `rotate128`, the gate and up
+  streams; again for the experts: `moe_logits`, `moe_route`, `rotate128`, the gate and up
   experts, `rotate128` of their SiLU pair, the down experts, the shared
   expert, `moe_combine`, `hc_combine`.
 
 On the RTX 5090 Laptop, `zllm generate` loads it warm in 16 to 20 s
-(weights 11 to 14 s, tuning 5 s), prefills at 27 tok/s and decodes at 11 to
-13 tok/s, one step per batch.
+(weights 11 to 14 s, tuning 5 s), prefills at 56 tok/s and decodes at 29
+tok/s, one step per batch.

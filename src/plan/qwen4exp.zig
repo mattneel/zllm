@@ -398,6 +398,7 @@ pub const Program = struct {
         const ids = try a.storage(cap * used);
         const weights = try a.storage(cap * used);
         const shared_logit = try a.storage(cap);
+        const route_logits = try a.storage(cap * (@as(u64, hp.n_expert) + 1));
         const xh = try a.storage(cap * e);
         const gu = try a.storage(cap * used * 2 * ff);
         const act = try a.storage(cap * used * ff);
@@ -574,7 +575,9 @@ pub const Program = struct {
 
             // The experts.
             try Mix.build(&body, &b, mm, arena, &layer.hc_ffn, hp, bufs);
-            try body.append(arena, .{ .launch = try b.add(.moe_route, P.MoeRoute{ .n_expert = hp.n_expert, .n_used = hp.n_expert_used, .cols = hp.n_embd, .x_stride = hp.n_embd, .scale = hp.expert_weights_scale }, &.{ layer.router, layer.shared_gate, cur, ids, weights, shared_logit }, .rows_x) });
+            const route: P.MoeRoute = .{ .n_expert = hp.n_expert, .n_used = hp.n_expert_used, .cols = hp.n_embd, .x_stride = hp.n_embd, .scale = hp.expert_weights_scale };
+            try body.append(arena, .{ .launch = try b.add(.moe_logits, route, &.{ layer.router, layer.shared_gate, cur, route_logits }, .{ .rows_y = std.math.divCeil(u32, hp.n_expert + 1, 8) catch unreachable }) });
+            try body.append(arena, .{ .launch = try b.add(.moe_route, route, &.{ route_logits, ids, weights, shared_logit }, .rows_x) });
             re.* = body.items.len;
             try body.append(arena, .{ .launch = try b.add(.rotate128, P.Rotate128{ .width = hp.n_embd, .x_stride = hp.n_embd, .y_stride = hp.n_embd }, &.{ cur, m.signs_embd, xh }, .{ .rows_y = hp.n_embd / 128 }) });
             try body.append(arena, .{ .launch = try b.add(.gyro_matvec, P.GyroMatvec{
