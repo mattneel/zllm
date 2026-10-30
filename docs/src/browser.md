@@ -149,6 +149,17 @@ where it came from (`cached`, `swept` or `off`). In Chrome the Gyro-Coder's
 first load sweeps for 8 s (29.4 s in all); later loads read the tuning from
 the cache (21.8 s).
 
+### Device lost
+
+A request in flight when the device is lost (a driver reset, a GPU hang,
+`engine.device.destroy()`) fails with `DeviceLostError`. The next request
+first loads the model again on a new device of the engine's own, from the
+same source, with the tuning from the plan cache, and then runs; the
+resident sequence is gone. `stats().recoveries` counts the rebuilds. In
+Chrome, with the 0.8B, a device destroyed in the middle of a request fails
+it with `DeviceLostError`, and the next greedy request gives the same tokens
+as before the loss; so does one after a loss between requests.
+
 ### Two steps in flight
 
 A mapped readback in Chrome resolves about 3 ms after its submit, even on

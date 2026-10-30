@@ -164,8 +164,8 @@ no resident sequence (`Runtime.recover`). `zllm chat` reports it and takes
 the message again. On the RTX 5090 Laptop the 0.8B rebuilds in 2.2 s.
 `engine-check` forces a loss through Dawn's `wgpuDeviceForceLoss` and checks
 the typed error, a rebuild from the plan cache, and the same prompt's
-tokens and logits, bitwise, after it. The browser shim does not rebuild yet:
-it reports the loss as an error.
+tokens and logits, bitwise, after it. The browser does the same
+([Browser](browser.md#device-lost)).
 
 ### Plan cache
 

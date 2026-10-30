@@ -239,6 +239,8 @@ export interface Stats {
   tuning: "cached" | "swept" | "off";
   /** The last request's usage. */
   last: Usage | null;
+  /** Rebuilds after a lost device. */
+  recoveries: number;
 }
 
 export async function load(opts: LoadOptions): Promise<Engine> {
@@ -307,7 +309,10 @@ async function loadFrom(source: ModelSource, opts: LoadOptions): Promise<Engine>
   const key = outText(x);
   const plan = tune ? await loadPlan(key) : null;
   callJson(x, x.zllm_load, { ...options, plan });
-  const engine = new Engine(x, exec, adapter);
+  // After a lost device: the same source and options on a new device of
+  // the engine's own (an app's device is gone with the loss).
+  const { device: _lost, ...rest } = opts;
+  const engine = new Engine(x, exec, adapter, () => loadFrom(source, rest));
   // The setup batch (buffers, weights, pipelines), the tuning sweep, the
   // step program and calibration.
   for await (const _ of engine.drive()) {
@@ -339,9 +344,13 @@ async function openSource(model: LoadOptions["model"]): Promise<ModelSource> {
 }
 
 export class Engine {
-  readonly #x: Exports;
-  readonly #exec: Executor;
-  readonly #adapter: string;
+  #x: Exports;
+  #exec: Executor;
+  #adapter: string;
+  /** Loads the model again on a new device (after a lost one). */
+  readonly #rebuild: () => Promise<Engine>;
+  #recovering: Promise<void> | null = null;
+  #recoveries = 0;
   /** Requests run one at a time; each waits for the previous. */
   #queue: Promise<unknown> = Promise.resolve();
   #last: Usage | null = null;
@@ -366,10 +375,38 @@ export class Engine {
     },
   };
 
-  constructor(x: Exports, exec: Executor, adapter: string) {
+  constructor(x: Exports, exec: Executor, adapter: string, rebuild: () => Promise<Engine>) {
     this.#x = x;
     this.#exec = exec;
     this.#adapter = adapter;
+    this.#rebuild = rebuild;
+  }
+
+  /** The GPU device the engine runs on (a new one after a rebuild). */
+  get device(): GPUDevice {
+    return this.#exec.device;
+  }
+
+  /**
+   * After a lost device (spec 8): the model loaded again on a new device,
+   * its tuning from the plan cache, and this engine switched over to it.
+   * The resident sequence is gone. Runs once however many requests wait.
+   */
+  async #recover(): Promise<void> {
+    this.#recovering ??= (async () => {
+      const fresh = await this.#rebuild();
+      this.#x = fresh.#x;
+      this.#exec = fresh.#exec;
+      this.#adapter = fresh.#adapter;
+      this.#inFlight.length = 0;
+      this.tuning = fresh.tuning;
+      this.#recoveries += 1;
+    })();
+    try {
+      await this.#recovering;
+    } finally {
+      this.#recovering = null;
+    }
   }
 
   /** Continues `prompt` (or `tokens`), streaming each sampled token. */
@@ -444,6 +481,7 @@ export class Engine {
       cache: this.cache,
       tuning: this.tuning,
       last: this.#last,
+      recoveries: this.#recoveries,
     };
   }
 
@@ -543,6 +581,10 @@ export class Engine {
     await previous.catch(() => undefined);
     const onAbort = (): void => this.interruptGenerate();
     try {
+      // A lost device is rebuilt before the next request runs.
+      if (this.#exec.lost) {
+        await this.#recover();
+      }
       signal?.throwIfAborted();
       signal?.addEventListener("abort", onAbort);
       body.seed ??= Math.floor(Math.random() * 2 ** 53);
@@ -554,8 +596,9 @@ export class Engine {
           yield chunk;
         }
       } finally {
-        // A consumer that stops early cancels; the engine still runs to idle.
-        if (!finished) {
+        // A consumer that stops early cancels; the engine still runs to idle
+        // (unless the device is lost: the request fails with DeviceLostError).
+        if (!finished && !this.#exec.lost) {
           this.#x.zllm_cancel();
           for await (const _ of this.drive()) {
             // Drain to the abort.

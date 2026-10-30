@@ -61,6 +61,11 @@ export function planLimits(device: GPUDevice): PlanLimits {
   };
 }
 
+/** The GPU device was lost (a driver reset, a hang, `destroy()`): the request in flight fails with it. */
+export class DeviceLostError extends Error {
+  override name = "DeviceLostError";
+}
+
 export class Executor {
   readonly #device: GPUDevice;
   readonly #memory: WebAssembly.Memory;
@@ -296,18 +301,29 @@ export class Executor {
       reads.length === 0
         ? this.#device.queue.onSubmittedWorkDone()
         : Promise.all(reads.map((r) => r.staging.mapAsync(MAP_READ, 0, r.size)));
-    const done = finished.then(() => {
-      const t1 = performance.now();
-      const elapsed = t1 - Math.max(t0, this.#lastDone);
-      this.#lastDone = t1;
-      for (const r of reads) {
-        const src = new Uint8Array(r.staging.getMappedRange(0, r.size));
-        new Uint8Array(this.#memory.buffer, r.dst, r.size).set(src);
-        r.staging.unmap();
-        r.staging.destroy();
-      }
-      return elapsed;
-    });
+    const done = finished
+      .catch((e: unknown) => {
+        // Nothing unmaps or destroys a staging buffer before its map resolves,
+        // so an aborted map means the device was lost.
+        if (this.#lost !== null || (e instanceof DOMException && e.name === "AbortError")) {
+          throw new DeviceLostError(
+            `WebGPU device lost: ${this.#lost ?? (e instanceof Error ? e.message : String(e))}`,
+          );
+        }
+        throw e;
+      })
+      .then(() => {
+        const t1 = performance.now();
+        const elapsed = t1 - Math.max(t0, this.#lastDone);
+        this.#lastDone = t1;
+        for (const r of reads) {
+          const src = new Uint8Array(r.staging.getMappedRange(0, r.size));
+          new Uint8Array(this.#memory.buffer, r.dst, r.size).set(src);
+          r.staging.unmap();
+          r.staging.destroy();
+        }
+        return elapsed;
+      });
     return { done };
   }
 
@@ -362,9 +378,18 @@ export class Executor {
     this.#pass = null;
   }
 
+  get device(): GPUDevice {
+    return this.#device;
+  }
+
+  /** Whether the device is lost. */
+  get lost(): boolean {
+    return this.#lost !== null;
+  }
+
   #check(): void {
     if (this.#lost !== null) {
-      throw new Error(`WebGPU device lost: ${this.#lost}`);
+      throw new DeviceLostError(`WebGPU device lost: ${this.#lost}`);
     }
     if (this.#error !== null) {
       const e = this.#error;

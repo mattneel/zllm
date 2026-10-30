@@ -24,6 +24,6 @@ export {
   type TokenLogprob,
   type Usage,
 } from "./engine";
-export type { LoadProgress } from "./gpu";
+export { DeviceLostError, type LoadProgress } from "./gpu";
 export { fileSource, type ModelSource, urlSource } from "./source";
 export type { Tool, ToolCall } from "./tools";
