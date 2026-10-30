@@ -45,11 +45,11 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
         checkGyroMatvec,     checkMoeRoute,       checkRotate128,       checkMoeCombine,        checkHc,
         checkPle,            checkSampleGreedy,   checkSampleTopKTopP,  checkSampleMinP,        checkSampleTopP,
         checkSamplePlain,    checkSampleTopK1,    checkSampleLargeTopK, checkSampleTopKSkipped, checkSampleVocab,
-        Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,   Quant(.q3_k).matvec,    Quant(.q3_k).matmul,
-        Quant(.q3_k).embed,  Quant(.q4_k).matvec, Quant(.q4_k).matmul,  Quant(.q4_k).embed,     Quant(.q5_k).matvec,
-        Quant(.q5_k).matmul, Quant(.q5_k).embed,  Quant(.q6_k).matvec,  Quant(.q6_k).matmul,    Quant(.q6_k).embed,
-        checkQuantTiles,     checkQuantSiluPair,  checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,
-        checkQuantizeSilu,
+        Quant(.q8_0).matvec, Quant(.q8_0).matmul, Quant(.q8_0).embed,   checkEmbedStride,       Quant(.q3_k).matvec,
+        Quant(.q3_k).matmul, Quant(.q3_k).embed,  Quant(.q4_k).matvec,  Quant(.q4_k).matmul,    Quant(.q4_k).embed,
+        Quant(.q5_k).matvec, Quant(.q5_k).matmul, Quant(.q5_k).embed,   Quant(.q6_k).matvec,    Quant(.q6_k).matmul,
+        Quant(.q6_k).embed,  checkQuantTiles,     checkQuantSiluPair,   checkQuantizeQ8K,       checkQuantizeQ80,
+        checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -577,6 +577,28 @@ fn Quant(comptime t: gguf.TensorType) type {
             return .{ .name = "embed " ++ @tagName(t) ++ " (2 chunks)", .err = relErr(got, want), .tolerance = 1e-6 };
         }
     };
+}
+
+/// Q8_0 rows of 160 values (170 bytes) stored 172 bytes apart, with 2 bytes
+/// of junk after each, as the Gyro-Coder's PLE rows arrive from the file.
+fn checkEmbedStride(c: *Ctx) !Result {
+    const rows = 16;
+    const dim = 160;
+    const row_bytes = 170;
+    const stride = 172;
+    const table = try quantRows(c, .q8_0, rows, dim);
+    const bytes = try c.arena.alloc(u8, rows * stride);
+    c.rand.bytes(bytes);
+    for (0..rows) |r| @memcpy(bytes[r * stride ..][0..row_bytes], table.bytes[r * row_bytes ..][0..row_bytes]);
+    const tokens = [_]u32{ 0, 15, 7, 8, 1 };
+    const out = try c.output(tokens.len * dim);
+    try c.launcher().launch(.embed_q8_0, P.EmbedBf16{ .dim = dim, .row0 = 0, .chunk_rows = rows, .stride = stride }, &.{ try c.upload(&tokens), try c.upload(bytes), out }, .{ tokens.len, 1, 1 });
+    const got = try c.read(out);
+    const want = try c.arena.alloc(f64, tokens.len * dim);
+    for (tokens, 0..) |tok, i| for (0..dim) |e| {
+        want[i * dim + e] = table.values[tok * dim + e];
+    };
+    return .{ .name = "embed q8_0, rows 172 bytes apart", .err = relErr(got, want), .tolerance = 1e-6 };
 }
 
 /// The decode multiply on quantized weights: 3 tokens, 100 outputs (a

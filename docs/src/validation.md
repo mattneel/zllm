@@ -260,7 +260,9 @@ up to it:
   value, in both block formats. The rows include a negative largest
   value, a tie between +max and −max, and a zero block. Two more check
   it computing its input, RMSNorm and the SiLU pair, first: every value
-  must be within half a step of the f64 result. All 21 pass on
+  must be within half a step of the f64 result. The Q8_0 gather also
+  runs over rows stored 172 bytes apart with junk between them, as the
+  Gyro-Coder's PLE rows arrive. All 22 pass on
   llvmpipe and the RTX 5090: embeddings and rounding exactly, multiplies
   within 5.6e-7. The rounding needed exact division: WGSL's may be off by
   2.5 ULP, and on D3D12 that moved values across rounding boundaries.

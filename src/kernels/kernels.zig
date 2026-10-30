@@ -362,7 +362,9 @@ pub const params = struct {
     pub const RepackQ3K = extern struct { blocks: u32, _pad: [3]u32 = @splat(0) };
     pub const Repad = extern struct { blocks: u32, src_bytes: u32, dst_bytes: u32, _pad: u32 = 0 };
     pub const SiluMul = extern struct { count: u32, width: u32, _pad: [2]u32 = @splat(0) };
-    pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, _pad: u32 = 0 };
+    /// `stride`: bytes from one quantized row to the next; 0, the type's
+    /// row size (the half-precision kernels ignore it).
+    pub const EmbedBf16 = extern struct { dim: u32, row0: u32, chunk_rows: u32, stride: u32 = 0 };
     pub const RopeAppend = extern struct {
         heads: u32,
         kv_heads: u32,
