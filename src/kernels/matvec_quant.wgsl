@@ -1,9 +1,21 @@
 // out[t][col0 + j] = Σ_i x[t][i] · w[j][i] for quantized weights: the
 // decode-path multiply, as matvec_bf16. A workgroup computes 8 lane groups
-// × R rows for token t = workgroup_id.y. A row's blocks are split into
+// × R rows for every token of the step. A row's blocks are split into
 // (block, part) tasks across the group's 32 lanes, so consecutive lanes
 // read consecutive words (quant/<type>_dot.wgsl decodes a part); then the
 // lanes' partial sums reduce in a fixed tree.
+//
+// The grid has one row of workgroups per token (m = num_workgroups.y), but
+// only the first row works: it takes the tokens in pairs (a pass over the
+// weights each), staging both tokens' x tiles, and block_dot decodes each
+// weight part once for both, each pair's sums staying in registers. The
+// multiply is bound by decoding, not memory traffic, so a step of two
+// tokens (a speculative step verifies two) then costs well under two steps
+// of one. Each token's arithmetic is the same whatever m is: its x tile and
+// its partial sums, in the same order. A lone token stages tiles of 2048
+// floats, pairs 1024 each, in the same workgroup memory; both hold a
+// multiple of the 32 lanes in tasks (32 or 64 for the K-quants, 256 or 512
+// for Q8_0), so each lane accumulates the same tasks in the same order.
 //
 // Fused around it, by flag (as matvec_bf16):
 //   NORM        x ← rmsnorm(x) · norm_w first; every workgroup reduces the
@@ -41,76 +53,42 @@ const LANES: u32 = 32u;
 // Rows per lane group: a staged x tile serves ROWS · R rows.
 const R: u32 = 1u;
 const ROWS: u32 = WG / LANES;
-const TILE: u32 = 2048u;
+const TILE_ONE: u32 = 2048u;
+const TILE_PAIR: u32 = 1024u;
+// Where the pair's second x tile starts in xs, in vectors.
+const XT: u32 = TILE_PAIR / 4u;
+// Tokens a step may have (kernels.decode_max_rows).
+const MAX_M: u32 = 4u;
 
 var<workgroup> partial: array<f32, WG * R>;
 var<workgroup> partial2: array<f32, WG * R>;
-var<workgroup> xs: array<vec4f, TILE / 4u>;
+var<workgroup> xs: array<vec4f, TILE_ONE / 4u>;
 
-@compute @workgroup_size(WG)
-fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u32) {
+// The RMSNorm scale of token t's x: every workgroup reduces the row's sum
+// of squares itself.
+fn norm_scale(t: u32, li: u32, k4: u32) -> f32 {
+    var ss = 0.0;
+    for (var i = li; i < k4; i += WG) {
+        let v = x[t * k4 + i];
+        ss += dot(v, v);
+    }
+    workgroupBarrier();
+    partial[li] = ss;
+    workgroupBarrier();
+    for (var s = WG / 2u; s > 0u; s /= 2u) {
+        if (li < s) {
+            partial[li] += partial[li + s];
+        }
+        workgroupBarrier();
+    }
+    return 1.0 / sqrt(partial[0] / f32(p.k) + p.eps);
+}
+
+// Reduces each lane group's partial sums for token t and writes its rows.
+fn finish(t: u32, li: u32, j0: u32, acc: array<f32, R>, acc2: array<f32, R>) {
     let lane = li % LANES;
-    let r = li / LANES;
-    // This lane group's rows: j0 + q, q < R.
-    let j0 = (wg.x * ROWS + r) * R;
-    let t = wg.y;
-    let k4 = p.k / 4u;
-    let xb = t * k4;
-    let norm = (p.flags & NORM) != 0u;
-
-    var scale = 1.0;
-    if (norm) {
-        var ss = 0.0;
-        for (var i = li; i < k4; i += WG) {
-            let v = x[xb + i];
-            ss += dot(v, v);
-        }
-        partial[li] = ss;
-        workgroupBarrier();
-        for (var s = WG / 2u; s > 0u; s /= 2u) {
-            if (li < s) {
-                partial[li] += partial[li + s];
-            }
-            workgroupBarrier();
-        }
-        scale = 1.0 / sqrt(partial[0] / f32(p.k) + p.eps);
-    }
-
     let pair = (p.flags & SILU_PAIR) != 0u;
-    let row_bytes = (p.k / BLOCK_ELEMS) * BLOCK_BYTES;
-    var acc: array<f32, R>;
-    var acc2: array<f32, R>;
-    for (var k0 = 0u; k0 < p.k; k0 += TILE) {
-        let len4 = min(TILE, p.k - k0) / 4u;
-        workgroupBarrier();
-        for (var i = li; i < len4; i += WG) {
-            let g = k0 / 4u + i;
-            var v = x[xb + g];
-            if (norm) {
-                v = v * scale * norm_w[g];
-            }
-            xs[i] = v;
-        }
-        workgroupBarrier();
-        // (block, part) tasks: consecutive lanes read consecutive words.
-        let tasks = (4u * len4 / BLOCK_ELEMS) * PARTS;
-        for (var task = lane; task < tasks; task += LANES) {
-            let blk = task / PARTS;
-            let part = task % PARTS;
-            let gblk = k0 / BLOCK_ELEMS + blk;
-            let xb4 = blk * (BLOCK_ELEMS / 4u);
-            for (var q = 0u; q < R; q++) {
-                let j = j0 + q;
-                if (j >= p.n) {
-                    break;
-                }
-                acc[q] += block_dot(j * row_bytes, gblk, xb4, part);
-                if (pair) {
-                    acc2[q] += block_dot((p.half + j) * row_bytes, gblk, xb4, part);
-                }
-            }
-        }
-    }
+    workgroupBarrier();
     for (var q = 0u; q < R; q++) {
         partial[q * WG + li] = acc[q];
         partial2[q * WG + li] = acc2[q];
@@ -140,6 +118,106 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
                 v += out[o];
             }
             out[o] = v;
+        }
+    }
+}
+
+@compute @workgroup_size(WG)
+fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @builtin(local_invocation_index) li: u32) {
+    if (wg.y != 0u) {
+        return;
+    }
+    let m = min(nwg.y, MAX_M);
+    let lane = li % LANES;
+    let r = li / LANES;
+    // This lane group's rows: j0 + q, q < R.
+    let j0 = (wg.x * ROWS + r) * R;
+    let k4 = p.k / 4u;
+    let norm = (p.flags & NORM) != 0u;
+    let pair = (p.flags & SILU_PAIR) != 0u;
+    let row_bytes = (p.k / BLOCK_ELEMS) * BLOCK_BYTES;
+    let tile = select(TILE_ONE, TILE_PAIR, m > 1u);
+
+    // Tokens in pairs (a lone one last), each pair's sums in registers.
+    for (var t = 0u; t < m; t += 2u) {
+        let two = t + 1u < m;
+        var scale0 = 1.0;
+        var scale1 = 1.0;
+        if (norm) {
+            scale0 = norm_scale(t, li, k4);
+            if (two) {
+                scale1 = norm_scale(t + 1u, li, k4);
+            }
+        }
+        var acc0 = array<f32, R>();
+        var acc1 = array<f32, R>();
+        var gate0 = array<f32, R>();
+        var gate1 = array<f32, R>();
+        for (var k0 = 0u; k0 < p.k; k0 += tile) {
+            let len4 = min(tile, p.k - k0) / 4u;
+            workgroupBarrier();
+            for (var i = li; i < len4; i += WG) {
+                let g = k0 / 4u + i;
+                var v = x[t * k4 + g];
+                if (norm) {
+                    v = v * scale0 * norm_w[g];
+                }
+                xs[i] = v;
+                if (two) {
+                    var v2 = x[(t + 1u) * k4 + g];
+                    if (norm) {
+                        v2 = v2 * scale1 * norm_w[g];
+                    }
+                    xs[XT + i] = v2;
+                }
+            }
+            workgroupBarrier();
+            // (block, part) tasks: consecutive lanes read consecutive words.
+            // A lone token takes the single-token decoder, a pair block_dot2.
+            let tasks = (4u * len4 / BLOCK_ELEMS) * PARTS;
+            if (two) {
+                for (var task = lane; task < tasks; task += LANES) {
+                    let blk = task / PARTS;
+                    let part = task % PARTS;
+                    let gblk = k0 / BLOCK_ELEMS + blk;
+                    let xb4 = blk * (BLOCK_ELEMS / 4u);
+                    for (var q = 0u; q < R; q++) {
+                        let j = j0 + q;
+                        if (j >= p.n) {
+                            break;
+                        }
+                        let d = block_dot2(j * row_bytes, gblk, xb4, part);
+                        acc0[q] += d.x;
+                        acc1[q] += d.y;
+                        if (pair) {
+                            let d2 = block_dot2((p.half + j) * row_bytes, gblk, xb4, part);
+                            gate0[q] += d2.x;
+                            gate1[q] += d2.y;
+                        }
+                    }
+                }
+            } else {
+                for (var task = lane; task < tasks; task += LANES) {
+                    let blk = task / PARTS;
+                    let part = task % PARTS;
+                    let gblk = k0 / BLOCK_ELEMS + blk;
+                    let xb4 = blk * (BLOCK_ELEMS / 4u);
+                    for (var q = 0u; q < R; q++) {
+                        let j = j0 + q;
+                        if (j >= p.n) {
+                            break;
+                        }
+                        acc0[q] += block_dot(j * row_bytes, gblk, xb4, part);
+                        if (pair) {
+                            gate0[q] += block_dot((p.half + j) * row_bytes, gblk, xb4, part);
+                        }
+                    }
+                }
+            }
+        }
+        finish(t, li, j0, acc0, gate0);
+        if (two) {
+            finish(t + 1u, li, j0, acc1, gate1);
         }
     }
 }

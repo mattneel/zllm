@@ -16,3 +16,20 @@ fn block_dot(row_byte: u32, blk: u32, xb4: u32, p: u32) -> f32 {
     }
     return acc;
 }
+
+// The same for two tokens: the second's x starts XT vectors on.
+fn block_dot2(row_byte: u32, blk: u32, xb4: u32, p: u32) -> vec2f {
+    let h = head(row_byte + blk * BLOCK_BYTES, p);
+    var acc = vec2f(0.0);
+    for (var k = 0u; k < 8u; k++) {
+        let e = (k + p) % 8u;
+        // q + 4·hbit (0..7) for four positions at once.
+        let c = ((h.lo[e / 4u] >> (2u * (e % 4u))) & 0x03030303u) | (((h.hi >> e) & 0x01010101u) << 2u);
+        let dl = select(h.dl0, h.dl1, e >= 4u);
+        let wv = dl * (vec4f(unpack4xU8(c)) - 4.0);
+        let i = xb4 + 8u * p + e;
+        acc.x += dot(wv, xs[i]);
+        acc.y += dot(wv, xs[i + XT]);
+    }
+    return acc;
+}

@@ -295,7 +295,11 @@ input to 8-bit blocks, as llama.cpp's CPU backend does, makes each weight
 sub-block's dot product exact in integers, at four products per
 instruction. The GPU is then checked against the reference that rounds
 the same way ([Validation](validation.md#the-27b)). Decode keeps f32
-inputs: it is bound by reading weights, not by arithmetic.
+inputs. Its multiplies are bound by decoding the weights rather than by
+reading them: the largest, a Q3_K 5,120 × 17,408 matrix, takes 179 µs, about
+210 GB/s, a quarter of this GPU's bandwidth. Two tokens per step at first
+cost 1.9 times one, since each token decoded every weight again; decoding
+each weight vector once for both tokens brought that to about 1.3.
 
 `zllm profile` (below) shows where a step goes now: of about 88 ms of GPU
 time, the Q3_K multiplies take 43 ms and the Q4_K ones 29 ms, both at about
