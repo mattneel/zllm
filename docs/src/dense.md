@@ -45,6 +45,15 @@ The program has no embedding, residual or logit multiplier. Granite 4.2's
 are all 1; a model with others (Granite 3) is refused on the GPU. The CPU
 reference runs them.
 
+## Performance
+
+Granite 4.2 30B at Q4_K_M (17.7 GB) on the RTX 5090 Laptop (D3D12), from
+`zllm benchmark`: prefill 209 tok/s over 1,024 tokens, decode 25.1 tok/s.
+A decode step takes 40.7 ms, 82% of it in the Q4_K and Q6_K matrix-vector
+multiplies (about 560 GB/s over 13 GB of weights). Loading took 106 s, nearly
+all of it reading the file from the WSL disk through `\\wsl.localhost`.
+Its checks are in [Validation](validation.md#granite-42-30b).
+
 ## Chat
 
 Qwen 3.5–3.8 and the Gyro-Coder chat in zllm's fixed Qwen template

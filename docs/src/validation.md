@@ -547,6 +547,33 @@ the worst relative L2 is 1.7e-5 (llvmpipe) and 1.3e-5 (D3D12), and every
 top-1 agrees (1,264 prefill and 320 decode positions). The GPU program
 ignoring `rope_freqs` moves Llama's layers by 1.6e-2 within 24 tokens.
 
+### Granite 4.2 30B
+
+[`ibm-granite/granite-4.2-30b-GGUF`](https://huggingface.co/ibm-granite/granite-4.2-30b-GGUF)
+@ `27b350a791e81d9a4d1ddca1c49282e9ec533768`, file
+`granite-4.2-30b-Q4_K_M.gguf` (17.7 GB: Q4_K, Q6_K), SHA-256
+`f299dace85d77ee0e24ca0b6720bd211b1f4cd1f65b9c0a2111e79692e29c9be`, is
+the dense target: 64 layers, GQA 32/8, head size 128, a 32,768-wide FFN.
+`zig build check-quant -Dquant-model=<gguf> -Dgpu-host=d3d12` runs it
+through the 27B's checks ([The 27B](#the-27b)), tokenized by the model's own
+GGUF. All pass on the RTX 5090 (25 minutes):
+
+| Check | Result | Bound |
+|---|---|---|
+| GPU decode kernels against the reference: top-1, 5 × 40 positions | 200/200 | all |
+| … first layer, max rel L2 | 2.7e-6 | 1e-5 |
+| … everywhere, max rel L2 (min cosine 1.0000000) | 3.5e-5 | 1e-3 |
+| GPU prefill kernels against the rounded reference: first layer, worst median rel L2 | 3.5e-7 | 1e-4 |
+| … gap to the f32 reference over its own, worst layer | 1.05 | 1.5 |
+| Reference against llama.cpp, its rounding emulated: first layer, worst median rel L2 | 3.6e-7 | 1e-4 |
+| … gap to the f32 reference over its own, worst layer | 1.06 | 1.5 |
+| Reference against llama.cpp: top-1 (reported) | 870/890 (97.75%) | |
+
+As with the 27B, llama.cpp's rounding of every multiply's input explains
+the reference's whole gap to llama.cpp: emulated, the two agree to 3.6e-7
+after the first layer, and at every layer the gap to llama.cpp is the
+gap the rounding alone makes (ratio 0.90 to 1.06).
+
 ## Qwen3.8-Flash-Next (Gyro-Coder)
 
 [`agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF`](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)

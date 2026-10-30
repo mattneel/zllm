@@ -58,7 +58,6 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from tokenizers import Tokenizer
 
 from check_forward import read_records, row_stats
 from check_gpu import run_gpu
@@ -92,8 +91,11 @@ def main() -> int:
     model = (args.model or paths.root / "models" / GGUF27_FILE).resolve()
     if not model.is_file():
         raise SystemExit(f"{model} not found; run scripts/fixtures.sh model27b")
-    hf = Tokenizer.from_file(str(paths.hf_tokenizer))
     evals = [json.loads(line) for line in EVAL.read_text(encoding="utf-8").split("\n") if line]
+    # The model's own tokenizer, as zllm reads it from the GGUF (check-tokenizer
+    # holds it to Hugging Face's ids).
+    tokenized = subprocess.run([args.zllm, "tokenize", str(model), str(EVAL)], check=True, capture_output=True, text=True, encoding="utf-8").stdout
+    token_ids = [json.loads(line)["ids"] for line in tokenized.split("\n") if line]
 
     fail = Failures()
     report: dict = {"model": model.name, "sequences": []}
@@ -143,8 +145,7 @@ def main() -> int:
         print(f"  GPU vs reference, {path} kernels: top-1 {top}/{rows}; logits min cosine {cos.min():.7f}, max rel L2 {rel.max():.2e}")
 
     with tempfile.TemporaryDirectory() as tmp:
-        for ev in evals:
-            ids = hf.encode(ev["text"]).ids
+        for ev, ids in zip(evals, token_ids, strict=True):
             n = len(ids)
             tok = Path(tmp) / f"{ev['name']}.i32"
             tok.write_bytes(np.asarray(ids, dtype="<i4").tobytes())
