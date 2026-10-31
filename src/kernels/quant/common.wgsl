@@ -27,8 +27,9 @@ fn wbyte(i: u32) -> u32 {
     return (wword(i >> 2u) >> ((i & 3u) * 8u)) & 0xffu;
 }
 
+// The binary16 at even byte offset i: one word read.
 fn whalf(i: u32) -> f32 {
-    return unpack2x16float(wbyte(i) | (wbyte(i + 1u) << 8u)).x;
+    return unpack2x16float(wword(i >> 2u) >> ((i & 2u) * 8u)).x;
 }
 
 // The 4 bytes at even offset i, little-endian.

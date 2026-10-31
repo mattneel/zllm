@@ -19,8 +19,9 @@ uint wbyte(uint z, uint i) {
     return (word >> ((i & 3u) * 8u)) & 0xffu;
 }
 
+// The binary16 at even byte offset i: one word read.
 float whalf(uint z, uint i) {
-    return f16tof32(wbyte(z, i) | (wbyte(z, i + 1u) << 8u));
+    return f16tof32((z == 0u ? ldw(1, i >> 2u) : ldw(2, i >> 2u)) >> ((i & 2u) * 8u));
 }
 
 [WaveSize(32)]

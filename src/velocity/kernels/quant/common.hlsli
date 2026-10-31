@@ -6,7 +6,8 @@ static uint row_k;
 uint wword(uint q) { return ldw(2, q); }
 uint4 wvec(uint q) { return ro(2).Load4(base(2) + 16u * q); }
 uint wbyte(uint i) { return (wword(i >> 2u) >> ((i & 3u) * 8u)) & 0xffu; }
-float whalf(uint i) { return f16tof32(wbyte(i) | (wbyte(i + 1u) << 8u)); }
+// The binary16 at even byte offset i: one word read.
+float whalf(uint i) { return f16tof32(wword(i >> 2u) >> ((i & 2u) * 8u)); }
 float2 unpack_half2(uint v) { return float2(f16tof32(v & 0xffffu), f16tof32(v >> 16u)); }
 uint w32(uint i) {
     uint q = i >> 2u;

@@ -57,8 +57,15 @@ fn wbyte(z: u32, i: u32) -> u32 {
     return (word >> ((i & 3u) * 8u)) & 0xffu;
 }
 
+// The binary16 at even byte offset i: one word read.
 fn whalf(z: u32, i: u32) -> f32 {
-    return unpack2x16float(wbyte(z, i) | (wbyte(z, i + 1u) << 8u)).x;
+    var word = 0u;
+    if (z == 0u) {
+        word = wa[i >> 2u];
+    } else {
+        word = wb[i >> 2u];
+    }
+    return unpack2x16float(word >> ((i & 2u) * 8u)).x;
 }
 
 @compute @workgroup_size(WG)
