@@ -139,6 +139,7 @@ def main() -> int:
         lambda p: (
             p.add_argument("--host", choices=HOSTS, default="native"),
             p.add_argument("--fast", action="store_true", help="the fast tier: the first eval text and engine-check, no dense models"),
+            p.add_argument("--no-engine-check", action="store_true", help="skip engine-check (llvmpipe in CI: hours of CPU, and its rounding drifts past the reuse bound)"),
         ),
     )
     paths = fixture_paths(args.fixtures)
@@ -273,6 +274,10 @@ def main() -> int:
         s = kv_stats[fmt]
         print(f"{args.host}, {fmt} KV: top-1 agreement {s['agree']}/{s['total']} (min {top_min:.0%}); min cosine {s['cos']:.7f} (min {cos_min})")
         fail.expect(f"{fmt} KV top-1 agreement", s["agree"] >= top_min * s["total"], f"{s['agree']}/{s['total']}")
+    if args.no_engine_check:
+        fail.expect("top-1 agreement", agree == total, f"{agree}/{total}")
+        fail.expect("decode top-1 agreement", decode_agree == decode_total, f"{decode_agree}/{decode_total}")
+        return fail.report()
     proc = zllm_on_host(args, paths, "engine-check", paths.gguf)
     print(f"\n{args.host}, engine-check:")
     sys.stdout.write("".join(line + "\n" for line in proc.stdout.replace("\r", "").splitlines() if line.startswith(("PASS", "FAIL"))))

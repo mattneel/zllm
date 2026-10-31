@@ -47,7 +47,7 @@ jobs:
       - run: zig build check-chat
 
   gpu-kernels:
-    name: GPU kernels (Dawn on llvmpipe)
+    name: GPU fast tier (Dawn on llvmpipe)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -59,7 +59,27 @@ jobs:
           path: .fixtures/dawn
           key: fixtures-dawn-${{ hashFiles('scripts/fixtures.sh') }}
       - run: scripts/fixtures.sh dawn
-      - run: zig build gpu-check
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: tools/uv.lock
+      - uses: actions/cache@v6
+        with:
+          path: |
+            .fixtures/models
+            .fixtures/hf
+          key: fixtures-model-${{ hashFiles('scripts/fixtures.sh') }}
+      - run: scripts/fixtures.sh vocab && scripts/fixtures.sh model
+      # The CPU reference's outputs (tools/common.py cached_reference), keyed
+      # by what produces them; a reference change recomputes them.
+      - uses: actions/cache@v6
+        with:
+          path: .fixtures/cache
+          key: references-${{ hashFiles('src/ref/**', 'src/gguf/**', 'src/graph/**', 'src/main.zig', 'build.zig', 'build.zig.zon', 'tools/corpus/**') }}
+          restore-keys: references-
+      # gpu-check, then the first eval text through both kernel paths, the
+      # step splits and every KV format, against the CPU reference.
+      - run: zig build check-fast -Dengine-check=false
 
   web:
     name: TypeScript (Biome + tsc)

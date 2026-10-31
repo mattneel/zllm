@@ -78,8 +78,12 @@ pub fn build(b: *std.Build) void {
     // through scripts/d3d12.sh, on Dawn; `velocity` is that build on the
     // Velocity backend.
     const gpu_host = b.option(enum { native, d3d12, velocity }, "gpu-host", "Where GPU checks run (default: native)") orelse .native;
+    // llvmpipe (CI) skips engine-check: hours of CPU, and its rounding drifts
+    // past the prefix-reuse bound (docs/src/validation.md).
+    const engine_check = b.option(bool, "engine-check", "Run engine-check in check-gpu and check-fast (default: true)") orelse true;
     const gpu_run = addCheck(b, check_exe, fixtures, "check-gpu", "Compare the GPU forward pass with the CPU reference", "check_gpu.py");
     gpu_run.addArgs(&.{ "--host", @tagName(gpu_host) });
+    if (!engine_check) gpu_run.addArg("--no-engine-check");
     const quant_run = addCheck(b, check_exe, fixtures, "check-quant", "Compare the GPU forward pass on the quantized 27B with llama.cpp", "check_quant.py");
     quant_run.addArgs(&.{ "--host", @tagName(gpu_host) });
     if (b.option([]const u8, "quant-model", "Quantized GGUF for check-quant (default: the 27B fixture)")) |m| quant_run.addArgs(&.{ "--model", m });
@@ -95,6 +99,7 @@ pub fn build(b: *std.Build) void {
     const fast_step = b.step("check-fast", "The fast tier: gpu-check, check-gpu --fast and check-gyro --fast (with -Dgyro-model)");
     const fast_gpu = checkRun(b, check_exe, fixtures, "check_gpu.py");
     fast_gpu.addArgs(&.{ "--host", @tagName(gpu_host), "--fast" });
+    if (!engine_check) fast_gpu.addArg("--no-engine-check");
     fast_gpu.step.dependOn(kernel_step);
     fast_step.dependOn(&fast_gpu.step);
     if (gyro_model) |m| {
