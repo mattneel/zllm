@@ -10,14 +10,18 @@
 //! Every GPU access but DirectStorage's is a compute UAV access, so a
 //! submission never mixes resource states: copies, clears, uploads (through
 //! mapped host memory) and readbacks are the host's own kernels
-//! (kernels/copy.hlsl, kernels/fill.hlsl). Dispatches are separated by UAV
-//! barriers, the ordering WebGPU gives dispatches in one pass.
+//! (kernels/copy.hlsl, kernels/fill.hlsl). A UAV barrier separates two
+//! operations only where they conflict: the later one touches a buffer range
+//! one since the last barrier wrote, or writes a range it read (Hazards, by
+//! each kernel's contract, Kernel.contract). That is the ordering WebGPU
+//! gives dispatches in one pass, without serializing independent ones.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
 const Timings = @import("../gpu/timings.zig").Timings;
 const Kernel = @import("../kernels/kernels.zig").Kernel;
+const hazards = @import("hazards.zig");
 pub const c = @import("velocity_c");
 
 pub const timeout_ms: u32 = 60_000;
@@ -102,9 +106,19 @@ pub const Device = struct {
     }
 };
 
-/// A kernel's pipeline, or `missing` where Velocity has no implementation
-/// of the kernel (an empty artifact).
-const Pipeline = union(enum) { ready: *c.vel_pipeline, missing: u32 };
+/// A kernel's pipeline and the bindings its contract writes, or `missing`
+/// where Velocity has no implementation of the kernel (an empty artifact).
+const Pipeline = union(enum) {
+    ready: struct { p: *c.vel_pipeline, writes: u32 },
+    missing: u32,
+};
+
+const Access = hazards.Access;
+const Hazards = hazards.Hazards;
+
+/// Buffer ids for the host's staging buffers in Access.
+const upload_id = std.math.maxInt(u32) - 1;
+const download_id = std.math.maxInt(u32);
 
 const Buffer = struct {
     b: *c.vel_buffer,
@@ -112,21 +126,28 @@ const Buffer = struct {
     size: u64,
 };
 
-/// A bind group as root constants: (SRV, UAV, byte offset) per binding.
-/// The dispatch adds its grid at `grid_word` (common.hlsli's num_groups).
-const Group = struct { words: [max_words]u32 };
+/// A bind group as root constants: (SRV, UAV, byte offset) per binding,
+/// and each binding's range. The dispatch adds its grid at `grid_word`
+/// (common.hlsli's num_groups).
+const Group = struct {
+    words: [max_words]u32,
+    ranges: [max_bindings]?Range = @splat(null),
+};
+const Range = struct { buffer: u32, offset: u64, size: u64 };
+const max_bindings = grid_word / 3;
 const max_words = 60;
 const grid_word = 57;
 
 const Op = union(enum) {
-    dispatch: struct { pipeline: *c.vel_pipeline, id: u32, grid: [3]u32, words: [max_words]u32 },
+    dispatch: struct { pipeline: *c.vel_pipeline, id: u32, grid: [3]u32, words: [max_words]u32, writes: u32, ranges: [max_bindings]?Range },
     copy: Copy,
-    fill: struct { dst: u32, dst_offset: u32, words: u32 },
+    fill: struct { dst: u32, dst_offset: u32, words: u32, buffer: u32 },
 };
 
-const Copy = struct { src: u32, src_offset: u32, dst: u32, dst_offset: u32, words: u32 };
+/// UAV indices and byte offsets, and the buffer ids for Hazards.
+const Copy = struct { src: u32, src_offset: u32, dst: u32, dst_offset: u32, words: u32, src_buffer: u32, dst_buffer: u32 };
 
-const Write = struct { dst: u32, dst_offset: u32, start: usize, len: usize };
+const Write = struct { dst: u32, dst_offset: u32, start: usize, len: usize, buffer: u32 };
 const Read = struct { token: u32, dst: []u8, offset: u64 };
 
 pub const Host = struct {
@@ -161,6 +182,7 @@ pub const Host = struct {
     /// Per-dispatch GPU times, while profiling (startProfile).
     timings: ?Timings = null,
     pending_times: std.ArrayList(Timings.Key) = .empty,
+    hazards: Hazards = .{},
 
     /// Timestamp pairs per submit: the 4096 timestamps of the query heap.
     pub const timing_capacity = 2048;
@@ -185,7 +207,7 @@ pub const Host = struct {
             _ = c.vel_release_buffer(ctx, b.b, timeout_ms);
         };
         for (h.pipelines.items) |o| if (o) |p| switch (p) {
-            .ready => |x| _ = c.vel_release_pipeline(ctx, x, timeout_ms),
+            .ready => |x| _ = c.vel_release_pipeline(ctx, x.p, timeout_ms),
             .missing => {},
         };
         _ = c.vel_release_pipeline(ctx, h.copy, timeout_ms);
@@ -200,6 +222,7 @@ pub const Host = struct {
         h.reads.deinit(h.gpa);
         h.released.deinit(h.gpa);
         h.pending_times.deinit(h.gpa);
+        h.hazards.since.deinit(h.gpa);
         if (h.timings) |*t| t.deinit(h.gpa);
         h.* = undefined;
     }
@@ -271,22 +294,22 @@ pub const Host = struct {
                 const start = std.mem.alignForward(usize, h.write_data.items.len, 16);
                 try h.write_data.resize(h.gpa, start + len);
                 @memcpy(h.write_data.items[start..][0..len], data);
-                try h.writes.append(h.gpa, .{ .dst = dst.info.uav_index, .dst_offset = @intCast(offset), .start = start, .len = len });
+                try h.writes.append(h.gpa, .{ .dst = dst.info.uav_index, .dst_offset = @intCast(offset), .start = start, .len = len, .buffer = a[0] });
             },
             .write_file => {
                 try need(a, 7);
                 try h.writeFile(try get(Buffer, h.buffers, a[0]), command.u64At(1), command.u64At(3), command.u64At(5));
             },
             .create_kernel => {
-                try need(a, 6);
-                if (a[5] == 0) return put(Pipeline, h.gpa, &h.pipelines, a[0], .{ .missing = a[1] });
-                const source = command.ptrAt([*]const u8, 3)[0..a[5]];
+                try need(a, 7);
+                if (a[6] == 0) return put(Pipeline, h.gpa, &h.pipelines, a[0], .{ .missing = a[1] });
+                const source = command.ptrAt([*]const u8, 4)[0..a[6]];
                 var p: ?*c.vel_pipeline = null;
                 h.d.check(c.vel_compile_pipeline(h.d.ctx, source.ptr, source.len, target(source), &p)) catch |err| {
                     std.log.err("velocity: kernel {d} (variant {d}) does not compile: {s}", .{ a[1], a[2], h.d.errorMessage() });
                     return err;
                 };
-                try put(Pipeline, h.gpa, &h.pipelines, a[0], .{ .ready = p.? });
+                try put(Pipeline, h.gpa, &h.pipelines, a[0], .{ .ready = .{ .p = p.?, .writes = a[3] } });
             },
             .create_bind_group => {
                 try need(a, 4);
@@ -301,6 +324,7 @@ pub const Host = struct {
                     const offset = e.u64At(2);
                     if (offset > std.math.maxInt(u32)) return error.BadCommand;
                     g.words[3 * binding ..][0..3].* = .{ b.info.srv_index, b.info.uav_index, @intCast(offset) };
+                    g.ranges[binding] = .{ .buffer = e.args[1], .offset = offset, .size = e.u64At(4) };
                 }
                 try put(Group, h.gpa, &h.groups, a[0], g);
             },
@@ -314,10 +338,12 @@ pub const Host = struct {
                     .missing => |k| return h.d.missing(k),
                 };
                 try h.ops.append(h.gpa, .{ .dispatch = .{
-                    .pipeline = pipeline,
+                    .pipeline = pipeline.p,
                     .id = a[0],
                     .grid = a[1..4].*,
                     .words = g.words,
+                    .writes = pipeline.writes,
+                    .ranges = g.ranges,
                 } });
             },
             .copy_buffer => {
@@ -334,6 +360,8 @@ pub const Host = struct {
                     .dst = dst.info.uav_index,
                     .dst_offset = @intCast(do),
                     .words = @intCast(size / 4),
+                    .src_buffer = a[0],
+                    .dst_buffer = a[3],
                 } });
             },
             .clear_buffer => {
@@ -342,7 +370,7 @@ pub const Host = struct {
                 const offset = command.u64At(1);
                 const size = command.u64At(3);
                 if ((offset | size) % 4 != 0 or offset + size > dst.size) return error.BadCommand;
-                if (size > 0) try h.ops.append(h.gpa, .{ .fill = .{ .dst = dst.info.uav_index, .dst_offset = @intCast(offset), .words = @intCast(size / 4) } });
+                if (size > 0) try h.ops.append(h.gpa, .{ .fill = .{ .dst = dst.info.uav_index, .dst_offset = @intCast(offset), .words = @intCast(size / 4), .buffer = a[0] } });
             },
             .read_buffer => {
                 try need(a, 8);
@@ -361,6 +389,8 @@ pub const Host = struct {
                     .dst = std.math.maxInt(u32),
                     .dst_offset = @intCast(at),
                     .words = @intCast(size / 4),
+                    .src_buffer = a[1],
+                    .dst_buffer = download_id,
                 } });
             },
             .submit => {
@@ -382,7 +412,7 @@ pub const Host = struct {
                         } else try h.release(a[1]);
                     },
                     .pipeline => switch (try take(Pipeline, h.pipelines, a[1])) {
-                        .ready => |p| try h.d.check(c.vel_release_pipeline(h.d.ctx, p, timeout_ms)),
+                        .ready => |p| try h.d.check(c.vel_release_pipeline(h.d.ctx, p.p, timeout_ms)),
                         .missing => {},
                     },
                     .bind_group => _ = try take(Group, h.groups, a[1]),
@@ -457,19 +487,22 @@ pub const Host = struct {
         // through SRVs (common.hlsli's ro) in the next.
         if (h.writes.items.len > 0) {
             try h.d.check(c.vel_begin(ctx, timeout_ms));
+            h.hazards.reset();
             for (h.writes.items) |w| {
-                try h.runCopy(.{ .src = upload.?.info.uav_index, .src_offset = @intCast(w.start), .dst = w.dst, .dst_offset = w.dst_offset, .words = @intCast(w.len / 4) });
+                // Later writes to the same range must land last, as on WebGPU.
+                try h.order(&.{.{ .buffer = w.buffer, .lo = w.dst_offset, .hi = w.dst_offset + w.len, .write = true }});
+                try h.runCopy(.{ .src = upload.?.info.uav_index, .src_offset = @intCast(w.start), .dst = w.dst, .dst_offset = w.dst_offset, .words = @intCast(w.len / 4), .src_buffer = upload_id, .dst_buffer = w.buffer });
             }
             var ticket: u64 = 0;
             try h.d.check(c.vel_submit(ctx, &ticket));
         }
         try h.d.check(c.vel_begin(ctx, timeout_ms));
-        var first = true;
+        h.hazards.reset();
         var times: [2 * timing_capacity]u32 = undefined;
         h.pending_times.clearRetainingCapacity();
         for (h.ops.items) |op| {
-            if (!first) try h.d.check(c.vel_barrier(ctx));
-            first = false;
+            var buf: [max_bindings]Access = undefined;
+            try h.order(accesses(op, &buf));
             switch (op) {
                 .dispatch => |dp| {
                     const timed = if (h.timings) |*t| blk: {
@@ -523,11 +556,47 @@ pub const Host = struct {
         h.released.clearRetainingCapacity();
     }
 
+    /// Records a UAV barrier first where `ops` conflict with what ran since
+    /// the last one; while profiling, before every operation but a list's
+    /// first, so each dispatch's time is its own (as on Dawn).
+    fn order(h: *Host, ops: []const Access) Error!void {
+        const ran = h.hazards.since.items.len > 0;
+        if (ran and (h.timings != null or h.hazards.conflict(ops))) {
+            try h.d.check(c.vel_barrier(h.d.ctx));
+            h.hazards.reset();
+        }
+        try h.hazards.since.appendSlice(h.gpa, ops);
+    }
+
     fn runCopy(h: *Host, x: Copy) Error!void {
         const words = [_]u32{ x.src, x.src_offset, x.dst, x.dst_offset, x.words };
         try h.d.check(c.vel_dispatch(h.d.ctx, h.copy, &words, words.len, groupsFor(x.words), 1, 1));
     }
 };
+
+/// The buffer ranges `op` reads and writes, in `buf`.
+fn accesses(op: Op, buf: *[max_bindings]Access) []const Access {
+    switch (op) {
+        .dispatch => |dp| {
+            var n: usize = 0;
+            for (dp.ranges, 0..) |r, i| if (r) |x| {
+                buf[n] = .{ .buffer = x.buffer, .lo = x.offset, .hi = x.offset + x.size, .write = dp.writes & (@as(u32, 1) << @intCast(i)) != 0 };
+                n += 1;
+            };
+            return buf[0..n];
+        },
+        .copy => |cp| {
+            const len = 4 * @as(u64, cp.words);
+            buf[0] = .{ .buffer = cp.src_buffer, .lo = cp.src_offset, .hi = cp.src_offset + len, .write = false };
+            buf[1] = .{ .buffer = cp.dst_buffer, .lo = cp.dst_offset, .hi = cp.dst_offset + len, .write = true };
+            return buf[0..2];
+        },
+        .fill => |f| {
+            buf[0] = .{ .buffer = f.buffer, .lo = f.dst_offset, .hi = f.dst_offset + 4 * @as(u64, f.words), .write = true };
+            return buf[0..1];
+        },
+    }
+}
 
 /// Groups for the grid-strided copy and fill kernels (256 words a group).
 fn groupsFor(words: u32) u32 {

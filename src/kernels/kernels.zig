@@ -91,6 +91,15 @@ pub const Kernel = enum {
         };
     }
 
+    /// The kernel's bindings as its WGSL declares them: the contract every
+    /// backend's implementation keeps, and what hosts may rely on (Velocity
+    /// orders dispatches by it).
+    pub fn contract(k: Kernel) Contract {
+        return switch (k) {
+            inline else => |tag| comptime parseContract(composed(@tagName(tag))),
+        };
+    }
+
     /// Whether the kernel's source is a template over a MatvecVariant: the
     /// quantized decode multiplies.
     pub fn isTemplate(k: Kernel) bool {
@@ -144,6 +153,47 @@ pub fn isHalf(t: gguf.TensorType) bool {
 /// and the operation's body: half/<type>.wgsl and <op>_half.wgsl for BF16
 /// and F16; the shared quant helpers, the type's decoder and <op>_quant.wgsl
 /// for the quantized types.
+/// A kernel's bindings: how many (0 .. count − 1, binding 0 the params
+/// block), and which it writes (bit i: binding i is `var<storage,
+/// read_write>`); every other binding is only read.
+pub const Contract = struct {
+    count: u32,
+    writes: u32,
+
+    pub fn reads(c: Contract, binding: u32) bool {
+        return binding < c.count and c.writes & (@as(u32, 1) << @intCast(binding)) == 0;
+    }
+};
+
+/// Scans WGSL for `@group(0) @binding(N) var<...>` declarations.
+fn parseContract(comptime wgsl: []const u8) Contract {
+    @setEvalBranchQuota(1_000_000);
+    var c: Contract = .{ .count = 0, .writes = 0 };
+    const tag = "@binding(";
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, wgsl, at, tag)) |i| {
+        const start = i + tag.len;
+        const close = std.mem.indexOfScalarPos(u8, wgsl, start, ')').?;
+        const binding = std.fmt.parseInt(u32, wgsl[start..close], 10) catch unreachable;
+        const decl_end = std.mem.indexOfScalarPos(u8, wgsl, close, '>').?;
+        const decl = wgsl[close..decl_end];
+        if (std.mem.indexOf(u8, decl, "read_write") != null) c.writes |= 1 << binding;
+        c.count = @max(c.count, binding + 1);
+        at = decl_end;
+    }
+    return c;
+}
+
+test "kernel contracts come from the WGSL's binding declarations" {
+    // rmsnorm: params, x, w read; y written.
+    try std.testing.expectEqual(Contract{ .count = 4, .writes = 0b1000 }, Kernel.rmsnorm.contract());
+    // rope_append writes the fused QKV row in place and both caches.
+    try std.testing.expectEqual(Contract{ .count = 8, .writes = 0b0110_0010 }, Kernel.rope_append.contract());
+    try std.testing.expect(Kernel.matvec_q8_0.contract().reads(1));
+    try std.testing.expect(!Kernel.matvec_q8_0.contract().reads(3));
+    for (std.enums.values(Kernel)) |kernel| try std.testing.expect(kernel.contract().writes != 0);
+}
+
 fn composed(comptime name: []const u8) []const u8 {
     @setEvalBranchQuota(10_000);
     for (std.enums.values(QuantOp)) |op| {
@@ -654,7 +704,7 @@ pub const Set = struct {
                 },
                 else => |e| return e,
             };
-            set.pipelines.set(k, try rec.createKernel(gpa, @backingInt(k), 0, code));
+            set.pipelines.set(k, try rec.createKernel(gpa, @backingInt(k), 0, k.contract().writes, code));
         }
         return set;
     }
@@ -678,7 +728,7 @@ pub const Set = struct {
             error.UnsupportedKernel => "",
             else => |e| return e,
         };
-        const pipeline = try rec.createKernel(gpa, @backingInt(k), v.id(), code);
+        const pipeline = try rec.createKernel(gpa, @backingInt(k), v.id(), k.contract().writes, code);
         s.variants[s.n_variants] = .{ .kernel = k, .v = v, .pipeline = pipeline };
         s.n_variants += 1;
         return pipeline;

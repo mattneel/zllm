@@ -39,5 +39,6 @@ test {
     _ = @import("chat/jinja.zig");
     _ = @import("fuse/fuse.zig");
     _ = @import("velocity/kernels.zig");
+    _ = @import("velocity/hazards.zig");
     _ = @import("ref/fp8.zig");
 }

@@ -121,3 +121,44 @@ test "Velocity implements every kernel" {
         try std.testing.expect(s.len > common.len);
     }
 }
+
+/// The bindings `hlsl` writes: stf(N, ...), stu(N, ...), and
+/// rw(N).Store* / rw(N).Interlocked* with a literal binding N (the way
+/// every kernel past common.hlsli writes).
+fn hlslWrites(hlsl: []const u8) u32 {
+    var writes: u32 = 0;
+    for ([_][]const u8{ "stf(", "stu(", "rw(" }) |call| {
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, hlsl, at, call)) |i| {
+            at = i + call.len;
+            if (i > 0 and (std.ascii.isAlphanumeric(hlsl[i - 1]) or hlsl[i - 1] == '_')) continue;
+            var end = at;
+            while (end < hlsl.len and std.ascii.isDigit(hlsl[end])) end += 1;
+            if (end == at) continue;
+            const rest = hlsl[end..];
+            const write = if (call[1] == 'w')
+                std.mem.startsWith(u8, rest, ").Store") or std.mem.startsWith(u8, rest, ").Interlocked")
+            else
+                std.mem.startsWith(u8, rest, ",");
+            if (write) writes |= @as(u32, 1) << @intCast(std.fmt.parseInt(u5, hlsl[at..end], 10) catch unreachable);
+        }
+    }
+    return writes;
+}
+
+test "every kernel writes only the bindings its WGSL contract declares read_write" {
+    for (std.enums.values(Kernel)) |k| {
+        const writes = hlslWrites(source(k).?[common.len..]);
+        const allowed = k.contract().writes;
+        if (writes & ~allowed != 0) {
+            std.debug.print("{t}: HLSL writes bindings 0x{x}, its contract allows 0x{x}\n", .{ k, writes, allowed });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(writes != 0);
+    }
+}
+
+test hlslWrites {
+    try std.testing.expectEqual(@as(u32, 0b1010), hlslWrites("stf(3, i, v); x = ldf(2, i); stu(1, 0, w); rw(2).Load(0);"));
+    try std.testing.expectEqual(@as(u32, 0b100), hlslWrites("rw(2).InterlockedAdd(0, 1, o); mystf(5, 1);"));
+}

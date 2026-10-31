@@ -24,9 +24,11 @@ pub const Op = enum(u8) {
     /// buffer, offset: u64, data: ptr, len: u64 — queued immediately (queue.writeBuffer),
     /// so it lands before any later `submit`.
     write_buffer = 2,
-    /// id, kernel: u32, variant: u32, artifact: ptr, len: u32 — a compute
-    /// pipeline for kernel `kernel` (kernels.Kernel) in variant `variant`
-    /// (0: the default), from the backend's artifact for it: WGSL with one
+    /// id, kernel: u32, variant: u32, writes: u32, artifact: ptr, len: u32 —
+    /// a compute pipeline for kernel `kernel` (kernels.Kernel) in variant
+    /// `variant` (0: the default), whose contract (Kernel.contract) writes
+    /// the bindings set in `writes` and only reads the rest, from the
+    /// backend's artifact for it: WGSL with one
     /// entry point named "main" on WebGPU, HLSL on Velocity. The ids say
     /// which kernel a pipeline is (profiles, capability reports). An empty
     /// artifact marks a kernel the backend does not implement: dispatching
@@ -141,9 +143,9 @@ pub const Recorder = struct {
     }
 
     /// `artifact` must stay valid until the batch has been executed.
-    pub fn createKernel(r: *Recorder, gpa: Allocator, kernel: u32, variant: u32, artifact: []const u8) Allocator.Error!Pipeline {
+    pub fn createKernel(r: *Recorder, gpa: Allocator, kernel: u32, variant: u32, writes: u32, artifact: []const u8) Allocator.Error!Pipeline {
         const id = r.alloc(.pipeline);
-        try r.put(gpa, .create_kernel, &(.{ id, kernel, variant } ++ addr(artifact.ptr) ++ .{@as(u32, @intCast(artifact.len))}));
+        try r.put(gpa, .create_kernel, &(.{ id, kernel, variant, writes } ++ addr(artifact.ptr) ++ .{@as(u32, @intCast(artifact.len))}));
         return @fromBackingInt(@intCast(id));
     }
 
@@ -245,7 +247,7 @@ test "recorder output decodes back to the same commands" {
     var dst: [8]u8 = undefined;
     const buf = try r.createBuffer(gpa, 1 << 33, .{ .storage = true, .copy_dst = true });
     try r.writeBuffer(gpa, buf, 16, &data);
-    const pl = try r.createKernel(gpa, 5, 2, "wgsl");
+    const pl = try r.createKernel(gpa, 5, 2, 0b1000, "wgsl");
     const bg = try r.createBindGroup(gpa, pl, 0, &.{
         .{ .binding = 0, .buffer = buf, .size = 64 },
         .{ .binding = 3, .buffer = buf, .offset = 256, .size = 1 << 32 },
@@ -271,8 +273,8 @@ test "recorder output decodes back to the same commands" {
 
     c = (try it.next()).?;
     try std.testing.expectEqual(Op.create_kernel, c.op);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 5, 2 }, c.args[0..3]);
-    try std.testing.expectEqualStrings("wgsl", c.ptrAt([*]const u8, 3)[0..c.args[5]]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 5, 2, 0b1000 }, c.args[0..4]);
+    try std.testing.expectEqualStrings("wgsl", c.ptrAt([*]const u8, 4)[0..c.args[6]]);
 
     c = (try it.next()).?;
     try std.testing.expectEqual(Op.create_bind_group, c.op);

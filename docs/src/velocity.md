@@ -51,6 +51,17 @@ The Zig host keeps WebGPU's semantics:
 - Dispatches are ordered by UAV barriers.
 - Each `submit` blocks until the GPU has finished it.
 
+Each kernel's contract (`Kernel.contract`) comes from its WGSL's binding
+declarations: how many bindings, and which it writes (`var<storage,
+read_write>`). `create_kernel` carries the write set. A unit test holds every
+HLSL kernel to it: a kernel may write only the bindings its contract
+declares. The host orders operations by it: a UAV barrier goes between two
+operations only where the later one touches a buffer range one since the
+last barrier wrote, or writes a range one of them read. While profiling,
+every operation is serialized, so each dispatch's time is its own. On the
+RTX 5090 the elided barriers are not measurable: decode chains dependent
+kernels, and a barrier between dependent dispatches costs next to nothing.
+
 Copies, clears, uploads and readbacks are the host's own kernels
 (`copy.hlsl`, `fill.hlsl`), so every GPU access in a submission is a
 compute UAV access. A submission's uploads run as a command list of their

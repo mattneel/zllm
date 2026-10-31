@@ -156,8 +156,8 @@ pub const Host = struct {
             .create_kernel => {
                 // WebGPU's artifact is WGSL; the module lives as long as its
                 // pipeline needs it, which Dawn tracks itself.
-                try need(a, 6);
-                const code = command.ptrAt([*]const u8, 3)[0..a[5]];
+                try need(a, 7);
+                const code = command.ptrAt([*]const u8, 4)[0..a[6]];
                 var src = std.mem.zeroes(c.WGPUShaderSourceWGSL);
                 src.chain.sType = c.WGPUSType_ShaderSourceWGSL;
                 src.code = dawn.str(code);

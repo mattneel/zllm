@@ -163,9 +163,9 @@ export class Executor {
         this.#writeFile(this.#buffer(word(a, 0)), u64(a, 1), u64(a, 3), u64(a, 5));
         return;
       case Op.createKernel: {
-        // id, kernel, variant, then the artifact: WGSL on WebGPU.
+        // id, kernel, variant, writes, then the artifact: WGSL on WebGPU.
         const id = word(a, 0);
-        const bytes = new Uint8Array(this.#memory.buffer, u64(a, 3), word(a, 5));
+        const bytes = new Uint8Array(this.#memory.buffer, u64(a, 4), word(a, 6));
         const module = d.createShaderModule({ code: this.#decoder.decode(bytes) });
         const pending = d.createComputePipelineAsync({
           layout: "auto",
