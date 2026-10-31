@@ -158,6 +158,13 @@ the preceding trellis byte; wave broadcasts supply row scales; direct
 matrix-coordinate output stores avoid shared result staging. Its shared
 storage is exactly 32 KiB. WGSL and scalar HLSL keep their existing tiles.
 
+The dense float-Q8 LinAlg variant keeps its 16-token by 64-output tile and
+KT64, but pads shared rows to 72 half elements. The 144-byte row stride is
+still 16-byte aligned and distributes cooperative weight staging across
+shared-memory banks. Direct matrix-coordinate output stores remove the
+4 KiB shared result plane and epilogue barrier. Total shared storage is
+14 KiB; arithmetic and token/split-K reduction order are unchanged.
+
 The pinned DXC HLSL matrix headers are staged by
 `scripts/fixtures.sh agility` under `agility/include` beside its compiler
 DLL; the host supplies that absolute include directory at load-time compilation.

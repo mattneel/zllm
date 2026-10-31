@@ -301,6 +301,57 @@ Agility and Dawn D3D12. GPU checks now include 69 expert output rows and
 Gyro routing has zero flips, logits median/max rel L2 remain
 2.02e-5/1.63e-4, and split/unfused prefill results remain bitwise identical.
 
+## Bank-aware dense LinAlg staging
+
+The retained dense optimization keeps TT16/TN64/KT64 rather than reducing
+the number of active groups with a larger virtual tile. Shared activation
+and weight rows have a stride of 72 half elements (144 bytes), retaining
+16-byte alignment while avoiding the original power-of-two bank mapping.
+Direct matrix-coordinate output stores remove the 4 KiB shared result
+plane and its barrier. The resulting shared allocation is 14 KiB versus
+16.5 KiB before. Both activation products and the per-32-K scaling order
+are unchanged.
+
+| Measurement | Before (`548444e`) | Padded shared rows / direct stores |
+|---|---:|---:|
+| 1,024-token prefill, 65 steps | 160.64 tok/s | 178.04 tok/s |
+| Greedy decode | 61.81 tok/s | 61.73 tok/s |
+| Plain decode | 62.11 tok/s | 61.11 tok/s |
+| Unprofiled 64-token step | 248.61 ms | 228.95 ms |
+| Profiled wall time | 268.27 ms | 239.31 ms |
+
+| 64-token phase | Before GPU ms / share | Padded dense GPU ms / share |
+|---|---:|---:|
+| Grouped experts | 148.957 / 60.9% | 140.337 / 64.0% |
+| Dense float Q8_0 | 66.064 / 27.0% | 48.337 / 22.0% |
+| DeltaNet recurrence | 8.547 / 3.5% | 9.354 / 4.3% |
+| Expert grouping | 4.443 / 1.8% | 4.629 / 2.1% |
+| Sparse attention | 4.209 / 1.7% | 4.199 / 1.9% |
+| Router logits | 3.179 / 1.3% | 3.279 / 1.5% |
+| BF16 matmul | 2.764 / 1.1% | 2.869 / 1.3% |
+| Other kernels | 6.338 | 6.419 |
+| **Sum** | **244.501** | **219.423** |
+
+Prefill improves 10.83% and dense GPU time falls 26.8%. An adjacent
+remeasurement of the old dense kernel gave 64.684 ms (versus 48.337 ms,
+a 25.3% reduction), with unchanged expert code at 135.705 ms. That control
+also recorded 149.71 tok/s prefill and 57.63 tok/s decode: device timing and
+the newly keyed tuning sweeps vary, so small decode movements should not be
+attributed to a changed decode algorithm. Remaining gap to 250 tok/s:
+71.96 tok/s, requiring another 1.404×.
+
+A virtual 32-token by 128-output candidate passed the numerical checks but
+regressed to 119.96 tok/s and 82.961 ms dense GPU time; it was removed.
+Explicitly unrolling dynamic matrix-element loops caused an NVIDIA driver
+pipeline-compilation crash on the tested driver and was also removed.
+Larger tiles and fewer source-level loops are not automatic speedups.
+
+The padded layout passed the unchanged standalone Agility `gpu-check`,
+`check-fast` on Agility and Dawn D3D12, and fmt/build/test/wasm gates.
+Agility's Gyro logits median/max rel L2 remain 2.02e-5/1.63e-4, with
+zero routing flips, 66/66 top-1, 40/40 greedy and bitwise split/unfused
+prefill results. No precision gate or tolerance changed.
+
 ## Per-device records
 
 `benchmarks/rtx5090-laptop-d3d12.jsonl` stores the committed native benchmark

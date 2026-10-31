@@ -13,18 +13,20 @@ using TileC = Matrix<ComponentType::F32, 16, 16, MatrixUse::Accumulator, MatrixS
 static const uint TT = 16u;
 static const uint TN = 64u;
 static const uint TK = 64u;
+// Keep shared rows 16-byte aligned without mapping every weight row to
+// the same memory banks during cooperative staging.
+static const uint SK = TK + 8u;
 static const uint WG = 128u;
 
 // A Q8_0 block has one FP16 scale for 32 signed bytes. The bytes are exact
 // FP16 integers, so factor the scale outside each 32-position dot product.
 // This avoids dequantized-weight rounding and its third correction MMA.
 // Activation hi+lo retains roughly FP16 precision squared, subject to FP16
-// overflow/subnormal limits. Total groupshared storage is 16,896 bytes.
-groupshared half xs_hi[TT * TK];
-groupshared half xs_lo[TT * TK];
-groupshared half ws[TN * TK];
+// overflow/subnormal limits. Total groupshared storage is 14,336 bytes.
+groupshared half xs_hi[TT * SK];
+groupshared half xs_lo[TT * SK];
+groupshared half ws[TN * SK];
 groupshared float scales[TN * (TK / 32u)];
-groupshared float sums[4u * 16u * 16u];
 
 [WaveSize(32)]
 [numthreads(128, 1, 1)]
@@ -33,7 +35,7 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
     const uint col0 = param(3), out_stride = param(4);
     const uint kb = wg.z * param(6), ke = min(k, kb + param(6));
     const uint j0 = wg.x * TN, t0 = wg.y * TT;
-    const uint wave = li / 32u, lane = li % 32u;
+    const uint wave = li / 32u;
     const uint row_words = ((k + k / 16u + 15u) & ~15u) / 4u;
     TileC total = TileC::Splat(0.0f);
 
@@ -44,8 +46,9 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
             if (t < rows && c < ke) v = ldf(1, t * k + c);
             const half hi = (half)v;
             precise float residual = v - (float)hi;
-            xs_hi[e] = hi;
-            xs_lo[e] = (half)residual;
+            const uint at = (e / TK) * SK + e % TK;
+            xs_hi[at] = hi;
+            xs_lo[at] = (half)residual;
         }
 
         // One thread per row/32-value half. Invalid columns and the final
@@ -59,7 +62,7 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
             scales[li] = f16tof32((packed_scales >> ((block & 1u) * 16u)) & 0xffffu);
             [unroll] for (uint q = 0u; q < 8u; q++) {
                 const uint word = ldw(2, wbase + kk / 4u + q);
-                const uint o = r * TK + half_index * 32u + q * 4u;
+                const uint o = r * SK + half_index * 32u + q * 4u;
                 ws[o] = (half)(asint(word << 24u) >> 24u);
                 ws[o + 1u] = (half)(asint(word << 16u) >> 24u);
                 ws[o + 2u] = (half)(asint(word << 8u) >> 24u);
@@ -68,7 +71,7 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
         } else {
             scales[li] = 0.0f;
             [unroll] for (uint c = 0u; c < 32u; c++) {
-                ws[r * TK + half_index * 32u + c] = (half)0.0f;
+                ws[r * SK + half_index * 32u + c] = (half)0.0f;
             }
         }
         GroupMemoryBarrierWithGroupSync();
@@ -82,9 +85,9 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
             TileC part_lo = TileC::Splat(0.0f);
             [unroll] for (uint c = 0u; c < 32u; c += 16u) {
                 const uint ks = block * 32u + c;
-                TileA a_hi = TileA::Load(xs_hi, ks, TK, MatrixLayout::RowMajor);
-                TileA a_lo = TileA::Load(xs_lo, ks, TK, MatrixLayout::RowMajor);
-                TileB b = TileB::Load(ws, wave * 16u * TK + ks, TK, MatrixLayout::ColMajor);
+                TileA a_hi = TileA::Load(xs_hi, ks, SK, MatrixLayout::RowMajor);
+                TileA a_lo = TileA::Load(xs_lo, ks, SK, MatrixLayout::RowMajor);
+                TileB b = TileB::Load(ws, wave * 16u * SK + ks, SK, MatrixLayout::ColMajor);
                 part_hi.MultiplyAccumulate(a_hi, b);
                 part_lo.MultiplyAccumulate(a_lo, b);
             }
@@ -100,13 +103,13 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
     }
 
-    total.Store(sums, wave * 256u, 16u, MatrixLayout::RowMajor);
-    GroupMemoryBarrierWithGroupSync();
-    for (uint e = lane; e < 256u; e += 32u) {
-        const uint t = t0 + e / 16u, j = j0 + wave * 16u + e % 16u;
+    // Store register-local matrix elements without a shared output plane.
+    for (uint e = 0u; e < total.Length(); e++) {
+        const uint2 rc = total.GetCoordinate(e);
+        const uint t = t0 + rc.x, j = j0 + wave * 16u + rc.y;
         if (t < rows && j < n) {
             const uint o = wg.z * param(7) + t * out_stride + col0 + j;
-            precise float v = sums[wave * 256u + e];
+            precise float v = total.Get(e);
             if (param(5) != 0u) v = ldf(3, o) + v;
             stf(3, o, v);
         }
