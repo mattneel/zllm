@@ -1,7 +1,7 @@
 # zllm
 
 [![CI](https://github.com/mattneel/zllm/actions/workflows/ci.yml/badge.svg)](https://github.com/mattneel/zllm/actions/workflows/ci.yml)
-[![Book](https://img.shields.io/badge/book-mattneel.github.io%2Fzllm-blue)](https://mattneel.github.io/zllm/)
+[![Book](https://img.shields.io/badge/book-mattneel.github.io%2Fzllm-blue)](https://mattneel.github.io/zllm/) [![Demo](https://img.shields.io/badge/demo-WebGPU%20chat-green)](https://mattneel.github.io/zllm/demo/)
 
 LLM inference on WebGPU from one Zig codebase, built to the standard of a server engine like vLLM.
 

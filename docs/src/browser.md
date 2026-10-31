@@ -5,6 +5,12 @@ native CLI uses, built for `wasm32-freestanding`. `zllm.js` (`web/src/zllm`)
 is the shim around it: it runs the core's command batches on WebGPU, streams
 weights from the model file, and exposes the spec's JavaScript API.
 
+**[Try the demo](demo/)** in a browser with WebGPU (Chrome or Edge). It
+streams Qwen3.5-0.8B (1.5 GB, BF16) from Hugging Face by HTTP range reads,
+or loads a GGUF you pick from disk; the model stays in the browser's
+private file system for later visits. CI builds it into the book from the
+same commit.
+
 ```sh
 zig build wasm            # zig-out/web/zllm.wasm
 cd web

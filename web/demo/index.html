@@ -63,7 +63,7 @@
   <body>
     <h1>zllm</h1>
     <fieldset id="load-form">
-      <input id="model-url" value="/models/Qwen3.5-0.8B-BF16.gguf" aria-label="Model URL" />
+      <input id="model-url" value="https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/807dfd9a6fadbf703207aac3bfb0b2b3040d077c/Qwen3.5-0.8B-BF16.gguf" aria-label="Model URL" />
       <button id="load-url">Load URL</button>
       <input id="model-file" type="file" accept=".gguf" aria-label="Model file" />
       <button id="clear-cache" type="button">Clear cache</button>
@@ -79,6 +79,6 @@
       <button id="reset" type="button">New chat</button>
     </form>
     <p id="stats"></p>
-    <script type="module" src="/main.js"></script>
+    <script type="module" src="./main.js"></script>
   </body>
 </html>
