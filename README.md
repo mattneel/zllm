@@ -60,6 +60,27 @@ Open `http://localhost:8080/`. Load a local GGUF or use the demo's model
 URLs. See [Browser](https://mattneel.github.io/zllm/browser.html) for the
 API, weight cache and device-lost recovery.
 
+## Tokenizer throughput
+
+Tokenization uses the model's GGUF vocabulary and preserves its Hugging
+Face token ids. Measure warmed, repeated encodes of the pinned JSONL
+corpus, excluding loading and parsing:
+
+```sh
+scripts/fixtures.sh vocab
+zig-out/bin/zllm tokenize-bench \
+  .fixtures/models/Qwen3.5-0.8B-BF16.header.gguf \
+  tools/corpus/tokenizer.jsonl
+```
+
+The command emits JSON with decimal MB/s, tokens/s, repetitions, elapsed
+time and exact work counts. The [tokenizer guide](https://mattneel.github.io/zllm/tokenizer.html)
+explains the portable BPE design and the `uv run --project tools
+tools/tokenize_bench.py <model.gguf> <tokenizer.json>` comparison against
+Hugging Face and a warm llama.cpp helper. Use a full GGUF for llama.cpp;
+the report flags id differences rather than presenting them as equivalent
+work.
+
 ## Documentation and development
 
 The [book](https://mattneel.github.io/zllm/) covers

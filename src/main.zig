@@ -11,6 +11,7 @@ const bench = @import("bench.zig");
 const profile = @import("profile.zig");
 const soak = @import("soak.zig");
 const benchmark = @import("benchmark.zig");
+const tokenize_bench = @import("tokenize_bench.zig");
 
 const usage =
     \\usage: zllm <command> [args]
@@ -19,6 +20,8 @@ const usage =
     \\  gguf-index <model.gguf>             print header, metadata and tensor index as JSON
     \\  tokenize <model.gguf> <texts.jsonl>  for each {"text": ...} line, print
     \\                                       {"ids": [...], "decoded": ...} as one JSON line
+    \\  tokenize-bench <model.gguf> <texts.jsonl>
+    \\                                       warm encode-only throughput as JSON (~0.5 s)
     \\  forward <model.gguf> <tokens.i32> <out.bin> [--llama-activations] [--mtp] [--kv f16|f32]
     \\                                       run the CPU f32 reference on little-endian int32
     \\                                       token ids; write activation records (format in
@@ -104,6 +107,17 @@ pub fn main(init: std.process.Init) !void {
         const texts = try Io.Dir.cwd().readFileAlloc(io, args[3], gpa, .unlimited);
         defer gpa.free(texts);
         try tokenizeLines(gpa, &tok, texts, out);
+    } else if (std.mem.eql(u8, cmd, "tokenize-bench")) {
+        if (args.len != 4) return fail(usage);
+        var mapped = try FileBytes.open(io, args[2]);
+        defer mapped.close(io);
+        var file = try zllm.gguf.parse(gpa, mapped.bytes, false);
+        defer file.deinit(gpa);
+        var tok = try zllm.tokenizer.Tokenizer.load(gpa, file);
+        defer tok.deinit(gpa);
+        const texts = try Io.Dir.cwd().readFileAlloc(io, args[3], gpa, .unlimited);
+        defer gpa.free(texts);
+        try tokenize_bench.run(gpa, io, &tok, texts, out);
     } else if (std.mem.eql(u8, cmd, "forward")) {
         if (args.len < 5) return fail(usage);
         var act: zllm.ref.matmul.Activations = .f32;

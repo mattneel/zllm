@@ -147,13 +147,14 @@ fn decomposeInto(gpa: Allocator, out: *std.ArrayList(u21), cp: u21) Allocator.Er
 
 pub const NormalizeError = error{InvalidUtf8} || Allocator.Error;
 
-/// Returns `s` in Normalization Form C. Caller owns the result.
-pub fn nfc(gpa: Allocator, s: []const u8) NormalizeError![]u8 {
+/// Returns owned NFC bytes only when normalization may change `s`; null means
+/// the validated input can be borrowed unchanged, with no allocation or copy.
+pub fn nfc(gpa: Allocator, s: []const u8) NormalizeError!?[]u8 {
     if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
 
     // ASCII and text without decomposable or combining code points is
     // already NFC; most input takes this path.
-    if (isTriviallyNfc(s)) return gpa.dupe(u8, s);
+    if (isTriviallyNfc(s)) return null;
 
     var cps: std.ArrayList(u21) = .empty;
     defer cps.deinit(gpa);
@@ -171,7 +172,7 @@ pub fn nfc(gpa: Allocator, s: []const u8) NormalizeError![]u8 {
         const len = std.unicode.utf8Encode(cp, &buf) catch unreachable;
         try out.appendSlice(gpa, buf[0..len]);
     }
-    return out.toOwnedSlice(gpa);
+    return try out.toOwnedSlice(gpa);
 }
 
 fn isTriviallyNfc(s: []const u8) bool {
@@ -234,8 +235,8 @@ test "categories" {
 
 fn expectNfc(input: []const u8, want: []const u8) !void {
     const got = try nfc(std.testing.allocator, input);
-    defer std.testing.allocator.free(got);
-    try std.testing.expectEqualStrings(want, got);
+    defer if (got) |owned| std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings(want, got orelse input);
 }
 
 test "nfc composes, reorders and leaves NFC text alone" {
@@ -257,4 +258,9 @@ test "nfc composes, reorders and leaves NFC text alone" {
 
 test "nfc rejects invalid utf-8" {
     try std.testing.expectError(error.InvalidUtf8, nfc(std.testing.allocator, "\xff"));
+}
+
+test "already normalized text borrows input without allocation" {
+    try std.testing.expectEqual(@as(?[]u8, null), try nfc(std.testing.failing_allocator, "plain ascii"));
+    try std.testing.expectEqual(@as(?[]u8, null), try nfc(std.testing.failing_allocator, "日本語"));
 }

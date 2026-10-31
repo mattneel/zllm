@@ -75,6 +75,7 @@ pub const Iterator = struct {
 
 /// Code point at byte offset `i` and its encoded length.
 fn at(text: []const u8, i: usize) struct { cp: u21, len: usize } {
+    if (text[i] < 0x80) return .{ .cp = text[i], .len = 1 };
     const len = std.unicode.utf8ByteSequenceLength(text[i]) catch unreachable;
     const cp = std.unicode.utf8Decode(text[i..][0..len]) catch unreachable;
     return .{ .cp = cp, .len = len };

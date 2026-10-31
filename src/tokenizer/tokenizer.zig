@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const gguf = @import("../gguf/gguf.zig");
 const unicode = @import("unicode.zig");
 const pretokenize = @import("pretokenize.zig");
+const bpe = @import("bpe.zig");
 
 pub const Id = u32;
 
@@ -44,17 +45,27 @@ pub const Tokenizer = struct {
     tokens: []const []const u8,
     types: []TokenType,
     ids: std.StringHashMapUnmanaged(Id),
-    merges: std.AutoHashMapUnmanaged(u64, Merge),
+    merges: bpe.MergeTable,
+    /// Byte-alphabet vocabulary decoded once at load time, in a packed arena.
+    decoded: []Decoded,
+    decoded_bytes: []u8,
+    /// Raw-byte vocabulary lookup for ignore_merges, without alphabet expansion.
+    raw_ids: std.StringHashMapUnmanaged(Id),
     /// Token id of each byte's single-character GPT-2 alphabet token.
     byte_token: [256]Id,
-    /// Added tokens, longest first, matched on raw text before normalization.
+    /// Added tokens in first-byte buckets, longest first within each bucket.
     added: []Id,
+    added_offsets: [257]usize,
     pre: pretokenize.Kind,
     eos: ?Id,
     bos: ?Id,
     add_bos: bool,
 
-    const Merge = struct { rank: u32, id: Id };
+    const Decoded = struct {
+        offset: usize,
+        len: usize,
+        const invalid = std.math.maxInt(usize);
+    };
 
     pub fn deinit(t: *Tokenizer, gpa: Allocator) void {
         gpa.free(t.tokens);
@@ -62,6 +73,9 @@ pub const Tokenizer = struct {
         t.ids.deinit(gpa);
         t.merges.deinit(gpa);
         gpa.free(t.added);
+        gpa.free(t.decoded);
+        gpa.free(t.decoded_bytes);
+        t.raw_ids.deinit(gpa);
         t.* = undefined;
     }
 
@@ -99,12 +113,20 @@ pub const Tokenizer = struct {
             if ((ty.* == .control or ty.* == .user_defined) and tok.len > 0) try added.append(gpa, @intCast(i));
         }
 
-        // Longest first so a linear scan at each position is leftmost-longest.
+        // First-byte buckets avoid testing every added token at every byte.
         std.mem.sort(Id, added.items, tokens, struct {
             fn lessThan(toks: []const []const u8, a: Id, b: Id) bool {
+                if (toks[a][0] != toks[b][0]) return toks[a][0] < toks[b][0];
                 return toks[a].len > toks[b].len;
             }
         }.lessThan);
+        var added_offsets: [257]usize = undefined;
+        var added_index: usize = 0;
+        for (0..256) |byte| {
+            added_offsets[byte] = added_index;
+            while (added_index < added.items.len and tokens[added.items[added_index]][0] == byte) : (added_index += 1) {}
+        }
+        added_offsets[256] = added.items.len;
 
         var byte_token: [256]Id = undefined;
         for (0..256) |b| {
@@ -113,9 +135,8 @@ pub const Tokenizer = struct {
             byte_token[b] = ids.get(buf[0..len]) orelse return error.BadMetadata;
         }
 
-        var merges: std.AutoHashMapUnmanaged(u64, Merge) = .empty;
+        var merges = try bpe.MergeTable.init(gpa, @intCast(merge_arr.len));
         errdefer merges.deinit(gpa);
-        try merges.ensureTotalCapacity(gpa, @intCast(merge_arr.len));
         var mit = merge_arr.iterator();
         var rank: u32 = 0;
         var concat: std.ArrayList(u8) = .empty;
@@ -128,8 +149,49 @@ pub const Tokenizer = struct {
             try concat.appendSlice(gpa, m[0..sp]);
             try concat.appendSlice(gpa, m[sp + 1 ..]);
             const merged = ids.get(concat.items) orelse return error.UnknownMergeToken;
-            const gop = merges.getOrPutAssumeCapacity(pairKey(left, right));
-            if (!gop.found_existing) gop.value_ptr.* = .{ .rank = rank, .id = merged };
+            merges.putFirst(left, right, .{ .rank = rank, .id = merged });
+        }
+
+        const decoded = try gpa.alloc(Decoded, n);
+        errdefer gpa.free(decoded);
+        const alphabet = try gpa.alloc(Decoded, n);
+        defer gpa.free(alphabet);
+        var arena_bytes: std.ArrayList(u8) = .empty;
+        errdefer arena_bytes.deinit(gpa);
+        for (tokens, types, decoded, alphabet) |token, ty, *decoded_token, *alphabet_token| {
+            const start = arena_bytes.items.len;
+            var valid = true;
+            const view = std.unicode.Utf8View.init(token) catch return error.BadMetadata;
+            var codepoints = view.iterator();
+            while (codepoints.nextCodepoint()) |cp| {
+                const byte = codepointToByte(cp) orelse {
+                    valid = false;
+                    break;
+                };
+                try arena_bytes.append(gpa, byte);
+            }
+            if (!valid) arena_bytes.shrinkRetainingCapacity(start);
+            alphabet_token.* = .{ .offset = start, .len = if (valid) arena_bytes.items.len - start else Decoded.invalid };
+            if (ty == .control or ty == .user_defined) {
+                if (valid and std.mem.eql(u8, arena_bytes.items[start..], token)) {
+                    decoded_token.* = alphabet_token.*;
+                } else {
+                    decoded_token.* = .{ .offset = arena_bytes.items.len, .len = token.len };
+                    try arena_bytes.appendSlice(gpa, token);
+                }
+            } else decoded_token.* = alphabet_token.*;
+        }
+        const decoded_bytes = try arena_bytes.toOwnedSlice(gpa);
+        errdefer gpa.free(decoded_bytes);
+        var raw_ids: std.StringHashMapUnmanaged(Id) = .empty;
+        errdefer raw_ids.deinit(gpa);
+        if (pre.ignoresMerges()) {
+            try raw_ids.ensureTotalCapacity(gpa, @intCast(n));
+            for (alphabet, 0..) |entry, index| {
+                if (entry.len == Decoded.invalid) continue;
+                const gop = raw_ids.getOrPutAssumeCapacity(decoded_bytes[entry.offset..][0..entry.len]);
+                if (!gop.found_existing) gop.value_ptr.* = @intCast(index);
+            }
         }
 
         return .{
@@ -137,8 +199,12 @@ pub const Tokenizer = struct {
             .types = types,
             .ids = ids,
             .merges = merges,
+            .decoded = decoded,
+            .decoded_bytes = decoded_bytes,
+            .raw_ids = raw_ids,
             .byte_token = byte_token,
             .added = try added.toOwnedSlice(gpa),
+            .added_offsets = added_offsets,
             .pre = pre,
             .eos = getId(file, "tokenizer.ggml.eos_token_id"),
             .bos = getId(file, "tokenizer.ggml.bos_token_id"),
@@ -164,12 +230,14 @@ pub const Tokenizer = struct {
 
     pub fn encode(t: *const Tokenizer, gpa: Allocator, text: []const u8, out: *std.ArrayList(Id)) EncodeError!void {
         if (t.add_bos) if (t.bos) |b| try out.append(gpa, b);
+        var scratch: bpe.Scratch = .{};
+        defer scratch.deinit(gpa);
 
         var pos: usize = 0;
         var seg_start: usize = 0;
         while (pos < text.len) {
             if (t.matchAdded(text[pos..])) |id| {
-                try t.encodeSegment(gpa, text[seg_start..pos], out);
+                try t.encodeSegment(gpa, text[seg_start..pos], out, &scratch);
                 try out.append(gpa, id);
                 pos += t.tokens[id].len;
                 seg_start = pos;
@@ -177,59 +245,35 @@ pub const Tokenizer = struct {
                 pos += 1;
             }
         }
-        try t.encodeSegment(gpa, text[seg_start..], out);
+        try t.encodeSegment(gpa, text[seg_start..], out, &scratch);
     }
 
     fn matchAdded(t: *const Tokenizer, rest: []const u8) ?Id {
-        for (t.added) |id| {
+        for (t.added[t.added_offsets[rest[0]]..t.added_offsets[@as(usize, rest[0]) + 1]]) |id| {
             if (std.mem.startsWith(u8, rest, t.tokens[id])) return id;
         }
         return null;
     }
 
-    fn encodeSegment(t: *const Tokenizer, gpa: Allocator, raw: []const u8, out: *std.ArrayList(Id)) EncodeError!void {
+    fn encodeSegment(t: *const Tokenizer, gpa: Allocator, raw: []const u8, out: *std.ArrayList(Id), scratch: *bpe.Scratch) EncodeError!void {
         if (raw.len == 0) return;
         const normalized = if (t.pre.nfc()) try unicode.nfc(gpa, raw) else null;
         defer if (normalized) |n| gpa.free(n);
         const text = normalized orelse raw;
 
-        var symbols: std.ArrayList(Id) = .empty;
-        defer symbols.deinit(gpa);
-        var mapped: std.ArrayList(u8) = .empty;
-        defer mapped.deinit(gpa);
         var pieces = pretokenize.iterator(t.pre, text);
         while (pieces.next()) |piece| {
+            if (piece.len == 1) {
+                try out.append(gpa, t.byte_token[piece[0]]);
+                continue;
+            }
             if (t.pre.ignoresMerges()) {
-                mapped.clearRetainingCapacity();
-                for (piece) |b| try mapped.appendSlice(gpa, t.tokens[t.byte_token[b]]);
-                if (t.ids.get(mapped.items)) |id| {
+                if (t.raw_ids.get(piece)) |id| {
                     try out.append(gpa, id);
                     continue;
                 }
             }
-            symbols.clearRetainingCapacity();
-            try symbols.ensureTotalCapacity(gpa, piece.len);
-            for (piece) |b| symbols.appendAssumeCapacity(t.byte_token[b]);
-            t.mergeAll(&symbols);
-            try out.appendSlice(gpa, symbols.items);
-        }
-    }
-
-    /// Repeatedly merges the lowest-ranked adjacent pair, leftmost on ties.
-    fn mergeAll(t: *const Tokenizer, symbols: *std.ArrayList(Id)) void {
-        while (symbols.items.len > 1) {
-            var best: ?usize = null;
-            var best_merge: Merge = undefined;
-            for (symbols.items[0 .. symbols.items.len - 1], symbols.items[1..], 0..) |a, b, i| {
-                const m = t.merges.get(pairKey(a, b)) orelse continue;
-                if (best == null or m.rank < best_merge.rank) {
-                    best = i;
-                    best_merge = m;
-                }
-            }
-            const i = best orelse return;
-            symbols.items[i] = best_merge.id;
-            _ = symbols.orderedRemove(i + 1);
+            try scratch.encode(gpa, &t.merges, &t.byte_token, piece, out);
         }
     }
 
@@ -239,23 +283,12 @@ pub const Tokenizer = struct {
     pub fn decode(t: *const Tokenizer, gpa: Allocator, ids: []const Id, out: *std.ArrayList(u8)) DecodeError!void {
         for (ids) |id| {
             if (id >= t.tokens.len) return error.UnknownToken;
-            const s = t.tokens[id];
-            switch (t.types[id]) {
-                .control, .user_defined => try out.appendSlice(gpa, s),
-                else => {
-                    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
-                    while (it.nextCodepoint()) |cp| {
-                        try out.append(gpa, codepointToByte(cp) orelse return error.UnknownToken);
-                    }
-                },
-            }
+            const entry = t.decoded[id];
+            if (entry.len == Decoded.invalid) return error.UnknownToken;
+            try out.appendSlice(gpa, t.decoded_bytes[entry.offset..][0..entry.len]);
         }
     }
 };
-
-fn pairKey(a: Id, b: Id) u64 {
-    return (@as(u64, a) << 32) | b;
-}
 
 fn getString(f: gguf.File, key: []const u8) ?[]const u8 {
     const v = f.get(key) orelse return null;
@@ -317,4 +350,46 @@ test "byte alphabet is a bijection onto 256 code points" {
     try std.testing.expectEqual(@as(u21, 'A'), byteToCodepoint('A'));
     try std.testing.expectEqual(@as(u21, 0x120), byteToCodepoint(' '));
     try std.testing.expectEqual(@as(u21, 0x10A), byteToCodepoint('\n'));
+}
+
+test "predecoded bytes preserve split UTF-8 and streaming stop boundaries" {
+    const gpa = std.testing.allocator;
+    var bytes = "\xe2\x82\xac<stop>".*;
+    var entries = [_]Tokenizer.Decoded{
+        .{ .offset = 0, .len = 1 },
+        .{ .offset = 1, .len = 2 },
+        .{ .offset = 3, .len = 6 },
+        .{ .offset = 0, .len = Tokenizer.Decoded.invalid },
+    };
+    const tok: Tokenizer = .{
+        .tokens = &.{ "first-byte", "remaining-bytes", "<stop>", "invalid" },
+        .types = &.{},
+        .ids = .empty,
+        .merges = .{ .entries = &.{} },
+        .decoded = &entries,
+        .decoded_bytes = &bytes,
+        .raw_ids = .empty,
+        .byte_token = undefined,
+        .added = &.{},
+        .added_offsets = @splat(0),
+        .pre = .qwen2,
+        .eos = null,
+        .bos = null,
+        .add_bos = false,
+    };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(gpa);
+    try tok.decode(gpa, &.{ 0, 1, 2 }, &output);
+    try std.testing.expectEqualStrings("€<stop>", output.items);
+    try std.testing.expectError(error.UnknownToken, tok.decode(gpa, &.{3}, &output));
+    try std.testing.expectError(error.UnknownToken, tok.decode(gpa, &.{4}, &output));
+    output.clearRetainingCapacity();
+    var stream: @import("stream.zig").Stream = .{ .stops = &.{"<stop>"} };
+    defer stream.deinit(gpa);
+    try std.testing.expect(!try stream.push(gpa, &tok, 0, &output));
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+    try std.testing.expect(!try stream.push(gpa, &tok, 1, &output));
+    try std.testing.expectEqualStrings("€", output.items);
+    try std.testing.expect(try stream.push(gpa, &tok, 2, &output));
+    try std.testing.expectEqualStrings("€", output.items);
 }

@@ -207,6 +207,34 @@ A corpus match is a release gate, not proof of equivalence. During
 development, 3,000 randomly generated mixed-script strings also matched with
 zero mismatches. That fuzz run is not a pinned check.
 
+The [tokenizer chapter](tokenizer.md) explains the portable cached-rank BPE
+engine and its encode-only benchmark. Unit tests compare both the short
+scan and long heap schedulers with an exhaustive rank/leftmost merge
+oracle, exercise merge-table collisions and duplicate ranks, and check
+predecoded tokens across split UTF-8 and streaming stop boundaries.
+Normalizer tests also use a failing allocator to prove unchanged ASCII
+and safe Unicode inputs are borrowed without allocating.
+
+On 2026-10-31, four deliberate engine mutations were each rejected by
+the merge oracle: choosing rightmost heap ties, skipping predecessor
+candidate repair, accepting stale heap entries, and choosing rightmost
+short-scan ties. The mutations ran on temporary copies, which were then
+removed; this is evidence that those fault classes are detected, not a
+claim of exhaustive mutation coverage.
+
+`tools/test_tokenize_bench.py` mutates corpus records, token ids, work
+counts, elapsed time and rates to ensure the comparison harness rejects
+malformed or inconsistent results. It also checks that the llama.cpp
+measurement comes from the helper's inner clock, never subprocess
+startup, and that an unavailable build has no reported throughput:
+
+```sh
+uv run --project tools python -m unittest discover -s tools -p test_tokenize_bench.py
+```
+
+All 10 benchmark-harness mutation tests passed in the same final
+validation run on 2026-10-31.
+
 ## Chat template
 
 `check-chat` renders the 44 conversations in `tools/corpus/chat.jsonl` with

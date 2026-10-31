@@ -13,6 +13,7 @@
   - [Gyro-Coder](gyro.md)
 - [Precision](precision.md)
 - [Generation and serving](generation.md)
+- [Tokenization](tokenizer.md)
 - [Browser](browser.md)
 - [Performance](performance.md)
 - [Validation](validation.md)
