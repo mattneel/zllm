@@ -26,7 +26,7 @@ struct Params {
     eps: f32,
     flags: u32,
     half: u32,
-    _pad: u32,
+    x_stride: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;

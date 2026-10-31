@@ -222,6 +222,10 @@ pub const MatvecVariant = struct {
     wg: u32 = 256,
     lanes: u32 = 32,
     rows: u32 = 1,
+    /// A fused prologue, not a tuned parameter: nonzero, each input is
+    /// staged as silu(x / act_div) (hc_act folded into the multiply after
+    /// it).
+    act_div: u32 = 0,
 
     /// Rows one workgroup computes.
     pub fn groupRows(v: MatvecVariant) u32 {
@@ -256,6 +260,7 @@ pub const MatvecVariant = struct {
             .{ .name = "wg", .value = .{ .int = v.wg } },
             .{ .name = "lanes", .value = .{ .int = v.lanes } },
             .{ .name = "rows", .value = .{ .int = v.rows } },
+            .{ .name = "act_div", .value = .{ .int = v.act_div } },
         }, &.{}, &out);
         return out.items;
     }
@@ -352,7 +357,9 @@ pub const params = struct {
         flags: Flags = .{},
         /// The up rows' first row, with `silu_pair`.
         half: u32 = 0,
-        _pad: u32 = 0,
+        /// Vectors of 4 between tokens' inputs; 0: k / 4. (The quantized
+        /// kernel only: an input read out of a wider row.)
+        x_stride: u32 = 0,
 
         pub const Flags = packed struct(u32) {
             /// RMSNorm the input first, with `eps` and the weights bound at 4.
@@ -603,8 +610,9 @@ pub const Set = struct {
     n_variants: usize = 0,
 
     const Variant = struct { kernel: Kernel, v: MatvecVariant, pipeline: cmd.Pipeline };
-    /// Every candidate of every quantized type.
-    const max_variants = 5 * MatvecVariant.candidates.len;
+    /// Every candidate of every quantized type, with and without a fused
+    /// prologue.
+    const max_variants = 2 * 5 * MatvecVariant.candidates.len;
 
     pub const Error = Allocator.Error || tmpl.Error;
 

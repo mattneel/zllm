@@ -17,7 +17,10 @@
 // multiple of the 32 lanes in tasks (32 or 64 for the K-quants, 256 or 512
 // for Q8_0), so each lane accumulates the same tasks in the same order.
 //
-// Fused around it, by flag (as matvec_bf16):
+// Fused before it, by template parameter: with act_div > 0, each input is
+// staged as silu(x / act_div), read from rows of x_stride vectors (hc_act:
+// the hyper-connection mixer's activation between its down and up
+// projections). Fused around it, by flag (as matvec_bf16):
 //   NORM        x ← rmsnorm(x) · norm_w first; every workgroup reduces the
 //               row's sum of squares itself
 //   ACCUMULATE  out += result
@@ -35,7 +38,7 @@ struct Params {
     eps: f32,
     flags: u32,
     half: u32,
-    _pad: u32,
+    x_stride: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -134,6 +137,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @
     // This lane group's rows: j0 + q, q < R.
     let j0 = (wg.x * ROWS + r) * R;
     let k4 = p.k / 4u;
+    // Vectors between tokens' inputs.
+    let xr = select(k4, p.x_stride, p.x_stride != 0u);
     let norm = (p.flags & NORM) != 0u;
     let pair = (p.flags & SILU_PAIR) != 0u;
     let row_bytes = (p.k / BLOCK_ELEMS) * BLOCK_BYTES;
@@ -159,16 +164,24 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @
             workgroupBarrier();
             for (var i = li; i < len4; i += WG) {
                 let g = k0 / 4u + i;
-                var v = x[t * k4 + g];
+                var v = x[t * xr + g];
                 if (norm) {
                     v = v * scale0 * norm_w[g];
                 }
+                {{#if act_div}}
+                v = v / {{act_div}}.0;
+                v = v / (1.0 + exp(-v));
+                {{/if}}
                 xs[i] = v;
                 if (two) {
-                    var v2 = x[(t + 1u) * k4 + g];
+                    var v2 = x[(t + 1u) * xr + g];
                     if (norm) {
                         v2 = v2 * scale1 * norm_w[g];
                     }
+                    {{#if act_div}}
+                    v2 = v2 / {{act_div}}.0;
+                    v2 = v2 / (1.0 + exp(-v2));
+                    {{/if}}
                     xs[XT + i] = v2;
                 }
             }

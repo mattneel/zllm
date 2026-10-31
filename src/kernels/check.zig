@@ -49,8 +49,8 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
         checkSampleVocab,      Quant(.q8_0).matvec,  Quant(.q8_0).matmul, Quant(.q8_0).embed,     checkEmbedStride,
         Quant(.q3_k).matvec,   Quant(.q3_k).matmul,  Quant(.q3_k).embed,  Quant(.q4_k).matvec,    Quant(.q4_k).matmul,
         Quant(.q4_k).embed,    Quant(.q5_k).matvec,  Quant(.q5_k).matmul, Quant(.q5_k).embed,     Quant(.q6_k).matvec,
-        Quant(.q6_k).matmul,   Quant(.q6_k).embed,   checkQuantTiles,     checkQuantSiluPair,     checkQuantizeQ8K,
-        checkQuantizeQ80,      checkQuantizeNorm,    checkQuantizeSilu,
+        Quant(.q6_k).matmul,   Quant(.q6_k).embed,   checkQuantTiles,     checkQuantSiluPair,     checkQuantAct,
+        checkQuantizeQ8K,      checkQuantizeQ80,     checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
         const r = try f(&ctx);
         const pass = r.err <= r.tolerance;
@@ -649,6 +649,46 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
     var worst: f64 = 0;
     for (got) |g| worst = @max(worst, relErr(g, want));
     return .{ .name = name, .err = worst, .tolerance = 1e-5 };
+}
+
+/// hc_act fused into the multiply after it: each input staged as
+/// silu(x / 4), read from rows 264 floats apart (the down projection's
+/// rank columns, its stream weights after them), every variant, 3 tokens
+/// (a pair, then a lone one).
+fn checkQuantAct(c: *Ctx) !Result {
+    const rows = 3;
+    const n = 100;
+    const k = 256;
+    const stride = k + 8;
+    const div = 4;
+    const x = try c.random(rows * stride, 3);
+    const w = try quantRows(c, .q8_0, n, k);
+    const xa = try c.upload(x);
+    const wa = try gpuWeights(c, .q8_0, w.bytes);
+    var worst: f64 = 0;
+    const want = try c.arena.alloc(f64, rows * n);
+    for (0..rows) |tk| for (0..n) |j| {
+        var s: f64 = 0;
+        for (0..k) |i| {
+            const v = @as(f64, x[tk * stride + i]) / div;
+            s += v * sigmoid64(v) * w.values[j * k + i];
+        }
+        want[tk * n + j] = s;
+    };
+    for (kernels.MatvecVariant.candidates) |cand| {
+        var v = cand;
+        v.act_div = div;
+        const out = try c.output(rows * n);
+        try c.launcher().launchPipeline(try c.set.matvec(c.gpa, c.arena, &c.rec, .matvec_q8_0, v), P.MatvecBf16{
+            .n = n,
+            .k = k,
+            .col0 = 0,
+            .out_stride = n,
+            .x_stride = stride / 4,
+        }, &.{ xa, wa, out, wa }, .{ std.math.divCeil(u32, n, v.groupRows()) catch unreachable, rows, 1 });
+        worst = @max(worst, relErr(try c.read(out), want));
+    }
+    return .{ .name = "matvec q8_0 act prologue", .err = worst, .tolerance = 1e-5 };
 }
 
 fn checkQuantTiles(c: *Ctx) !Result {

@@ -235,6 +235,7 @@ errors to within a factor of 2.
 | embed_bf16, embed_f16 | 0 | 0 |
 | rope_append, f32 cache | 9.3e-8 | 1e-5 |
 | rope_append, f16 cache | 2.4e-4 | 5e-4 (half an f16 step) |
+| matvec q8_0 with the hc_act prologue (fused), every variant, inputs read from wider rows | 1.1e-7 | 1e-5 |
 | rope_append's f16 rounding, 65,536 values | 0 differ | 0 |
 | rope_append, dense layouts (normal RoPE with divisors; Qwen 3), f16 cache | 2.4e-4 | 5e-4 |
 | attention in 3 chunks, f32 and f16 cache; groups of 12; ungated | 3.6e-7 | 1e-5 |

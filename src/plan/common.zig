@@ -327,6 +327,9 @@ pub const Mm = struct {
         accumulate: bool = false,
         /// The weight is gate | up, each this many rows: out = silu(gate) · up.
         silu_pair: ?u32 = null,
+        /// Stage each input as silu(x / div), x read from rows `stride` floats
+        /// apart (hc_act folded in; quantized weights only).
+        act: ?struct { stride: u32, div: u32 } = null,
     };
 
     /// A prefill multiply's input: x as is, or computed from x by the
@@ -438,8 +441,13 @@ pub const Mm = struct {
             std.debug.assert(w.n == 2 * half);
         }
         const flags: P.MatvecBf16.Flags = .{ .norm = fuse.norm != null, .accumulate = fuse.accumulate, .silu_pair = fuse.silu_pair != null };
+        if (fuse.act) |a| {
+            // The prologue reads whole vectors of a row of its own width.
+            if (fuse.norm != null or a.stride % 4 != 0 or w.k % 4 != 0 or a.div == 0) return error.BadConfig;
+        }
         const list = try mm.arena.alloc(kernels.Launch, w.chunks.len);
         for (w.chunks, list) |ch, *l| {
+            if (fuse.act != null and kernels.isHalf(ch.type)) return error.BadConfig;
             // The half-precision kernel normalizes only staged inputs.
             if (kernels.isHalf(ch.type) and fuse.norm != null and w.k > kernels.matvec_max_staged) return error.BadConfig;
             const n = fuse.silu_pair orelse ch.rows;
@@ -452,6 +460,7 @@ pub const Mm = struct {
                 .eps = mm.eps,
                 .flags = flags,
                 .half = fuse.silu_pair orelse 0,
+                .x_stride = if (fuse.act) |a| a.stride / 4 else 0,
             };
             const args = [_]Arg{
                 x,                       ch.arg, out,
@@ -461,7 +470,8 @@ pub const Mm = struct {
             if (kernels.isHalf(ch.type)) {
                 l.* = try mm.b.add(kernel, params, &args, .{ .rows_y = std.math.divCeil(u32, n, kernels.matvec_rows) catch unreachable });
             } else {
-                const v = mm.tuning.matvec(ch.type, w.n, w.k);
+                var v = mm.tuning.matvec(ch.type, w.n, w.k);
+                if (fuse.act) |a| v.act_div = a.div;
                 l.* = try mm.b.addMatvec(kernel, v, params, &args, .{ .rows_y = std.math.divCeil(u32, n, v.groupRows()) catch unreachable });
             }
         }

@@ -520,9 +520,18 @@ pub const Program = struct {
             fn build(list: *std.ArrayList(Item), bb: *kernels.Builder, m_: Mm, al_: Allocator, h: *const Hc, hp_: Hparams, bufs: anytype) Program.BuildError!void {
                 try list.append(al_, .{ .launch = try bb.add(.rmsnorm, P.RmsNorm{ .rows = 0, .dim = hp_.n_embd, .eps = hp_.eps, .w_rows = hp_.hc }, &.{ bufs.res, h.norm, bufs.xn }, .rows_x), .mul = hp_.hc });
                 try add(list, al_, try m_.vector(bufs.down, bufs.xn, &h.down, .{}));
-                const silu: P.HcAct = .{ .count = kernels.decode_max_rows * hp_.hc_rank, .hc = hp_.hc, .rank = hp_.hc_rank, .stride = @intCast(h.down.n) };
-                try list.append(al_, .{ .launch = try bb.add(.hc_act, silu, &.{ bufs.down, bufs.lo }, .{ .elems = hp_.hc_rank }) });
-                try add(list, al_, try m_.vector(bufs.gate, bufs.lo, &h.up, .{}));
+                // hc_act runs as the up multiply's prologue where its weights
+                // are quantized (no `lo` round trip, one dispatch fewer).
+                const fusable = for (h.up.chunks) |ch| {
+                    if (kernels.isHalf(ch.type)) break false;
+                } else h.down.n % 4 == 0 and hp_.hc_rank % 4 == 0;
+                if (fusable) {
+                    try add(list, al_, try m_.vector(bufs.gate, bufs.down, &h.up, .{ .act = .{ .stride = @intCast(h.down.n), .div = hp_.hc } }));
+                } else {
+                    const silu: P.HcAct = .{ .count = kernels.decode_max_rows * hp_.hc_rank, .hc = hp_.hc, .rank = hp_.hc_rank, .stride = @intCast(h.down.n) };
+                    try list.append(al_, .{ .launch = try bb.add(.hc_act, silu, &.{ bufs.down, bufs.lo }, .{ .elems = hp_.hc_rank }) });
+                    try add(list, al_, try m_.vector(bufs.gate, bufs.lo, &h.up, .{}));
+                }
                 try list.append(al_, .{ .launch = try bb.add(.hc_mix, P.Hc{ .dim = hp_.n_embd, .hc = hp_.hc }, &.{ bufs.xn, bufs.gate, bufs.cur }, .{ .rows_y = bufs.col_groups }) });
             }
         };
