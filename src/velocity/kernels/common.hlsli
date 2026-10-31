@@ -4,7 +4,9 @@
 // b0, and every buffer has a raw SRV and a raw UAV in one shader-visible heap.
 // Binding i of a kernel (its WGSL @binding(i): 0 is the params block, then the
 // kernel's buffers in contract order) is three constants: the buffer's SRV
-// index, its UAV index, and the binding's byte offset into the buffer.
+// index, its UAV index, and the binding's byte offset into the buffer, for
+// up to 19 bindings. Constants 57..59 hold the dispatch's grid (WGSL's
+// num_workgroups), which HLSL has no builtin for.
 //
 // Use ro(i) only for buffers that only uploads write (write_buffer,
 // write_file: weights, tables): D3D12 promotes a buffer to one access state
@@ -21,6 +23,8 @@ ByteAddressBuffer ro(uint i) { return ResourceDescriptorHeap[NonUniformResourceI
 RWByteAddressBuffer rw(uint i) { return ResourceDescriptorHeap[NonUniformResourceIndex(binding_word(3 * i + 1))]; }
 /// Byte offset of binding i into its buffer.
 uint base(uint i) { return binding_word(3 * i + 2); }
+/// The dispatch's group counts (WGSL's num_workgroups).
+uint3 num_groups() { return uint3(bindings[14][1], bindings[14][2], bindings[14][3]); }
 
 /// The params block's u32 word `w` (binding 0).
 uint param(uint w) { return rw(0).Load(base(0) + 4 * w); }

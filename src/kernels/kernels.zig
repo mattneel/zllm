@@ -262,10 +262,11 @@ pub const MatvecVariant = struct {
     };
 
     /// The WGSL of decode multiply `k` with these parameters, in `arena`.
-    pub fn render(v: MatvecVariant, arena: Allocator, k: Kernel) (tmpl.Error)![]const u8 {
-        std.debug.assert(k.isTemplate());
+    /// Renders template `source` (a templated kernel's, on any backend)
+    /// for this variant.
+    pub fn render(v: MatvecVariant, arena: Allocator, source: []const u8) (tmpl.Error)![]const u8 {
         var out: std.ArrayList(u8) = .empty;
-        try tmpl.render(arena, k.source(), &.{
+        try tmpl.render(arena, source, &.{
             .{ .name = "wg", .value = .{ .int = v.wg } },
             .{ .name = "lanes", .value = .{ .int = v.lanes } },
             .{ .name = "rows", .value = .{ .int = v.rows } },
@@ -680,8 +681,11 @@ pub const Set = struct {
 /// a template.
 fn artifact(backend: Backend, arena: Allocator, k: Kernel, v: MatvecVariant) (Set.Error || error{UnsupportedKernel})![]const u8 {
     return switch (backend) {
-        .webgpu => if (k.isTemplate()) v.render(arena, k) else k.source(),
-        .velocity => if (k.isTemplate()) error.UnsupportedKernel else velocity_kernels.source(k) orelse error.UnsupportedKernel,
+        .webgpu => if (k.isTemplate()) v.render(arena, k.source()) else k.source(),
+        .velocity => {
+            const source = velocity_kernels.source(k) orelse return error.UnsupportedKernel;
+            return if (k.isTemplate()) v.render(arena, source) else source;
+        },
     };
 }
 

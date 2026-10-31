@@ -1,0 +1,142 @@
+// Quantized decode multiply from matvec_quant.wgsl.hbs: paired tokens,
+// fixed lane reductions, optional normalization, SiLU pair and accumulation.
+static const uint NORM = 1u, ACCUMULATE = 2u, SILU_PAIR = 4u;
+static const uint WG = {{wg}}u;
+static const uint LANES = {{lanes}}u;
+static const uint R = {{rows}}u;
+static const uint ROWS = WG / LANES;
+static const uint TILE_ONE = 2048u, TILE_PAIR = 1024u, MAX_M = 4u;
+// xs[512] and XT = TILE_PAIR / 4 are declared in the preceding dot fragment.
+groupshared float partial[WG * R];
+groupshared float partial2[WG * R];
+float4 load_x(uint v) { return asfloat(rw(1).Load4(base(1) + 16u * v)); }
+float4 load_norm(uint v) { return asfloat(ro(4).Load4(base(4) + 16u * v)); }
+float norm_scale(uint t, uint li, uint k4) {
+    precise float ss = 0.0;
+    for (uint i = li; i < k4; i += WG) {
+        float4 v = load_x(t * k4 + i);
+        ss += dot(v, v);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    partial[li] = ss;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = WG / 2u; s > 0u; s /= 2u) {
+        if (li < s) { precise float v = partial[li] + partial[li + s]; partial[li] = v; }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    precise float scale = 1.0 / sqrt(partial[0] / float(param(1)) + paramf(4));
+    return scale;
+}
+void finish(uint t, uint li, uint j0, float acc[R], float acc2[R]) {
+    uint lane = li % LANES;
+    bool pair = (param(5) & SILU_PAIR) != 0u;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint q = 0u; q < R; q++) {
+        partial[q * WG + li] = acc[q];
+        partial2[q * WG + li] = acc2[q];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = LANES / 2u; s > 0u; s /= 2u) {
+        if (lane < s) {
+            for (uint q = 0u; q < R; q++) {
+                precise float v = partial[q * WG + li] + partial[q * WG + li + s];
+                precise float v2 = partial2[q * WG + li] + partial2[q * WG + li + s];
+                partial[q * WG + li] = v;
+                partial2[q * WG + li] = v2;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0u) {
+        for (uint q = 0u; q < R; q++) {
+            uint j = j0 + q;
+            if (j >= param(0)) break;
+            uint o = t * param(3) + param(2) + j;
+            precise float v = partial[q * WG + li];
+            if (pair) v = v / (1.0 + exp(-v)) * partial2[q * WG + li];
+            if ((param(5) & ACCUMULATE) != 0u) v += ldf(3, o);
+            stf(3, o, v);
+        }
+    }
+}
+[numthreads(WG, 1, 1)]
+void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
+    if (wg.y != 0u) return;
+    uint m = min(num_groups().y, MAX_M);
+    uint lane = li % LANES, r = li / LANES;
+    uint j0 = (wg.x * ROWS + r) * R;
+    uint k4 = param(1) / 4u;
+    uint xr = param(7) != 0u ? param(7) : k4;
+    bool norm = (param(5) & NORM) != 0u;
+    bool pair = (param(5) & SILU_PAIR) != 0u;
+    uint row_bytes = (param(1) / BLOCK_ELEMS) * BLOCK_BYTES;
+    uint tile = m > 1u ? TILE_PAIR : TILE_ONE;
+    for (uint t = 0u; t < m; t += 2u) {
+        bool two = t + 1u < m;
+        float scale0 = 1.0, scale1 = 1.0;
+        if (norm) {
+            scale0 = norm_scale(t, li, k4);
+            if (two) scale1 = norm_scale(t + 1u, li, k4);
+        }
+        precise float acc0[R] = (float[R])0;
+        precise float acc1[R] = (float[R])0;
+        precise float gate0[R] = (float[R])0;
+        precise float gate1[R] = (float[R])0;
+        for (uint k0 = 0u; k0 < param(1); k0 += tile) {
+            uint len4 = min(tile, param(1) - k0) / 4u;
+            GroupMemoryBarrierWithGroupSync();
+            for (uint i = li; i < len4; i += WG) {
+                uint g = k0 / 4u + i;
+                precise float4 v = load_x(t * xr + g);
+                if (norm) v = v * scale0 * load_norm(g);
+                {{#if act_div}}
+                v = v / {{act_div}}.0;
+                v = v / (1.0 + exp(-v));
+                {{/if}}
+                xs[i] = v;
+                if (two) {
+                    precise float4 v2 = load_x((t + 1u) * xr + g);
+                    if (norm) v2 = v2 * scale1 * load_norm(g);
+                    {{#if act_div}}
+                    v2 = v2 / {{act_div}}.0;
+                    v2 = v2 / (1.0 + exp(-v2));
+                    {{/if}}
+                    xs[XT + i] = v2;
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+            uint tasks = (4u * len4 / BLOCK_ELEMS) * PARTS;
+            if (two) {
+                for (uint task = lane; task < tasks; task += LANES) {
+                    uint blk = task / PARTS, part = task % PARTS;
+                    uint gblk = k0 / BLOCK_ELEMS + blk;
+                    uint xb4 = blk * (BLOCK_ELEMS / 4u);
+                    for (uint q = 0u; q < R; q++) {
+                        uint j = j0 + q;
+                        if (j >= param(0)) break;
+                        float2 d = block_dot2(j * row_bytes, gblk, xb4, part);
+                        acc0[q] += d.x; acc1[q] += d.y;
+                        if (pair) {
+                            float2 d2 = block_dot2((param(6) + j) * row_bytes, gblk, xb4, part);
+                            gate0[q] += d2.x; gate1[q] += d2.y;
+                        }
+                    }
+                }
+            } else {
+                for (uint task = lane; task < tasks; task += LANES) {
+                    uint blk = task / PARTS, part = task % PARTS;
+                    uint gblk = k0 / BLOCK_ELEMS + blk;
+                    uint xb4 = blk * (BLOCK_ELEMS / 4u);
+                    for (uint q = 0u; q < R; q++) {
+                        uint j = j0 + q;
+                        if (j >= param(0)) break;
+                        acc0[q] += block_dot(j * row_bytes, gblk, xb4, part);
+                        if (pair) gate0[q] += block_dot((param(6) + j) * row_bytes, gblk, xb4, part);
+                    }
+                }
+            }
+        }
+        finish(t, li, j0, acc0, gate0);
+        if (two) finish(t + 1u, li, j0, acc1, gate1);
+    }
+}

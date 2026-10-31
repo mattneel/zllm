@@ -155,6 +155,13 @@ static HRESULT wait_fence(vel_context *c, ID3D12Fence *fence, uint64_t ticket, u
     }
 }
 
+// As wait_fence, for teardown: a removed device runs nothing more, so its
+// work counts as finished and its objects can be released.
+static HRESULT settle(vel_context *c, ID3D12Fence *fence, uint64_t ticket, uint32_t timeout) {
+    HRESULT hr = wait_fence(c, fence, ticket, timeout);
+    return hr == DXGI_ERROR_DEVICE_REMOVED ? S_OK : hr;
+}
+
 static HRESULT retire_batches(vel_context *c, uint64_t complete) {
     size_t count = 0;
     bool status_pending = false;
@@ -533,10 +540,10 @@ extern "C" vel_result vel_readback(vel_context *c, vel_buffer *b, uint64_t offse
 
 extern "C" vel_result vel_release_buffer(vel_context *c, vel_buffer *b, uint32_t timeout) {
     if (!c || !b || b->owner != c) return E_INVALIDARG;
-    VEL_TRY(wait_fence(c, c->storage_fence.p, b->last_storage, timeout));
-    VEL_TRY(wait_fence(c, c->compute_fence.p, b->last_compute, timeout));
+    VEL_TRY(settle(c, c->storage_fence.p, b->last_storage, timeout));
+    VEL_TRY(settle(c, c->compute_fence.p, b->last_compute, timeout));
     // Bindless dispatches do not record which buffers they touch.
-    if (b->srv_index != UINT32_MAX) VEL_TRY(wait_fence(c, c->compute_fence.p, c->last_bindless_compute, timeout));
+    if (b->srv_index != UINT32_MAX) VEL_TRY(settle(c, c->compute_fence.p, c->last_bindless_compute, timeout));
     if (b->srv_index != UINT32_MAX) c->heap_free.push_back(b->srv_index);
     if (b->uav_index != UINT32_MAX) c->heap_free.push_back(b->uav_index);
     c->buffers.erase(std::find(c->buffers.begin(), c->buffers.end(), b));
@@ -546,7 +553,7 @@ extern "C" vel_result vel_release_buffer(vel_context *c, vel_buffer *b, uint32_t
 
 extern "C" vel_result vel_release_file(vel_context *c, vel_file *f, uint32_t timeout) {
     if (!c || !f || f->owner != c) return E_INVALIDARG;
-    VEL_TRY(wait_fence(c, c->storage_fence.p, f->last_storage, timeout));
+    VEL_TRY(settle(c, c->storage_fence.p, f->last_storage, timeout));
     c->files.erase(std::find(c->files.begin(), c->files.end(), f));
     delete f;
     return S_OK;
@@ -554,8 +561,8 @@ extern "C" vel_result vel_release_file(vel_context *c, vel_file *f, uint32_t tim
 
 extern "C" vel_result vel_destroy(vel_context *c, uint32_t timeout) {
     if (!c) return S_OK;
-    VEL_TRY(wait_fence(c, c->storage_fence.p, c->next_storage, timeout));
-    VEL_TRY(wait_fence(c, c->compute_fence.p, c->next_compute, timeout));
+    VEL_TRY(settle(c, c->storage_fence.p, c->next_storage, timeout));
+    VEL_TRY(settle(c, c->compute_fence.p, c->next_compute, timeout));
     c->storage->Close();
     delete c;
     return S_OK;
@@ -735,7 +742,7 @@ extern "C" vel_result vel_remove_device(vel_context *c) {
 
 extern "C" vel_result vel_release_pipeline(vel_context *c, vel_pipeline *p, uint32_t timeout) {
     if (!c || !p || p->owner != c) return E_INVALIDARG;
-    VEL_TRY(wait_fence(c, c->compute_fence.p, c->last_bindless_compute, timeout));
+    VEL_TRY(settle(c, c->compute_fence.p, c->last_bindless_compute, timeout));
     c->pipelines.erase(std::find(c->pipelines.begin(), c->pipelines.end(), p));
     delete p;
     return S_OK;

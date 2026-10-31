@@ -37,7 +37,9 @@ DirectStorage. It is built by `zig c++` for `x86_64-windows-gnu`.
 - **Bindless:** every buffer has a raw SRV and a raw UAV in one
   shader-visible heap.
 - **Bindings:** one root signature of 60 root constants. A kernel's binding
-  *i* is three of them: the SRV index, the UAV index and the byte offset.
+  *i* is three of them: the SRV index, the UAV index and the byte offset,
+  for up to 19 bindings. The last three hold the dispatch's grid, which
+  `num_groups()` returns (WGSL's `num_workgroups`, which HLSL lacks).
   `kernels/common.hlsli` reads them.
 - **Device:** comes from the Agility SDK runtime through a device factory,
   with experimental shader models enabled on that factory only. Dawn in the
@@ -63,14 +65,24 @@ keeps its WGSL counterpart's contract:
 
 - the params block at binding 0;
 - the same buffers at the same bindings;
-- the same grid.
+- the same grid;
+- the same algorithm and reduction order, so results match WebGPU's to
+  the checks' tolerances, bitwise where the checks are bitwise.
 
-Dispatching a kernel Velocity lacks fails with `error.UnsupportedKernel`.
-`gpu-check` reports such checks as `MISSING`, and models refuse to load on
-Velocity until every kernel is ported.
+Kernels are composed from parts the way the WGSL is: half-precision and
+quantized types' decoders, the attention masks, and f16 rounding are
+shared fragments (`.hlsli`). The quantized decode multiply is a template
+(`matvec_quant.hlsl.hbs`) over the same variants WebGPU's tuner explores.
 
-Ported: `rmsnorm`. The rest of the 47 kernels are in progress, Gyro-Coder's
-set first.
+Velocity implements every kernel; a unit test holds it to that. A backend
+that lacked one would mark it missing: dispatching it fails with
+`error.UnsupportedKernel`, `gpu-check` reports `MISSING`, and models refuse
+to load.
+
+On the RTX 5090 Laptop, Velocity passes every `gpu-check` case (69) and
+every engine-check scenario (15) with Qwen3.5-0.8B, including the bitwise
+ones: speculative decoding, pipelined decode, and recovery after a lost
+device.
 
 ## Building and running
 
@@ -88,6 +100,8 @@ ZLLM_BACKEND=velocity scripts/d3d12.sh gpu-check
 ```
 
 `scripts/d3d12.sh` adds `-Dvelocity` when the SDKs are present.
+`-Dgpu-host=velocity` runs the parity checks (`gpu-check`, `check-gpu`,
+`check-quant`, `check-gyro`) on Velocity.
 
 `ZLLM_BACKEND` selects the backend for every GPU command: `webgpu` (the
 default) or `velocity`. `ZLLM_ADAPTER` picks Velocity's adapter, in DXGI's

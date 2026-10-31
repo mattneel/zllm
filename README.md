@@ -65,7 +65,7 @@ cd web && bun install && bun run dev   # chat demo on http://localhost:8080/
 
 Add `-Dgpu-host=d3d12` to the GPU checks to run them on a Windows GPU from WSL (see [GPU backend](https://mattneel.github.io/zllm/gpu.html)).
 
-zllm runs on more than one GPU backend: WebGPU (Dawn natively, and the browser), and Velocity, a native Direct3D 12 backend with its own HLSL kernels, LinAlg wave matrices and DirectStorage (see [Velocity](https://mattneel.github.io/zllm/velocity.html); its kernel port is in progress). `ZLLM_BACKEND=velocity` selects it.
+zllm runs on more than one GPU backend: WebGPU (Dawn natively, and the browser), and Velocity, a native Direct3D 12 backend with its own HLSL kernels, LinAlg wave matrices and DirectStorage (see [Velocity](https://mattneel.github.io/zllm/velocity.html)). `ZLLM_BACKEND=velocity` selects it.
 
 ## Documentation
 

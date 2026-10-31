@@ -113,14 +113,13 @@ const Buffer = struct {
 };
 
 /// A bind group as root constants: (SRV, UAV, byte offset) per binding.
-const Group = struct {
-    words: [max_words]u32,
-    len: u32,
-};
+/// The dispatch adds its grid at `grid_word` (common.hlsli's num_groups).
+const Group = struct { words: [max_words]u32 };
 const max_words = 60;
+const grid_word = 57;
 
 const Op = union(enum) {
-    dispatch: struct { pipeline: *c.vel_pipeline, id: u32, grid: [3]u32, words: [max_words]u32, len: u32 },
+    dispatch: struct { pipeline: *c.vel_pipeline, id: u32, grid: [3]u32, words: [max_words]u32 },
     copy: Copy,
     fill: struct { dst: u32, dst_offset: u32, words: u32 },
 };
@@ -293,23 +292,23 @@ pub const Host = struct {
                 try need(a, 4);
                 const count = a[3];
                 if (a.len != 4 + count * 6 or a[2] != 0) return error.BadCommand;
-                var g: Group = .{ .words = @splat(0), .len = 0 };
+                var g: Group = .{ .words = @splat(0) };
                 for (0..count) |i| {
                     const e: cmd.Command = .{ .op = command.op, .args = a[4 + i * 6 ..][0..6] };
                     const binding = e.args[0];
-                    if (3 * binding + 3 > max_words) return error.BadCommand;
+                    if (3 * binding + 3 > grid_word) return error.BadCommand;
                     const b = try get(Buffer, h.buffers, e.args[1]);
                     const offset = e.u64At(2);
                     if (offset > std.math.maxInt(u32)) return error.BadCommand;
                     g.words[3 * binding ..][0..3].* = .{ b.info.srv_index, b.info.uav_index, @intCast(offset) };
-                    g.len = @max(g.len, 3 * binding + 3);
                 }
                 try put(Group, h.gpa, &h.groups, a[0], g);
             },
             .dispatch => {
                 try need(a, 5);
                 if (a.len != 5 + a[4] or a[4] > 1) return error.BadCommand;
-                const g: Group = if (a[4] == 1) try get(Group, h.groups, a[5]) else .{ .words = @splat(0), .len = 0 };
+                var g: Group = if (a[4] == 1) try get(Group, h.groups, a[5]) else .{ .words = @splat(0) };
+                g.words[grid_word..][0..3].* = a[1..4].*;
                 const pipeline = switch (try get(Pipeline, h.pipelines, a[0])) {
                     .ready => |p| p,
                     .missing => |k| return h.d.missing(k),
@@ -319,7 +318,6 @@ pub const Host = struct {
                     .id = a[0],
                     .grid = a[1..4].*,
                     .words = g.words,
-                    .len = g.len,
                 } });
             },
             .copy_buffer => {
@@ -481,7 +479,7 @@ pub const Host = struct {
                     } else false;
                     const i = h.pending_times.items.len;
                     if (timed) try h.d.check(c.vel_timestamp(ctx, &times[2 * i]));
-                    try h.d.check(c.vel_dispatch(ctx, dp.pipeline, &dp.words, dp.len, dp.grid[0], dp.grid[1], dp.grid[2]));
+                    try h.d.check(c.vel_dispatch(ctx, dp.pipeline, &dp.words, max_words, dp.grid[0], dp.grid[1], dp.grid[2]));
                     if (timed) {
                         try h.d.check(c.vel_timestamp(ctx, &times[2 * i + 1]));
                         try h.pending_times.append(h.gpa, .{ .pipeline = dp.id, .grid = dp.grid });
