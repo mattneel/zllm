@@ -79,10 +79,19 @@ that lacked one would mark it missing: dispatching it fails with
 `error.UnsupportedKernel`, `gpu-check` reports `MISSING`, and models refuse
 to load.
 
-On the RTX 5090 Laptop, Velocity passes every `gpu-check` case (69) and
-every engine-check scenario (15) with Qwen3.5-0.8B, including the bitwise
-ones: speculative decoding, pipelined decode, and recovery after a lost
-device.
+On the RTX 5090 Laptop, Velocity passes every parity gate:
+
+| Gate | Result on Velocity |
+|---|---|
+| `gpu-check` | 69/69 kernel cases |
+| `check-gpu` (Qwen3.5-0.8B, dense models) | prefill 1264/1264 and decode 320/320 top-1, max rel L2 1.4e-5; f16 KV 818/818; engine-check 15/15, including speculative decoding, pipelined decode and recovery after a lost device |
+| `check-quant` (Granite 4.2 30B Q4_K_M) | decode 200/200 top-1, max rel L2 3.5e-5; prefill 870/890 against llama.cpp, the reference's own figure |
+| `check-gyro` (Qwen3.8-Flash-Next Gyro-Coder) | 0 expert sets differ; logits median rel L2 1.7e-5; 66/66 top-1, 40/40 greedy; step splits and fusion bitwise identical; the 6,430-token prompt answers correctly |
+
+Its speed is WebGPU's, since the kernels are the same algorithms: the
+Gyro-Coder prefills at 66 tok/s and decodes at 28 tok/s. Velocity-specific
+kernels (LinAlg wave matrices on the tensor cores, wave reductions, DP4a)
+are the next step.
 
 ## Building and running
 
