@@ -83,7 +83,8 @@ A fusion is legal only if it needs no cross-workgroup sync and fits the device l
 - **Device lost:** a typed error, then the engine rebuilds from the plan cache.
 
 ## 9. State and prefix reuse
-- **Attention layers:** paged f16 KV with 256-token pages. Rewinding drops the pages past the shared prefix.
+- **Attention layers:** paged KV with 256-token pages. Rewinding drops the pages past the shared prefix.
+- **Precision:** each tensor class has a ladder of formats, fastest first: KV FP8 → f16 → f32, and likewise for prefill operands and weight storage. At load, the engine takes the fastest rung the device supports that passes the model's quality gate (top-1 agreement and divergence against the reference). The plan cache records the choice. `--kv f16` and `--precision exact` opt out.
 - **DeltaNet layers:** the recurrent state (K×V per head, f32) plus the conv state. These can't be rewound, so the engine saves checkpoints at the end of each prompt segment and every 512 tokens, keeping a ring of the last few.
 - **Reuse:** find the longest common token prefix with the resident sequence, restore the nearest checkpoint at or before it, and prefill only the rest.
 
