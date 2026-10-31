@@ -17,6 +17,7 @@ pub const backend = @import("backend/backend.zig");
 pub const sampler = @import("sampler/sampler.zig");
 pub const state = @import("state/state.zig");
 pub const sched = @import("sched/sched.zig");
+pub const precision = @import("precision.zig");
 pub const chat = @import("chat/chat.zig");
 
 test {
@@ -26,6 +27,7 @@ test {
     _ = @import("tokenizer/pretokenize.zig");
     _ = @import("sampler/defaults.zig");
     _ = @import("plan/cache.zig");
+    _ = @import("precision.zig");
     _ = ref.ops;
     _ = ref.tensor;
     _ = ref.gyro;

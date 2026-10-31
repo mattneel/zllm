@@ -5,6 +5,7 @@
 const std = @import("std");
 const cmd = @import("../gpu/cmd.zig");
 const Timings = @import("../gpu/timings.zig").Timings;
+const precision = @import("../precision.zig");
 
 pub const Error = error{};
 
@@ -22,6 +23,9 @@ pub const Device = struct {
     }
     pub fn errorMessage(_: *const Device) []const u8 {
         unreachable;
+    }
+    pub fn supportsPrefill(_: *const Device, rung: precision.Prefill) bool {
+        return rung == .scalar_f32;
     }
     pub fn forceLoss(_: *Device) void {
         unreachable;

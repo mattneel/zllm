@@ -19,6 +19,7 @@ const gguf = @import("../gguf/gguf.zig");
 const tmpl = @import("../tmpl/tmpl.zig");
 pub const Backend = @import("../backend/backend.zig").Backend;
 const agility_kernels = @import("../agility/kernels.zig");
+const precision = @import("../precision.zig");
 
 pub const Kernel = enum {
     rmsnorm,
@@ -736,6 +737,10 @@ pub const Set = struct {
     missing: std.EnumSet(Kernel) = .empty,
     variants: [max_variants]Variant = undefined,
     n_variants: usize = 0,
+    /// Original scalar pipelines are never replaced or recompiled.
+    scalar_prefill: [4]cmd.Pipeline = undefined,
+    /// Lazily recorded real LinAlg pipelines, single then compensated.
+    prefill_variants: [2][4]?cmd.Pipeline = .{ @splat(null), @splat(null) },
 
     const Variant = struct { kernel: Kernel, v: MatvecVariant, pipeline: cmd.Pipeline };
     /// Every candidate of every quantized type, with and without a fused
@@ -759,6 +764,7 @@ pub const Set = struct {
             };
             set.pipelines.set(k, try rec.createKernel(gpa, @backingInt(k), 0, k.contract().writes, code));
         }
+        for (agility_kernels.prefill_kernels, 0..) |k, i| set.scalar_prefill[i] = set.pipelines.get(k);
         return set;
     }
 
@@ -769,6 +775,32 @@ pub const Set = struct {
         var it = s.missing.iterator();
         while (it.next()) |k| std.log.err("{t}: kernel {t} has no implementation", .{ s.backend, k });
         return error.UnsupportedKernel;
+    }
+
+    /// Switches the four prefill identities without changing their contracts
+    /// or grids. Sources live for the recorder batch, as with create. Native
+    /// support must be checked with Device.supportsPrefill before selection;
+    /// the Agility host independently rejects unsupported LinAlg pipelines.
+    /// Existing plans retain their captured pipelines: select before planning.
+    pub fn selectPrefill(s: *Set, gpa: Allocator, _: Allocator, rec: *cmd.Recorder, rung: precision.Prefill) (Error || error{UnsupportedPrefill})!void {
+        if (rung == .scalar_f32) {
+            for (agility_kernels.prefill_kernels, 0..) |k, i| s.pipelines.set(k, s.scalar_prefill[i]);
+            return;
+        }
+        if (s.backend != .agility) return error.UnsupportedPrefill;
+        const slot: usize = switch (rung) {
+            .fp16_single => 0,
+            .fp16_compensated => 1,
+            .scalar_f32 => unreachable,
+        };
+        for (agility_kernels.prefill_kernels, 0..) |k, i| {
+            if (s.prefill_variants[slot][i] == null) {
+                const code = agility_kernels.prefillSource(k, rung) orelse return error.UnsupportedPrefill;
+                s.prefill_variants[slot][i] = try rec.createKernel(gpa, @backingInt(k), agility_kernels.prefillVariant(rung), k.contract().writes, code);
+            }
+        }
+        // Only publish the selection after all four pipelines are recorded.
+        for (agility_kernels.prefill_kernels, 0..) |k, i| s.pipelines.set(k, s.prefill_variants[slot][i].?);
     }
 
     /// The pipeline of decode multiply `k` with variant `v`, recording its
@@ -787,6 +819,66 @@ pub const Set = struct {
         return pipeline;
     }
 };
+
+test "prefill selection preserves scalar originals and caches each native rung" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var rec: cmd.Recorder = .{};
+    defer rec.deinit(gpa);
+    var set = try Set.create(gpa, arena.allocator(), &rec, .agility);
+    const scalar = set.pipelines;
+    var originals: cmd.Iterator = .{ .words = rec.batch() };
+    while (try originals.next()) |command| {
+        try std.testing.expectEqual(cmd.Op.create_kernel, command.op);
+        try std.testing.expectEqual(@as(u32, 0), command.args[2]);
+    }
+    const base = rec.created(.pipeline);
+    for ([_]precision.Prefill{ .fp16_single, .fp16_compensated }) |rung| {
+        rec.clear();
+        try set.selectPrefill(gpa, arena.allocator(), &rec, rung);
+        var it: cmd.Iterator = .{ .words = rec.batch() };
+        for (agility_kernels.prefill_kernels) |k| {
+            const command = (try it.next()).?;
+            try std.testing.expectEqual(@as(u32, @backingInt(k)), command.args[1]);
+            try std.testing.expectEqual(agility_kernels.prefillVariant(rung), command.args[2]);
+            try std.testing.expectEqual(k.contract().writes, command.args[3]);
+            const code = command.ptrAt([*]const u8, 4)[0..command.args[6]];
+            try std.testing.expectEqualSlices(u8, agility_kernels.prefillSource(k, rung).?, code);
+            try std.testing.expect(set.pipelines.get(k) != scalar.get(k));
+        }
+        try std.testing.expect((try it.next()) == null);
+        const selected = set.pipelines;
+        try set.selectPrefill(gpa, arena.allocator(), &rec, .scalar_f32);
+        try std.testing.expectEqualDeep(scalar, set.pipelines);
+        rec.clear();
+        try set.selectPrefill(gpa, arena.allocator(), &rec, rung);
+        try std.testing.expectEqualDeep(selected, set.pipelines);
+        try std.testing.expectEqual(@as(usize, 0), rec.batch().len);
+        for (std.enums.values(Kernel)) |k| {
+            if (agility_kernels.linAlgSource(k) == null) try std.testing.expectEqual(scalar.get(k), set.pipelines.get(k));
+        }
+    }
+    try std.testing.expectEqual(base + 8, rec.created(.pipeline));
+}
+
+test "WebGPU rejects approximate prefill without recording or relabeling" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var rec: cmd.Recorder = .{};
+    defer rec.deinit(gpa);
+    var set = try Set.create(gpa, arena.allocator(), &rec, .webgpu);
+    const scalar = set.pipelines;
+    rec.clear();
+    for ([_]precision.Prefill{ .fp16_single, .fp16_compensated }) |rung| {
+        try std.testing.expectError(error.UnsupportedPrefill, set.selectPrefill(gpa, arena.allocator(), &rec, rung));
+        try std.testing.expectEqualDeep(scalar, set.pipelines);
+        try std.testing.expectEqual(@as(usize, 0), rec.batch().len);
+    }
+    try set.selectPrefill(gpa, arena.allocator(), &rec, .scalar_f32);
+    try std.testing.expectEqualDeep(scalar, set.pipelines);
+}
 
 /// Kernel `k`'s implementation on `backend`, in variant `v` (templated
 /// kernels only; the default otherwise), rendered into `arena` where it is

@@ -11,6 +11,7 @@ const dawn_host = @import("dawn_host.zig");
 const Timings = @import("timings.zig").Timings;
 pub const Backend = @import("../backend/backend.zig").Backend;
 const agility = if (build_options.agility) @import("../agility/host.zig") else @import("../agility/absent.zig");
+const precision = @import("../precision.zig");
 
 /// error.UnsupportedKernel: a kernel the backend lacks was dispatched
 /// (kernels.Set.missing); the submission in progress is dropped.
@@ -63,6 +64,15 @@ pub const Device = union(Backend) {
 
     pub fn backend(d: Device) Backend {
         return d;
+    }
+
+    /// Only capable Agility devices implement real FP16 matrix operands.
+    pub fn supportsPrefill(d: Device, rung: precision.Prefill) bool {
+        if (rung == .scalar_f32) return true;
+        return switch (d) {
+            .webgpu => false,
+            .agility => |x| x.supportsPrefill(rung),
+        };
     }
 
     pub fn limits(d: Device) Limits {
@@ -170,3 +180,12 @@ pub const Host = union(Backend) {
         };
     }
 };
+
+test "WebGPU supports only scalar prefill operands" {
+    // Capability reporting never dereferences a WebGPU device for these
+    // rungs: no WebGPU implementation may advertise scalar as native FP16.
+    const device: Device = .{ .webgpu = undefined };
+    try std.testing.expect(device.supportsPrefill(.scalar_f32));
+    try std.testing.expect(!device.supportsPrefill(.fp16_single));
+    try std.testing.expect(!device.supportsPrefill(.fp16_compensated));
+}

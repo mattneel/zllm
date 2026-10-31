@@ -8,6 +8,7 @@
 const std = @import("std");
 const kernels = @import("../kernels/kernels.zig");
 const Kernel = kernels.Kernel;
+const precision = @import("../precision.zig");
 
 const common = @embedFile("kernels/common.hlsli");
 
@@ -94,21 +95,73 @@ pub const LinAlgCaps = struct {
     }
 };
 
-/// A device-selected implementation of the same identity, grid and contract.
-/// Selection happens at pipeline creation, after the native capability query.
+/// The compensated implementation of the same identity, grid and contract.
+/// Kept separate from the explicit runtime rung selection below.
 pub fn linAlgSource(k: Kernel) ?[]const u8 {
     return switch (k) {
         .matmul_q8_0_float => common ++ @embedFile("kernels/matmul_q8_0_float_linalg.hlsl"),
         .gyro_matmul => common ++ @embedFile("kernels/gyro_matmul_linalg.hlsl"),
+        .matmul_bf16 => common ++ "#define SINGLE_PRODUCT 0\n" ++ @embedFile("kernels/half/bf16.hlsli") ++ @embedFile("kernels/matmul_half_linalg.hlsl"),
+        .matmul_f16 => common ++ "#define SINGLE_PRODUCT 0\n" ++ @embedFile("kernels/half/f16.hlsli") ++ @embedFile("kernels/matmul_half_linalg.hlsl"),
         else => null,
     };
 }
 
-/// Hash both possible implementations: capability selection must not hide a
-/// shader change from the persistent tuning cache.
+/// The only kernel identities changed by prefill precision selection.
+pub const prefill_kernels = [_]Kernel{ .matmul_q8_0_float, .gyro_matmul, .matmul_bf16, .matmul_f16 };
+
+/// Reserved command-stream variants. Valid matvec IDs have nonzero lanes
+/// in bits 8..15; these IDs keep their entire low half zero.
+pub fn prefillVariant(rung: precision.Prefill) u32 {
+    return switch (rung) {
+        .scalar_f32 => 0,
+        .fp16_single => 0xfffc0000,
+        .fp16_compensated => 0xffff0000,
+    };
+}
+
+pub fn prefillFromVariant(id: u32) ?precision.Prefill {
+    return switch (id) {
+        0 => .scalar_f32,
+        0xfffc0000 => .fp16_single,
+        0xffff0000 => .fp16_compensated,
+        else => null,
+    };
+}
+
+/// Validate identities independently of shader compilation. Unsupported
+/// native operands fail closed rather than falling back to scalar source.
+pub fn validatePrefillVariant(k: Kernel, variant: u32, caps: LinAlgCaps) error{ BadCommand, UnsupportedPrefill }!void {
+    if (linAlgSource(k) != null) {
+        const rung = prefillFromVariant(variant) orelse return error.BadCommand;
+        if (rung != .scalar_f32 and !caps.supported()) return error.UnsupportedPrefill;
+    } else if (prefillFromVariant(variant)) |rung| {
+        if (rung != .scalar_f32) return error.BadCommand;
+    }
+}
+
+/// Real FP16 matrix implementations; scalar is always the original source.
+pub fn prefillSource(k: Kernel, rung: precision.Prefill) ?[]const u8 {
+    return switch (rung) {
+        .scalar_f32 => source(k),
+        .fp16_compensated => linAlgSource(k),
+        .fp16_single => switch (k) {
+            .matmul_q8_0_float => common ++ @embedFile("kernels/matmul_q8_0_float_linalg_single.hlsl"),
+            .gyro_matmul => common ++ @embedFile("kernels/gyro_matmul_linalg_single.hlsl"),
+            .matmul_bf16 => common ++ "#define SINGLE_PRODUCT 1\n" ++ @embedFile("kernels/half/bf16.hlsli") ++ @embedFile("kernels/matmul_half_linalg.hlsl"),
+            .matmul_f16 => common ++ "#define SINGLE_PRODUCT 1\n" ++ @embedFile("kernels/half/f16.hlsli") ++ @embedFile("kernels/matmul_half_linalg.hlsl"),
+            else => null,
+        },
+    };
+}
+
+/// Hash every implementation: selecting another rung must not hide a shader
+/// change from the persistent tuning cache.
 pub fn cacheSource(k: Kernel) []const u8 {
     inline for (implemented) |i| {
-        if (k == i) return comptime (source(i).? ++ (linAlgSource(i) orelse ""));
+        if (k == i) return comptime (source(i).? ++
+            (prefillSource(i, .fp16_single) orelse "") ++
+            (prefillSource(i, .fp16_compensated) orelse ""));
     }
     return "";
 }
@@ -134,10 +187,101 @@ test "LinAlg selection requires every native operation capability" {
 
 test "LinAlg variants preserve the complete WGSL write set" {
     for (std.enums.values(Kernel)) |k| {
-        if (linAlgSource(k)) |code| {
-            try std.testing.expectEqual(k.contract().writes, hlslWrites(code[common.len..]));
-            try std.testing.expect(std.mem.indexOf(u8, code, "\n// agility: cs_6_10\n") != null);
+        for ([_]precision.Prefill{ .fp16_single, .fp16_compensated }) |rung| {
+            if (prefillSource(k, rung)) |code| {
+                try std.testing.expectEqual(k.contract().writes, hlslWrites(code[common.len..]));
+                try std.testing.expect(std.mem.indexOf(u8, code, "\n// agility: cs_6_10\n") != null);
+            }
         }
+    }
+}
+
+test "prefill variants are distinct and reject mutated identities" {
+    for ([_]precision.Prefill{ .scalar_f32, .fp16_single, .fp16_compensated }) |rung| {
+        const id = prefillVariant(rung);
+        try std.testing.expectEqual(rung, prefillFromVariant(id).?);
+        for (0..32) |bit| {
+            try std.testing.expect(prefillFromVariant(id ^ (@as(u32, 1) << @intCast(bit))) == null);
+        }
+        for (kernels.MatvecVariant.candidates) |candidate| {
+            for (0..256) |act_div| {
+                var v = candidate;
+                v.act_div = @intCast(act_div);
+                if (rung != .scalar_f32) try std.testing.expect(id != v.id());
+            }
+        }
+    }
+}
+
+test "native prefill rejects unsupported capabilities and variant mutations" {
+    const native: LinAlgCaps = .{ .shader_model = 0x6a, .tier = 0x10, .wave_flags = 1, .experimental = true };
+    var unsupported = native;
+    unsupported.experimental = false;
+    for (prefill_kernels) |k| {
+        try validatePrefillVariant(k, 0, unsupported);
+        for ([_]precision.Prefill{ .fp16_single, .fp16_compensated }) |rung| {
+            const variant = prefillVariant(rung);
+            try validatePrefillVariant(k, variant, native);
+            try std.testing.expectError(error.UnsupportedPrefill, validatePrefillVariant(k, variant, unsupported));
+            try std.testing.expectError(error.BadCommand, validatePrefillVariant(.rmsnorm, variant, native));
+            for (0..32) |bit| {
+                try std.testing.expectError(error.BadCommand, validatePrefillVariant(k, variant ^ (@as(u32, 1) << @intCast(bit)), native));
+            }
+        }
+    }
+    // Decode variants retain their independent command-stream namespace.
+    for (kernels.MatvecVariant.candidates) |v| try validatePrefillVariant(.matvec_q8_0, v.id(), unsupported);
+}
+
+test "prefill cache source commits every rung and changes with each source" {
+    for (prefill_kernels) |k| {
+        const cached = cacheSource(k);
+        var offset: usize = 0;
+        for ([_]precision.Prefill{ .scalar_f32, .fp16_single, .fp16_compensated }) |rung| {
+            const code = prefillSource(k, rung).?;
+            try std.testing.expectEqualSlices(u8, code, cached[offset..][0..code.len]);
+            const mutated = try std.testing.allocator.dupe(u8, cached);
+            defer std.testing.allocator.free(mutated);
+            mutated[offset + code.len - 1] ^= 1;
+            try std.testing.expect(std.hash.Wyhash.hash(0, cached) != std.hash.Wyhash.hash(0, mutated));
+            offset += code.len;
+        }
+        try std.testing.expectEqual(cached.len, offset);
+    }
+}
+
+test "single-product sources round scaled weights without correction products" {
+    for ([_]Kernel{ .matmul_q8_0_float, .gyro_matmul }) |k| {
+        const single = prefillSource(k, .fp16_single).?;
+        const compensated = prefillSource(k, .fp16_compensated).?;
+        try std.testing.expect(!std.mem.eql(u8, single, compensated));
+        try std.testing.expect(std.mem.indexOf(u8, single, "Matrix<ComponentType::F32") != null);
+        try std.testing.expect(std.mem.indexOf(u8, single, "= (half)v;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, single, "(half)(scale *") != null);
+        try std.testing.expect(std.mem.indexOf(u8, single, "_lo") == null);
+        const mma = "MultiplyAccumulate(";
+        const first = std.mem.indexOf(u8, single, mma).?;
+        try std.testing.expect(std.mem.indexOfPos(u8, single, first + mma.len, mma) == null);
+    }
+    const dense = prefillSource(.matmul_q8_0_float, .fp16_single).?;
+    try std.testing.expect(std.mem.indexOf(u8, dense, "SK = TK + 8u") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dense, "wg.z * param(7) + t * out_stride + col0 + j") != null);
+    const expert = prefillSource(.gyro_matmul, .fp16_single).?;
+    try std.testing.expect(std.mem.indexOf(u8, expert, "#define ROWS 64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expert, "if ((wg.x & 1u) != 0u) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expert, "slot * param(5) + wg.z * param(6) + j") != null);
+}
+
+test "half-weight prefill specializes real single and compensated products" {
+    for ([_]Kernel{ .matmul_bf16, .matmul_f16 }) |k| {
+        const single = prefillSource(k, .fp16_single).?;
+        const compensated = prefillSource(k, .fp16_compensated).?;
+        try std.testing.expect(std.mem.indexOf(u8, single, "#define SINGLE_PRODUCT 1\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, compensated, "#define SINGLE_PRODUCT 0\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, single, "(half)half_lo(word)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, single, "(half)half_hi(word)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, single, "#if !SINGLE_PRODUCT\n            TileA a_lo") != null);
+        try std.testing.expect(std.mem.indexOf(u8, single, "t * out_stride + col0 + j") != null);
     }
 }
 

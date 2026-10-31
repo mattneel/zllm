@@ -17,6 +17,7 @@ const ref_tensor = @import("../ref/tensor.zig");
 const ref_matmul = @import("../ref/matmul.zig");
 const fp8 = @import("../ref/fp8.zig");
 const KvFormat = @import("../plan/common.zig").KvFormat;
+const precision = @import("../precision.zig");
 
 pub const Result = struct {
     name: []const u8,
@@ -59,6 +60,23 @@ pub fn run(gpa: Allocator, device: platform.Device, host: *Host, out: *std.Io.Wr
         ok = try report(&ctx, f, out) and ok;
         _ = arena_state.reset(.retain_capacity);
     }
+    // Keep the original strict suite scalar/exact. Native rungs are separate
+    // checks against their actual rounded-operand contracts, not looser gates.
+    defer {
+        ctx.set.selectPrefill(gpa, ctx.arena, &ctx.rec, .scalar_f32) catch unreachable;
+        ctx.prefill = .scalar_f32;
+    }
+    for ([_]precision.Prefill{ .fp16_single, .fp16_compensated }) |rung| {
+        if (!device.supportsPrefill(rung)) continue;
+        try out.print("prefill operands: {s}\n", .{@tagName(rung)});
+        try ctx.set.selectPrefill(gpa, ctx.arena, &ctx.rec, rung);
+        ctx.prefill = rung;
+        try ctx.flush();
+        inline for (.{ checkMatmul, checkMatmulF16, checkMatmulChunked, checkMatmulF16Chunked, checkMatmulQ80Float, checkGyroMatmul }) |f| {
+            ok = try report(&ctx, f, out) and ok;
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
     return ok;
 }
 
@@ -92,6 +110,7 @@ const Ctx = struct {
     set: kernels.Set = undefined,
     rand: std.Random = undefined,
     token: u32 = 0,
+    prefill: precision.Prefill = .scalar_f32,
 
     fn launcher(c: *Ctx) kernels.Launcher {
         return .{ .gpa = c.gpa, .arena = c.arena, .rec = &c.rec, .set = &c.set };
@@ -208,6 +227,41 @@ test relErr {
     try std.testing.expect(std.math.isInf(worse(0, std.math.nan(f64))));
 }
 
+fn roundF16(value: f32) f32 {
+    return @floatCast(@as(f16, @floatCast(value)));
+}
+
+/// Mathematical operand contract, evaluated in f64 rather than reproducing
+/// the GPU's reduction order. Quantized compensated kernels factor exact
+/// scales outside the dot; half-weight kernels round their decoded weights.
+fn prefillProduct(rung: precision.Prefill, x: f32, w: f32, half_weight: bool) f64 {
+    return switch (rung) {
+        .scalar_f32 => @as(f64, x) * w,
+        .fp16_single => @as(f64, roundF16(x)) * roundF16(w),
+        .fp16_compensated => blk: {
+            const hi = roundF16(x);
+            const lo = roundF16(x - hi);
+            break :blk (@as(f64, hi) + lo) * (if (half_weight) roundF16(w) else w);
+        },
+    };
+}
+
+test "prefill reference rejects missing rounding and residual mutations" {
+    const x: f32 = 1.0003;
+    const w: f32 = 0.3333;
+    const single = prefillProduct(.fp16_single, x, w, false);
+    try std.testing.expectEqual(@as(f64, roundF16(x)) * roundF16(w), single);
+    try std.testing.expect(single != @as(f64, x) * roundF16(w));
+    try std.testing.expect(single != @as(f64, roundF16(x)) * w);
+    const compensated = prefillProduct(.fp16_compensated, x, w, false);
+    const two_products = @as(f64, roundF16(x)) * w + @as(f64, roundF16(x - roundF16(x))) * w;
+    try std.testing.expectApproxEqAbs(two_products, compensated, 1e-15);
+    try std.testing.expect(compensated != @as(f64, roundF16(x)) * w);
+    try std.testing.expect(compensated != prefillProduct(.fp16_compensated, x, w, true));
+    try std.testing.expectEqual(@as(f64, x) * w, prefillProduct(.scalar_f32, x, w, true));
+    try std.testing.expect(!std.math.isFinite(prefillProduct(.fp16_single, 100000, w, false)));
+}
+
 fn checkRmsNorm(c: *Ctx) !Result {
     const rows = 7;
     const dim = 1000;
@@ -253,7 +307,7 @@ fn matmulCase(c: *Ctx, comptime wt: gguf.TensorType, name: []const u8, rows: u32
     const want = try c.arena.alloc(f64, rows * n);
     for (0..rows) |t| for (0..n) |j| {
         var s: f64 = init[t * n + j];
-        for (0..k) |i| s += @as(f64, x[t * k + i]) * w.values[j * k + i];
+        for (0..k) |i| s += prefillProduct(c.prefill, x[t * k + i], w.values[j * k + i], true);
         want[t * n + j] = s;
     };
     return .{ .name = name, .err = relErr(got, want), .tolerance = 1e-5 };
@@ -270,6 +324,10 @@ fn checkMatmulF16(c: *Ctx) !Result {
 
 fn checkMatmulChunked(c: *Ctx) !Result {
     return matmulCase(c, .bf16, "matmul_bf16 (2 chunks, +=)", 33, 150, 96, 70, true);
+}
+
+fn checkMatmulF16Chunked(c: *Ctx) !Result {
+    return matmulCase(c, .f16, "matmul_f16 (2 chunks, +=)", 33, 150, 96, 70, true);
 }
 
 fn checkMatvec(c: *Ctx) !Result {
@@ -586,7 +644,7 @@ fn checkMatmulQ80Float(c: *Ctx) !Result {
     for ([_]u32{ 0, 1 }) |accumulate| {
         for (0..rows) |r| for (0..n) |j| {
             var sum: f64 = if (accumulate == 1) init[r * stride + 3 + j] else 0;
-            for (0..k) |i| sum += @as(f64, x[r * k + i]) * w.values[j * k + i];
+            for (0..k) |i| sum += prefillProduct(c.prefill, x[r * k + i], w.values[j * k + i], false);
             want[r * n + j] = sum;
         };
         for ([_][2]u32{ .{ 1, 0 }, .{ 1, 1 }, .{ 2, 0 }, .{ 2, 1 } }) |path| {
@@ -1994,11 +2052,19 @@ fn checkGyroMatmul(c: *Ctx) !Result {
         const cpu = try c.arena.alloc(f64, tokens * used * projections * rows);
         const gpu = try c.arena.alloc(f32, cpu.len);
         const row_bytes = cols / 128 * 34;
+        const decoded = try c.arena.alloc(f32, cols);
         for (active_ids, 0..) |expert, slot| for (0..projections) |z| for (0..rows) |j| {
             const off = (expert * rows + j) * row_bytes;
             const xr = (if (per_slot) slot else slot / used) * x_stride;
             const compact = (slot * projections + z) * rows + j;
-            cpu[compact] = q4.dotRow(.tq2_t, w[z][off..][0..row_bytes], x[xr..][0..cols]);
+            if (c.prefill == .scalar_f32) {
+                cpu[compact] = q4.dotRow(.tq2_t, w[z][off..][0..row_bytes], x[xr..][0..cols]);
+            } else {
+                q4.decodeRow(.tq2_t, w[z][off..][0..row_bytes], decoded);
+                var sum: f64 = 0;
+                for (x[xr..][0..cols], decoded) |activation, weight| sum += prefillProduct(c.prefill, activation, weight, false);
+                cpu[compact] = sum;
+            }
             gpu[compact] = @bitCast(got[slot * out_stride + z * out_z + j]);
         };
         const numeric_error = relErr(gpu, cpu);

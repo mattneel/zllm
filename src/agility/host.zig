@@ -23,6 +23,8 @@ const Timings = @import("../gpu/timings.zig").Timings;
 const Kernel = @import("../kernels/kernels.zig").Kernel;
 const hazards = @import("hazards.zig");
 const storage_reads = @import("storage.zig");
+const precision = @import("../precision.zig");
+const native_kernels = @import("kernels.zig");
 pub const c = @import("agility_c");
 
 comptime {
@@ -33,7 +35,7 @@ comptime {
 
 pub const timeout_ms: u32 = 60_000;
 
-pub const Error = error{ GpuError, DeviceLost, BadCommand, BadId, NoTimestamps, UnsupportedKernel } || cmd.DecodeError || Allocator.Error;
+pub const Error = error{ GpuError, DeviceLost, BadCommand, BadId, NoTimestamps, UnsupportedKernel, UnsupportedPrefill } || cmd.DecodeError || Allocator.Error;
 
 /// A Agility device: one D3D12 adapter with its compute and DirectStorage
 /// queues.
@@ -104,6 +106,22 @@ pub const Device = struct {
 
     pub fn adapterName(d: *const Device) []const u8 {
         return std.mem.sliceTo(&d.caps.adapter_name, 0);
+    }
+
+    /// Approximate prefill is available only for the exact native FP16/F32
+    /// wave32 matrix operation queried at device creation.
+    pub fn supportsPrefill(d: *const Device, rung: precision.Prefill) bool {
+        if (rung == .scalar_f32) return true;
+        return d.linAlgCaps().supported();
+    }
+
+    fn linAlgCaps(d: *const Device) native_kernels.LinAlgCaps {
+        return .{
+            .shader_model = d.caps.shader_model,
+            .tier = d.caps.linalg_tier,
+            .wave_flags = d.caps.wave16_fp16_fp32_flags,
+            .experimental = d.caps.experimental_features_enabled != 0,
+        };
     }
 
     /// Removes the device as a driver fault would; later calls fail with
@@ -314,19 +332,13 @@ pub const Host = struct {
             .create_kernel => {
                 try need(a, 7);
                 if (a[6] == 0) return put(Pipeline, h.gpa, &h.pipelines, a[0], .{ .missing = a[1] });
-                const original = command.ptrAt([*]const u8, 4)[0..a[6]];
-                const native_kernels = @import("kernels.zig");
-                const caps: native_kernels.LinAlgCaps = .{
-                    .shader_model = h.d.caps.shader_model,
-                    .tier = h.d.caps.linalg_tier,
-                    .wave_flags = h.d.caps.wave16_fp16_fp32_flags,
-                    .experimental = h.d.caps.experimental_features_enabled != 0,
-                };
-                const selected = if (caps.supported())
-                    native_kernels.linAlgSource(std.enums.fromInt(Kernel, a[1]) orelse return error.BadCommand)
-                else
-                    null;
-                const source = selected orelse original;
+                const source = command.ptrAt([*]const u8, 4)[0..a[6]];
+                const kernel = std.enums.fromInt(Kernel, a[1]) orelse return error.BadCommand;
+                try native_kernels.validatePrefillVariant(kernel, a[2], h.d.linAlgCaps());
+                // Never substitute a shader behind variant 0. Even a raw
+                // native-matrix source requires the queried native capability.
+                if (std.mem.indexOf(u8, source, "\n// agility: cs_6_10\n") != null and
+                    !h.d.supportsPrefill(.fp16_compensated)) return error.UnsupportedPrefill;
                 var p: ?*c.vel_pipeline = null;
                 h.d.check(c.vel_compile_pipeline(h.d.ctx, source.ptr, source.len, target(source), &p)) catch |err| {
                     std.log.err("agility: kernel {d} (variant {d}) does not compile: {s}", .{ a[1], a[2], h.d.errorMessage() });
