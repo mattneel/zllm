@@ -509,7 +509,8 @@ fn quantizeX(c: *Ctx, t: gguf.TensorType, x: kernels.Arg, rows: u32, k: u32) !Ac
 
 /// quantize_q8 against the reference's rounding (roundLikeLlama), value
 /// for value: rows of random values, one whose largest magnitude is
-/// negative, one with a tie between +amax and −amax, and a zero row.
+/// negative, one with a tie between +amax and −amax, a zero row and exact
+/// half-integer probes distinguishing Q8_K tie-even from Q8_0 tie-away.
 fn checkQuantize(c: *Ctx, t: gguf.TensorType, name: []const u8) !Result {
     const rows = 6;
     const k = 512;
@@ -518,6 +519,11 @@ fn checkQuantize(c: *Ctx, t: gguf.TensorType, name: []const u8) !Result {
     x[3 * k + 5] = -7.25;
     x[3 * k + 40] = 7.25;
     @memset(x[4 * k ..][0..k], 0);
+    for (x[5 * k ..][0..k], 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 32)) - 16)) + 0.5;
+    }
+    var at: usize = 0;
+    while (at < k) : (at += 32) x[5 * k + at] = 127;
     const act = try quantizeX(c, t, try c.upload(x), rows, k);
     const words = try c.read(act.qx);
     const d = try c.read(act.dx);

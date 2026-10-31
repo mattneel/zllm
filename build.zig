@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
     _ = addCheck(b, check_exe, fixtures, "check-chat", "Compare chat prompts with the pinned Jinja template", "check_chat.py");
     _ = addCheck(b, check_exe, fixtures, "check-forward", "Compare the reference forward pass with llama.cpp", "check_forward.py");
     _ = addCheck(b, check_exe, fixtures, "check-dequant", "Compare CPU dequantization with ggml's, bit for bit", "check_dequant.py");
+    _ = addCheck(b, check_exe, fixtures, "check-rounding", "Compare activation rounding with ggml, bit for bit", "check_rounding.py");
 
     // Where GPU checks run: `native` is this build on whatever adapter Dawn
     // finds (llvmpipe in CI); `d3d12` is the Windows build run from WSL

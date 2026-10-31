@@ -1,5 +1,5 @@
 // Rounds activation rows to Q8_K or Q8_0 from quantize_q8.wgsl, with
-// optional RMSNorm or SiLU(gate)*up, exact division and tie-away rounding.
+// optional RMSNorm or SiLU(gate)*up, exact division and ggml's rounding.
 groupshared float squares[64];
 groupshared float4 vals[64];
 groupshared float2 best[64];
@@ -32,6 +32,9 @@ float f16_rne(float x) {
 float round_away(float y) {
     float t = trunc(y);
     return abs(y - t) == 0.5 ? t + sign(y) : round(y);
+}
+float round_even(float y) {
+    return float(int(asuint(y + 12582912.0)) - 0x4b400000);
 }
 [numthreads(64, 1, 1)]
 void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
@@ -84,7 +87,7 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
             float vmax = vals[at / 4u][at % 4u];
             float iscale = div_rn(-127.0, vmax);
             d = div_rn(1.0, iscale);
-            q = min(127.0, float4(round_away(iscale * v.x), round_away(iscale * v.y), round_away(iscale * v.z), round_away(iscale * v.w)));
+            q = min(127.0, float4(round_even(iscale * v.x), round_even(iscale * v.y), round_even(iscale * v.z), round_even(iscale * v.w)));
         }
     } else {
         if (lead.x != 0.0) {

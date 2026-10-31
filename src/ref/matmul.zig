@@ -209,7 +209,10 @@ pub fn roundLikeLlama(t: gguf.TensorType, x: []f32) void {
                 const d = amax / 127;
                 const id: f32 = if (d != 0) 1 / d else 0;
                 const d16: f32 = @as(f16, @floatCast(d));
-                for (blk) |*v| v.* = @round(v.* * id) * d16;
+                for (blk) |*v| {
+                    const q: i8 = @intFromFloat(@round(v.* * id));
+                    v.* = @as(f32, @floatFromInt(q)) * d16;
+                }
             }
         },
         .q3_k, .q4_k, .q5_k, .q6_k => {
@@ -228,7 +231,11 @@ pub fn roundLikeLlama(t: gguf.TensorType, x: []f32) void {
                 }
                 const iscale = -127.0 / max;
                 const d = 1 / iscale;
-                for (blk) |*v| v.* = @min(127, @round(iscale * v.*)) * d;
+                for (blk) |*v| {
+                    // ggml nearest_int: the f32 addition rounds ties to even.
+                    const bits: i32 = @bitCast(iscale * v.* + @as(f32, 12582912));
+                    v.* = @as(f32, @floatFromInt(@min(127, bits - 0x4b400000))) * d;
+                }
             }
         },
         .f16 => for (x) |*v| {
@@ -357,4 +364,17 @@ test "quantized matrices decode panels on the fly" {
         for (0..k) |i| want += x[t * k + i] * w[j * k + i];
         try std.testing.expectApproxEqAbs(want, out[t * n + j], 1e-4);
     };
+}
+
+test "Q8_K rounds halfway values to even while Q8_0 rounds away" {
+    var x: [256]f32 = @splat(0);
+    x[0] = 127;
+    x[1..7].* = .{ 0.5, 1.5, 2.5, -0.5, -1.5, -2.5 };
+    x[7] = -0.1;
+    var q8 = x;
+    roundLikeLlama(.q4_k, &x);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 2, 2, 0, -2, -2 }, x[1..7]);
+    roundLikeLlama(.q8_0, &q8);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, -1, -2, -3 }, q8[1..7]);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(q8[7])));
 }

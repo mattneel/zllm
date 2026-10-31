@@ -562,6 +562,15 @@ stay in the file mapping, and each thread of the reference multiply decodes
 a 32-row panel just before using it. A 148-token sequence takes 8 s on 32
 threads.
 
+`zig build check-rounding` compares 8,192 activation values per format
+bitwise with ggml's exported quantizers and decoders. Its probes distinguish
+Q8_K's `nearest_int` (halfway to even) from Q8_0's `roundf` (halfway away
+from zero), including each half step's immediate f32 neighbors and signed
+zero. Both GPU shaders and the CPU emulation preserve that distinction.
+Restoring tie-away Q8_K rounding deliberately fails the independent oracle.
+The GPU probes additionally check exact half steps, so a shared incorrect
+rule cannot pass solely by agreement between zllm's implementations.
+
 ### The 27B
 
 `check-quant` runs every eval sequence (818 positions) through the CPU

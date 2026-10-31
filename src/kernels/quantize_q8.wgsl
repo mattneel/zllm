@@ -17,7 +17,8 @@
 // - block = 32 (Q8_0): d = amax / 127 rounded to f16; q = x / d unrounded
 //   d, rounded.
 //
-// Rounding is half away from zero. q goes to `qx`, four per word
+// Q8_K rounds halfway to even; Q8_0 rounds halfway away from zero, as ggml.
+// q goes to `qx`, four per word
 // (dot4I8Packed order), d to `dx`, one per block. A workgroup takes 256
 // values of one row: one Q8_K block, or eight Q8_0 blocks of 8 threads each.
 //
@@ -97,6 +98,10 @@ fn round_away(y: f32) -> f32 {
     return select(round(y), t + sign(y), abs(y - t) == 0.5);
 }
 
+fn round_even(y: f32) -> f32 {
+    return f32(i32(bitcast<u32>(y + 12582912.0)) - 0x4b400000);
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u32) {
     let row = wg.y;
@@ -162,7 +167,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
             let max = vals[at / 4u][at % 4u];
             let iscale = div_rn(-127.0, max);
             d = div_rn(1.0, iscale);
-            q = min(vec4f(127.0), vec4f(round_away(iscale * v.x), round_away(iscale * v.y), round_away(iscale * v.z), round_away(iscale * v.w)));
+            q = min(vec4f(127.0), vec4f(round_even(iscale * v.x), round_even(iscale * v.y), round_even(iscale * v.z), round_even(iscale * v.w)));
         }
     } else {
         if (lead.x != 0.0) {
