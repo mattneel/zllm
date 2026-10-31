@@ -14,6 +14,8 @@
 
 Every kernel it adds is hand-written per backend and checked against a CPU reference, as the LLM's are.
 
+**Then video with audio:** MiniMax-H3 (text, frames or references to video with native stereo audio). It adds video and audio VAE decoding, plus staged loading: the 32B Qwen3-VL text encoder and the denoiser do not fit one 24 GB GPU together, so the encoder runs and is freed before the denoiser loads. Its weights are under the MiniMax-H3 Community License.
+
 | Target | v1 bar |
 |---|---|
 | Models | Qwen 3.5/3.6/3.8 hybrid (Gated DeltaNet + full attention), 0.8B–27B. Llama and Qwen3 dense in v1.1 |
