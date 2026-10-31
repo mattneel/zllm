@@ -53,6 +53,8 @@ pub const Kernel = enum {
     sample,
     draft,
     gyro_matvec,
+    gyro_matmul,
+    moe_group,
     moe_logits,
     moe_route,
     rotate128,
@@ -75,6 +77,7 @@ pub const Kernel = enum {
     matvec_q5_k,
     matvec_q6_k,
     matmul_q8_0,
+    matmul_q8_0_float,
     matmul_q3_k,
     matmul_q4_k,
     matmul_q5_k,
@@ -204,6 +207,9 @@ test "kernel contracts come from the WGSL's binding declarations" {
     try std.testing.expectEqual(Contract{ .count = 4, .writes = 0b1000 }, Kernel.rmsnorm.contract());
     // rope_append writes the fused QKV row in place and both caches.
     try std.testing.expectEqual(Contract{ .count = 8, .writes = 0b0110_0010 }, Kernel.rope_append.contract());
+    try std.testing.expectEqual(Contract{ .count = 5, .writes = 0b01100 }, Kernel.moe_group.contract());
+    try std.testing.expectEqual(Contract{ .count = 8, .writes = 0b0001_0000 }, Kernel.gyro_matmul.contract());
+    try std.testing.expectEqual(Contract{ .count = 4, .writes = 0b1000 }, Kernel.matmul_q8_0_float.contract());
     try std.testing.expect(Kernel.matvec_q8_0.contract().reads(1));
     try std.testing.expect(!Kernel.matvec_q8_0.contract().reads(3));
     for (std.enums.values(Kernel)) |kernel| try std.testing.expect(kernel.contract().writes != 0);
@@ -211,6 +217,7 @@ test "kernel contracts come from the WGSL's binding declarations" {
 
 fn composed(comptime name: []const u8) []const u8 {
     @setEvalBranchQuota(10_000);
+    if (std.mem.eql(u8, name, "matmul_q8_0_float")) return @embedFile("matmul_q8_0_float.wgsl");
     for (std.enums.values(QuantOp)) |op| {
         for ([_][]const u8{ "bf16", "f16" }) |h| {
             if (std.mem.eql(u8, name, @tagName(op) ++ "_" ++ h)) {
@@ -580,6 +587,18 @@ pub const params = struct {
         out_stride: u32,
         out_z: u32,
         _pad: u32 = 0,
+    };
+    /// Stable expert lists, with active rows supplied by the final Step binding.
+    pub const MoeGroup = extern struct { n_used: u32, n_expert: u32, max_slots: u32, _pad: u32 = 0 };
+    pub const GyroMatmul = extern struct {
+        rows: u32,
+        cols: u32,
+        n_used: u32,
+        x_per_slot: u32,
+        x_stride: u32,
+        out_stride: u32,
+        out_z: u32,
+        max_slots: u32,
     };
     /// Which phase of `sample` a launch runs.
     pub const SamplePhase = extern struct { phase: u32, round: u32 = 0, _pad: [2]u32 = @splat(0) };

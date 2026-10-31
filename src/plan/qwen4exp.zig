@@ -1,8 +1,9 @@
 //! The Qwen4Exp (Qwen3.8-Flash-Next) step program: its weights on the GPU
 //! and every launch of a step, built once (src/ref/qwen4exp/engine.zig is
-//! the graph it follows). It runs the decode kernels only, in steps of at
-//! most kernels.decode_max_rows tokens. Attention is sparse: past `width`
-//! visible cells (top-k + ratio − 1, 2,051 for the released model) each
+//! the graph it follows). Prefill uses tiled dense and grouped expert
+//! multiplies; steps of at most kernels.decode_max_rows retain the decode
+//! matrix-vector kernels. Attention is sparse: past `width` visible cells
+//! (top-k + ratio − 1, 2,051 for the released model), each
 //! query attends to its tail and the blocks its indexer scores highest
 //! (qsa_*.wgsl, attn_split_sparse).
 //!
@@ -32,6 +33,7 @@ const Mm = common.Mm;
 const weightKernel = common.weightKernel;
 
 pub const Hparams = graph.Hparams;
+pub const Path = @import("qwen35.zig").Path;
 
 /// Contexts the program allows: the sparse attention's cell budget, below
 /// which it is dense (the indexer is not built yet).
@@ -316,8 +318,12 @@ fn uploadBytes(gpa: Allocator, rec: *cmd.Recorder, data: []const u8) Allocator.E
 }
 
 pub const Config = struct {
+    /// Most tokens one prefill chunk processes.
+    max_tokens: u32 = 512,
     /// Positions the KV caches and the RoPE table hold, at most max_context.
     context: u32 = max_context,
+    /// Maximum rows projected to logits (one for generation).
+    logit_rows: u32 = 1,
     kv: common.KvFormat = .f16,
     /// Recurrent-state checkpoint slots.
     checkpoints: u32 = 3,
@@ -326,13 +332,31 @@ pub const Config = struct {
     fuse: bool = true,
 };
 
-/// One launch of the step body, and how its grid scales with the step's m
-/// tokens: by `mul` rows per token.
-const Item = struct { launch: kernels.Launch, mul: u32 = 1 };
+/// One operation in the body. Dense and expert multiplies select the
+/// prefill or decode launches without changing the surrounding graph.
+const Item = struct {
+    launch: ?kernels.Launch = null,
+    fork: ?@import("qwen35.zig").Fork = null,
+    mul: u32 = 1,
+
+    fn record(item: Item, gpa: Allocator, rec: *cmd.Recorder, path: Path, rows: u32, keys: u32) Allocator.Error!void {
+        const extent: kernels.Extent = .{ .rows = rows * item.mul, .keys = keys };
+        if (item.launch) |launch| try launch.record(gpa, rec, extent);
+        if (item.fork) |fork| for (fork.pick(path)) |launch| try launch.record(gpa, rec, extent);
+    }
+
+    fn matrix(list: *std.ArrayList(Item), arena: Allocator, mm: Mm, out: Arg, x: Arg, w: *const Matrix) Program.BuildError!void {
+        try list.append(arena, .{ .fork = .{
+            .prefill = try mm.tiled(out, .{ .plain = x }, w, false),
+            .decode = try mm.vector(out, x, w, .{}),
+        } });
+    }
+};
 
 pub const Program = struct {
     hp: Hparams,
     cfg: Config,
+    prefill_tile: u32,
     step: Arg,
     token_ids: Arg,
     /// The residual streams, [token][hc · n_embd].
@@ -343,6 +367,7 @@ pub const Program = struct {
     /// bytes apart.
     ple_rows: Arg,
     logits: Arg,
+    lm_res: Arg,
     /// Every DeltaNet layer's state and conv history, then the PLE block's
     /// convolution history: the state a checkpoint copies.
     recurrent: Arg,
@@ -385,11 +410,11 @@ pub const Program = struct {
     /// result and must outlive the Program.
     pub fn build(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *kernels.Set, m: *const Model, cfg: Config, limits: common.Limits) BuildError!Program {
         const hp = m.hp;
-        if (cfg.context == 0 or cfg.context > max_context) return error.BadConfig;
+        if (cfg.max_tokens == 0 or cfg.logit_rows == 0 or cfg.logit_rows > cfg.max_tokens or cfg.context == 0 or cfg.context > max_context) return error.BadConfig;
         if (hp.head_dim > kernels.max_head_dim or hp.ssm_state > kernels.max_delta_head) return error.BadConfig;
         if (hp.idx_dim > 256 or hp.idx_dim % 2 != 0 or hp.idx_heads * hp.idx_dim > 2048) return error.BadConfig;
         if (hp.n_head % hp.n_head_kv != 0 or hp.n_head / hp.n_head_kv > kernels.attn_max_group_wide or hp.n_embd > 2560 or hp.n_ff_exp > 2560) return error.BadConfig;
-        const cap: u32 = kernels.decode_max_rows;
+        const cap = cfg.max_tokens;
         const e: u64 = hp.n_embd;
         const hd: u64 = hp.hcDim();
         const used: u64 = hp.n_expert_used;
@@ -406,7 +431,8 @@ pub const Program = struct {
         const hc_down = try a.storage(cap * (@as(u64, hp.hc_rank) + hp.hc));
         const gate = try a.storage(cap * hd);
         const block = try a.storage(cap * e);
-        const logits = try a.storage(cap * @as(u64, hp.vocab));
+        const logits = try a.storage(@as(u64, cfg.logit_rows) * hp.vocab);
+        const lm_res = try a.storage(@as(u64, cfg.logit_rows) * hd);
         // Linear attention.
         const conv_dim: u64 = hp.convChannels();
         const proj_row: u64 = conv_dim + hp.ssm_inner + 2 * @as(u64, hp.ssm_v_heads);
@@ -422,7 +448,7 @@ pub const Program = struct {
         const qkv = try a.storage(cap * qkv_row);
         const att = try a.storage(cap * hdim * hp.n_head);
         const max_blocks: u32 = std.math.divCeil(u32, cfg.context, kernels.attn_block) catch unreachable;
-        const attn_part = try a.storage(cap * hp.n_head * @as(u64, max_blocks) * (hdim + 2));
+        const attn_part = try a.storage(@min(cap, kernels.attn_rows) * hp.n_head * @as(u64, max_blocks) * (hdim + 2));
         // The sparse attention's indexer: each row's projection, block
         // scores and selection (shared by the layers; per layer, its key
         // cache and pooled blocks, below).
@@ -439,6 +465,8 @@ pub const Program = struct {
         // Experts.
         const ids = try a.storage(cap * used);
         const weights = try a.storage(cap * used);
+        const expert_counts = try a.storage(hp.n_expert);
+        const expert_slots = try a.storage(@as(u64, hp.n_expert) * cap * used);
         const shared_logit = try a.storage(cap);
         const route_logits = try a.storage(cap * (@as(u64, hp.n_expert) + 1));
         const xh = try a.storage(cap * e);
@@ -446,6 +474,7 @@ pub const Program = struct {
         const act = try a.storage(cap * used * ff);
         const down = try a.storage(cap * used * e);
         const sh_act = try a.storage(cap * @as(u64, hp.n_ff_shexp));
+        const sh_gu = try a.storage(cap * 2 * @as(u64, hp.n_ff_shexp));
         const sh_out = try a.storage(cap * e);
         // PLE.
         const ple_rows = try a.buffer(cap * ple_heads * @as(u64, m.ple.stride), .{ .storage = true, .copy_dst = true });
@@ -497,17 +526,12 @@ pub const Program = struct {
             .arena = arena,
             .cap = cap,
             .eps = hp.eps,
-            // The decode multiplies use neither.
-            .partials = try a.storage(1),
-            .act = .{ null, null },
+            .partials = try a.storage(Mm.partialFloats(m, cap)),
+            .act = .{ try Mm.actScratch(&a, m, cap, 256, true), try Mm.actScratch(&a, m, cap, 32, true) },
             .tuning = cfg.tuning,
+            .float_q8 = true,
         };
         var body: std.ArrayList(Item) = .empty;
-        const add = struct {
-            fn launches(list: *std.ArrayList(Item), al_: Allocator, ls: []const kernels.Launch) Allocator.Error!void {
-                for (ls) |l| try list.append(al_, .{ .launch = l });
-            }
-        }.launches;
 
         for (m.tok_embd.chunks) |ch| {
             try body.append(arena, .{ .launch = try b.add(weightKernel(.embed, ch.type), P.EmbedBf16{ .dim = hp.n_embd, .row0 = ch.row0, .chunk_rows = ch.rows }, &.{ token_ids, ch.arg, cur }, .rows_x) });
@@ -530,8 +554,15 @@ pub const Program = struct {
                     .{ .act = .{ .src = bufs.down, .dst = bufs.lo, .stride = @intCast(h.down.n), .rank = hp_.hc_rank, .div = hp_.hc } },
                     .{ .vector = .{ .out = bufs.gate, .x = bufs.lo, .w = &h.up } },
                 };
+                var prefill: std.ArrayList(kernels.Launch) = .empty;
+                try prefill.appendSlice(al_, try m_.tiled(bufs.down, .{ .plain = bufs.xn }, &h.down, false));
+                try prefill.append(al_, try bb.add(.hc_act, P.HcAct{ .count = m_.cap * hp_.hc_rank, .hc = hp_.hc, .rank = hp_.hc_rank, .stride = h.down.n }, &.{ bufs.down, bufs.lo }, .{ .elems = hp_.hc_rank }));
+                try prefill.appendSlice(al_, try m_.tiled(bufs.gate, .{ .plain = bufs.lo }, &h.up, false));
                 // `down` stays live: hc_combine reads its inject columns.
-                try add(list, al_, try fuse.lower(al_, m_, &ops, .{ .enabled = bufs.fuse, .live_out = &.{bufs.down} }, null));
+                try list.append(al_, .{ .fork = .{
+                    .prefill = prefill.items,
+                    .decode = try fuse.lower(al_, m_, &ops, .{ .enabled = bufs.fuse, .live_out = &.{bufs.down} }, null),
+                } });
                 try list.append(al_, .{ .launch = try bb.add(.hc_mix, P.Hc{ .dim = hp_.n_embd, .hc = hp_.hc }, &.{ bufs.xn, bufs.gate, bufs.cur }, .{ .rows_y = bufs.col_groups }) });
             }
         };
@@ -546,8 +577,8 @@ pub const Program = struct {
             if (layer.ple) |*pw| {
                 // The token's 16 table rows, decoded as a 16-row Q8_0 table.
                 try body.append(arena, .{ .launch = try b.add(.embed_q8_0, P.EmbedBf16{ .dim = hp.ple_head_dim, .row0 = 0, .chunk_rows = cap * ple_heads, .stride = m.ple.stride }, &.{ ple_index, ple_rows, ple_emb }, .rows_x), .mul = ple_heads });
-                try add(&body, arena, try mm.vector(ple_key, ple_emb, &pw.key, .{}));
-                try add(&body, arena, try mm.vector(ple_value, ple_emb, &pw.value, .{}));
+                try Item.matrix(&body, arena, mm, ple_key, ple_emb, &pw.key);
+                try Item.matrix(&body, arena, mm, ple_value, ple_emb, &pw.value);
                 try body.append(arena, .{ .launch = try b.add(.ple_mix, P.PleMix{ .dim = hp.n_embd, .hc = hp.hc, .eps = hp.eps }, &.{ ple_key, res, ple_value, pw.norm_key, pw.norm_query, pw.norm_conv, ple_gated, ple_normed }, .{ .rows_y = hp.hc }) });
                 try body.append(arena, .{ .launch = try b.add(.ple_conv, P.PleConv{ .channels = @intCast(hd), .taps = hp.ple_conv, .dilation = hp.ple_dilation }, &.{ ple_gated, ple_normed, pw.conv, ple_hist, res, step }, .{ .fixed = .{ std.math.divCeil(u32, @intCast(hd), 256) catch unreachable, 1, 1 } }) });
             }
@@ -559,7 +590,7 @@ pub const Program = struct {
                     const state: Arg = .{ .buffer = recurrent.buffer, .offset = base, .size = state_bytes };
                     const hist: Arg = .{ .buffer = recurrent.buffer, .offset = base + hist_at, .size = hist_bytes };
                     const d = hp.ssm_state;
-                    try add(&body, arena, try mm.vector(proj, cur, &w.proj, .{}));
+                    try Item.matrix(&body, arena, mm, proj, cur, &w.proj);
                     try body.append(arena, .{ .launch = try b.add(.delta_prep, P.DeltaPrep{
                         .channels = @intCast(conv_dim),
                         .taps = hp.ssm_conv,
@@ -587,7 +618,7 @@ pub const Program = struct {
                         .z_off = @intCast(conv_dim),
                         .sigmoid = 1,
                     }, &.{ o, proj, w.norm }, .{ .rows_y = hp.ssm_v_heads }) });
-                    try add(&body, arena, try mm.vector(block, o, &w.out, .{}));
+                    try Item.matrix(&body, arena, mm, block, o, &w.out);
                 },
                 .full => |*w| {
                     const kc = try a.buffer(kv_layer, .{ .storage = true });
@@ -611,12 +642,15 @@ pub const Program = struct {
                     try rec.writeBuffer(gpa, qsa_params.buffer, 0, std.mem.asBytes(qsa));
                     const idx_keys = try a.buffer(@as(u64, cfg.context) * id * 2, .{ .storage = true });
                     const pooled = try a.storage((cfg.context / w.ratio + 1) * id);
-                    try add(&body, arena, try mm.vector(idx_rows, cur, &w.idx, .{}));
+                    try Item.matrix(&body, arena, mm, idx_rows, cur, &w.idx);
                     try body.append(arena, .{ .launch = try b.add(.qsa_keys, qsa.*, &.{ idx_rows, w.idx_q_norm, rope, idx_keys, step }, .{ .rows_y = hp.idx_heads + 1 }) });
-                    try body.append(arena, .{ .launch = try b.add(.qsa_pool, qsa.*, &.{ idx_keys, w.idx_k_norm, rope, pooled, step }, .{ .fixed = .{ 2, 1, 1 } }) });
+                    try body.append(arena, .{ .fork = .{
+                        .prefill = try arena.dupe(kernels.Launch, &.{try b.add(.qsa_pool, qsa.*, &.{ idx_keys, w.idx_k_norm, rope, pooled, step }, .{ .fixed = .{ cap / w.ratio + 1, 1, 1 } })}),
+                        .decode = try arena.dupe(kernels.Launch, &.{try b.add(.qsa_pool, qsa.*, &.{ idx_keys, w.idx_k_norm, rope, pooled, step }, .{ .fixed = .{ 2, 1, 1 } })}),
+                    } });
                     try body.append(arena, .{ .launch = try b.add(.qsa_score, qsa.*, &.{ idx_rows, pooled, qsa_scores, step }, .{ .rows_y = std.math.divCeil(u32, qsa_stride, 256) catch unreachable }) });
                     try body.append(arena, .{ .launch = try b.add(.qsa_select, qsa.*, &.{ qsa_scores, qsa_sel, step }, .{ .rows_y = 1 }) });
-                    try add(&body, arena, try mm.vector(qkv, cur, &w.qkv, .{}));
+                    try Item.matrix(&body, arena, mm, qkv, cur, &w.qkv);
                     try body.append(arena, .{ .launch = try b.add(.rope_append, P.RopeAppend{
                         .heads = hp.n_head,
                         .kv_heads = hp.n_head_kv,
@@ -629,7 +663,7 @@ pub const Program = struct {
                         .eps = hp.eps,
                         .scales = kv_scales,
                     }, &.{ qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
-                    const params: P.Attention = .{
+                    var params: P.Attention = .{
                         .heads = hp.n_head,
                         .kv_heads = hp.n_head_kv,
                         .head_dim = hp.head_dim,
@@ -640,9 +674,13 @@ pub const Program = struct {
                         .row0 = 0,
                         .scales = kv_scales,
                     };
-                    try body.append(arena, .{ .launch = try b.add(.attn_split_sparse, params, &.{ qkv, kc, vc, attn_part, step, qsa_sel, qsa_params }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = 0, .max_rows = kernels.attn_rows } }) });
-                    try body.append(arena, .{ .launch = try b.add(.attn_combine, params, &.{ qkv, attn_part, att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = 0, .max_rows = kernels.attn_rows } }) });
-                    try add(&body, arena, try mm.vector(block, att, &w.wo, .{}));
+                    var row0: u32 = 0;
+                    while (row0 < cap) : (row0 += kernels.attn_rows) {
+                        params.row0 = row0;
+                        try body.append(arena, .{ .launch = try b.add(.attn_split_sparse, params, &.{ qkv, kc, vc, attn_part, step, qsa_sel, qsa_params }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } }) });
+                        try body.append(arena, .{ .launch = try b.add(.attn_combine, params, &.{ qkv, attn_part, att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = row0, .max_rows = kernels.attn_rows } }) });
+                    }
+                    try Item.matrix(&body, arena, mm, block, att, &w.wo);
                 },
             }
             try body.append(arena, .{ .launch = try b.add(.hc_combine, combine, &.{ block, hc_down, res }, .{ .rows_y = col_groups }) });
@@ -653,36 +691,74 @@ pub const Program = struct {
             try body.append(arena, .{ .launch = try b.add(.moe_logits, route, &.{ layer.router, layer.shared_gate, cur, route_logits }, .{ .rows_y = hp.n_expert + 1 }) });
             try body.append(arena, .{ .launch = try b.add(.moe_route, route, &.{ route_logits, ids, weights, shared_logit }, .rows_x) });
             re.* = body.items.len;
+            try body.append(arena, .{ .fork = .{
+                .prefill = try arena.dupe(kernels.Launch, &.{try b.add(.moe_group, P.MoeGroup{ .n_used = hp.n_expert_used, .n_expert = hp.n_expert, .max_slots = cap * hp.n_expert_used }, &.{ ids, expert_counts, expert_slots, step }, .{ .fixed = .{ std.math.divCeil(u32, hp.n_expert, 64) catch unreachable, 1, 1 } })}),
+                .decode = &.{},
+            } });
             try body.append(arena, .{ .launch = try b.add(.rotate128, P.Rotate128{ .width = hp.n_embd, .x_stride = hp.n_embd, .y_stride = hp.n_embd }, &.{ cur, m.signs_embd, xh }, .{ .rows_y = hp.n_embd / 128 }) });
-            try body.append(arena, .{ .launch = try b.add(.gyro_matvec, P.GyroMatvec{
-                .rows = hp.n_ff_exp,
-                .cols = hp.n_embd,
-                .n_used = hp.n_expert_used,
-                .x_per_slot = 0,
-                .x_stride = hp.n_embd,
-                .out_stride = 2 * hp.n_ff_exp,
-                .out_z = hp.n_ff_exp,
-            }, &.{ layer.gate_exps, layer.up_exps, xh, gu, ids, m.codebook }, .{ .tiles_y = .{ .x = std.math.divCeil(u32, hp.n_ff_exp, kernels.gyro_rows) catch unreachable, .tile = 1, .z = 2 } }), .mul = hp.n_expert_used });
+            try body.append(arena, .{ .fork = .{
+                .prefill = try arena.dupe(kernels.Launch, &.{try b.add(.gyro_matmul, P.GyroMatmul{
+                    .rows = hp.n_ff_exp,
+                    .cols = hp.n_embd,
+                    .n_used = hp.n_expert_used,
+                    .x_per_slot = 0,
+                    .x_stride = hp.n_embd,
+                    .out_stride = 2 * hp.n_ff_exp,
+                    .out_z = hp.n_ff_exp,
+                    .max_slots = cap * hp.n_expert_used,
+                }, &.{ layer.gate_exps, layer.up_exps, xh, gu, expert_counts, expert_slots, m.codebook }, .{ .fixed = .{ std.math.divCeil(u32, hp.n_ff_exp, kernels.gyro_rows) catch unreachable, hp.n_expert, 2 } })}),
+                .decode = try arena.dupe(kernels.Launch, &.{try b.add(.gyro_matvec, P.GyroMatvec{
+                    .rows = hp.n_ff_exp,
+                    .cols = hp.n_embd,
+                    .n_used = hp.n_expert_used,
+                    .x_per_slot = 0,
+                    .x_stride = hp.n_embd,
+                    .out_stride = 2 * hp.n_ff_exp,
+                    .out_z = hp.n_ff_exp,
+                }, &.{ layer.gate_exps, layer.up_exps, xh, gu, ids, m.codebook }, .{ .tiles_y = .{ .x = std.math.divCeil(u32, hp.n_ff_exp, kernels.gyro_rows) catch unreachable, .tile = 1, .z = 2 } })}),
+            }, .mul = hp.n_expert_used });
             try body.append(arena, .{ .launch = try b.add(.rotate128, P.Rotate128{ .width = hp.n_ff_exp, .x_stride = 2 * hp.n_ff_exp, .y_stride = hp.n_ff_exp, .silu_pair = 1 }, &.{ gu, m.signs_ff, act }, .{ .rows_y = hp.n_ff_exp / 128 }), .mul = hp.n_expert_used });
-            try body.append(arena, .{ .launch = try b.add(.gyro_matvec, P.GyroMatvec{
-                .rows = hp.n_embd,
-                .cols = hp.n_ff_exp,
-                .n_used = hp.n_expert_used,
-                .x_per_slot = 1,
-                .x_stride = hp.n_ff_exp,
-                .out_stride = hp.n_embd,
-                .out_z = 0,
-            }, &.{ layer.down_exps, layer.down_exps, act, down, ids, m.codebook }, .{ .tiles_y = .{ .x = std.math.divCeil(u32, hp.n_embd, kernels.gyro_rows) catch unreachable, .tile = 1, .z = 1 } }), .mul = hp.n_expert_used });
-            try add(&body, arena, try mm.vector(sh_act, cur, &layer.sh_gu, .{ .silu_pair = hp.n_ff_shexp }));
-            try add(&body, arena, try mm.vector(sh_out, sh_act, &layer.sh_down, .{}));
+            try body.append(arena, .{ .fork = .{
+                .prefill = try arena.dupe(kernels.Launch, &.{try b.add(.gyro_matmul, P.GyroMatmul{
+                    .rows = hp.n_embd,
+                    .cols = hp.n_ff_exp,
+                    .n_used = hp.n_expert_used,
+                    .x_per_slot = 1,
+                    .x_stride = hp.n_ff_exp,
+                    .out_stride = hp.n_embd,
+                    .out_z = 0,
+                    .max_slots = cap * hp.n_expert_used,
+                }, &.{ layer.down_exps, layer.down_exps, act, down, expert_counts, expert_slots, m.codebook }, .{ .fixed = .{ std.math.divCeil(u32, hp.n_embd, kernels.gyro_rows) catch unreachable, hp.n_expert, 1 } })}),
+                .decode = try arena.dupe(kernels.Launch, &.{try b.add(.gyro_matvec, P.GyroMatvec{
+                    .rows = hp.n_embd,
+                    .cols = hp.n_ff_exp,
+                    .n_used = hp.n_expert_used,
+                    .x_per_slot = 1,
+                    .x_stride = hp.n_ff_exp,
+                    .out_stride = hp.n_embd,
+                    .out_z = 0,
+                }, &.{ layer.down_exps, layer.down_exps, act, down, ids, m.codebook }, .{ .tiles_y = .{ .x = std.math.divCeil(u32, hp.n_embd, kernels.gyro_rows) catch unreachable, .tile = 1, .z = 1 } })}),
+            }, .mul = hp.n_expert_used });
+            try body.append(arena, .{ .fork = .{
+                .prefill = try mm.tiled(sh_gu, .{ .plain = cur }, &layer.sh_gu, false),
+                .decode = try mm.vector(sh_act, cur, &layer.sh_gu, .{ .silu_pair = hp.n_ff_shexp }),
+            } });
+            try body.append(arena, .{ .fork = .{
+                .prefill = try mm.tiled(sh_out, .{ .silu = .{ .gu = sh_gu, .width = hp.n_ff_shexp, .out = sh_act } }, &layer.sh_down, false),
+                .decode = try mm.vector(sh_out, sh_act, &layer.sh_down, .{}),
+            } });
             try body.append(arena, .{ .launch = try b.add(.moe_combine, P.MoeCombine{ .n_used = hp.n_expert_used, .dim = hp.n_embd }, &.{ down, weights, sh_out, shared_logit, block }, .{ .rows_y = col_groups }) });
             try body.append(arena, .{ .launch = try b.add(.hc_combine, combine, &.{ block, hc_down, res }, .{ .rows_y = col_groups }) });
             le.* = body.items.len;
         }
 
         var head: std.ArrayList(Item) = .empty;
-        try Mix.build(&head, &b, mm, arena, &m.hc_head, hp, bufs);
-        try add(&head, arena, try mm.vector(logits, cur, &m.output, .{}));
+        var head_mm = mm;
+        head_mm.cap = cfg.logit_rows;
+        var head_bufs = bufs;
+        head_bufs.res = lm_res;
+        try Mix.build(&head, &b, head_mm, arena, &m.hc_head, hp, head_bufs);
+        try Item.matrix(&head, arena, head_mm, logits, cur, &m.output);
         const mark = try b.addWith(.mark_tokens, sample_params, &.{ prompt_ids, prompt_mask }, .{ .elems = 1 });
         const sampler_args: common.SamplerArgs = .{ .bias = bias, .prompt_mask = prompt_mask, .counts = counts, .work = work, .state = sample_state, .next = token_ids, .params = sample_params };
         const sample = try sampler_args.launches(&b, hp.vocab, logits, step);
@@ -691,12 +767,14 @@ pub const Program = struct {
         return .{
             .hp = hp,
             .cfg = cfg,
+            .prefill_tile = prefillTile(m),
             .step = step,
             .token_ids = token_ids,
             .res = res,
             .cur = cur,
             .ple_rows = ple_rows,
             .logits = logits,
+            .lm_res = lm_res,
             .recurrent = recurrent,
             .checkpoints = checkpoints,
             .table = m.ple,
@@ -757,7 +835,9 @@ pub const Program = struct {
     pub const Step = struct {
         pos0: u32,
         tokens: []const u32,
-        /// 0, or every row: project the rows to logits.
+        /// Force a kernel path for checks; normally Path.of(tokens.len).
+        path: ?Path = null,
+        /// Project the last this many rows to logits.
         logit_rows: u32 = 0,
         /// Sample from the row with this draw (a one-token step with its
         /// logits), reading back (token, is_stop) into `sampled`.
@@ -782,8 +862,10 @@ pub const Program = struct {
         const m: u32 = @intCast(s.tokens.len);
         const e: usize = p.hp.n_embd;
         const hc: usize = p.hp.hc;
-        std.debug.assert(m > 0 and m <= kernels.decode_max_rows and s.pos0 + m <= p.cfg.context);
-        std.debug.assert(s.logit_rows == 0 or s.logit_rows == m);
+        const path = s.path orelse Path.of(m);
+        std.debug.assert(m > 0 and m <= p.cfg.max_tokens and s.pos0 + m <= p.cfg.context);
+        std.debug.assert(path != .decode or m <= kernels.decode_max_rows);
+        std.debug.assert(s.logit_rows <= m and s.logit_rows <= p.cfg.logit_rows);
         std.debug.assert(s.draw == null or (m == 1 and s.logit_rows == 1));
         p.step_value = .{ .m = m, .pos0 = s.pos0, .u = s.draw orelse 0 };
         try rec.writeBuffer(gpa, p.step.buffer, 0, std.mem.asBytes(&p.step_value));
@@ -797,20 +879,15 @@ pub const Program = struct {
             }
         }
 
-        const ext = struct {
-            fn of(item: Item, m_: u32, keys: u32) kernels.Extent {
-                return .{ .rows = m_ * item.mul, .keys = keys };
-            }
-        }.of;
         const keys = s.pos0 + m;
         // The embeddings, then into each of the token's streams.
-        for (p.body[0..p.embeds]) |item| try item.launch.record(gpa, rec, ext(item, m, keys));
+        for (p.body[0..p.embeds]) |item| try item.record(gpa, rec, path, m, keys);
         for (0..m) |r| for (0..hc) |c| {
             try rec.copyBuffer(gpa, p.cur.buffer, r * e * 4, p.res.buffer, (r * hc + c) * e * 4, e * 4);
         };
         var il: usize = 0;
         for (p.body[p.embeds..], p.embeds..) |item, at| {
-            try item.launch.record(gpa, rec, ext(item, m, keys));
+            try item.record(gpa, rec, path, m, keys);
             const r = s.readback orelse continue;
             if (at + 1 == p.route_end[il]) {
                 try rec.readBuffer(gpa, common.read_token, p.ids.buffer, 0, std.mem.sliceAsBytes(r.experts[il][0 .. m * p.hp.n_expert_used]));
@@ -821,10 +898,11 @@ pub const Program = struct {
             }
         }
         if (s.logit_rows == 0) return;
-        for (p.head) |item| try item.launch.record(gpa, rec, ext(item, m, keys));
+        try rec.copyBuffer(gpa, p.res.buffer, (m - s.logit_rows) * hc * e * 4, p.lm_res.buffer, 0, s.logit_rows * hc * e * 4);
+        for (p.head) |item| try item.record(gpa, rec, path, s.logit_rows, keys);
         if (s.logits) |dst| {
             const vocab: usize = p.hp.vocab;
-            try rec.readBuffer(gpa, common.read_token, p.logits.buffer, 0, std.mem.sliceAsBytes(dst[0 .. m * vocab]));
+            try rec.readBuffer(gpa, common.read_token, p.logits.buffer, 0, std.mem.sliceAsBytes(dst[0 .. s.logit_rows * vocab]));
         }
         if (s.draw != null) {
             std.debug.assert(p.sample_len > 0);
@@ -833,3 +911,16 @@ pub const Program = struct {
         }
     }
 };
+
+/// The largest token tile among the model's dense prefill multiplies.
+fn prefillTile(m: *const Model) u32 {
+    const Tile = struct {
+        tokens: u32 = 1,
+        fn add(s: *@This(), w: *const Matrix) void {
+            for (w.chunks) |ch| s.tokens = @max(s.tokens, if (ch.type == .q8_0) 16 else kernels.matmulTiles(ch.type)[1]);
+        }
+    };
+    var tile: Tile = .{};
+    m.eachMatrix(&tile, Tile.add);
+    return tile.tokens;
+}

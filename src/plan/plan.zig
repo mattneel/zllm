@@ -86,7 +86,7 @@ pub const Step = struct {
     sampled: ?*[2]u32 = null,
     /// The logit rows, read back here.
     logits: ?[]f32 = null,
-    /// Qwen 3.5's kernel path (qwen35.Program.Step.path).
+    /// Kernel path, shared by Qwen 3.5 and Qwen4Exp.
     path: ?qwen35.Path = null,
     /// Qwen 3.5: leave the final hidden states for its MTP block.
     hidden: bool = false,
@@ -113,6 +113,8 @@ pub const Program = union(enum) {
             }, limits) },
             .qwen4exp => |*w| .{ .qwen4exp = try .build(arena, gpa, rec, set, w, .{
                 .context = @min(cfg.context, qwen4exp.max_context),
+                .max_tokens = @min(512, cfg.context, qwen4exp.max_context),
+                .logit_rows = 2,
                 .kv = cfg.kv,
                 .tuning = cfg.tuning,
                 .fuse = cfg.fuse,
@@ -160,8 +162,7 @@ pub const Program = union(enum) {
     /// Most tokens one step processes.
     pub fn maxTokens(p: *const Program) u32 {
         return switch (p.*) {
-            .qwen35 => |*x| x.cfg.max_tokens,
-            .qwen4exp => kernels.decode_max_rows,
+            inline else => |*x| x.cfg.max_tokens,
         };
     }
 
@@ -174,8 +175,7 @@ pub const Program = union(enum) {
     /// Tokens of a prefill tile, which costs as much part-filled.
     pub fn prefillTile(p: *const Program) u32 {
         return switch (p.*) {
-            .qwen35 => |*x| x.prefill_tile,
-            .qwen4exp => 1,
+            inline else => |*x| x.prefill_tile,
         };
     }
 
@@ -244,6 +244,7 @@ pub const Program = union(enum) {
                 .draw = s.draw,
                 .sampled = s.sampled,
                 .logits = s.logits,
+                .path = s.path,
             }),
         }
     }
@@ -262,3 +263,16 @@ pub const Program = union(enum) {
         return p.qwen35.recordVerify(gpa, rec, s);
     }
 };
+
+test "program capacity and tile expose each architecture's built values" {
+    var p: Program = .{ .qwen4exp = undefined };
+    p.qwen4exp.cfg = .{ .context = 8192, .max_tokens = 129 };
+    p.qwen4exp.prefill_tile = 64;
+    try std.testing.expectEqual(@as(u32, 129), p.maxTokens());
+    try std.testing.expectEqual(@as(u32, 64), p.prefillTile());
+    p = .{ .qwen35 = undefined };
+    p.qwen35.cfg = .{ .context = 8192, .max_tokens = 257 };
+    p.qwen35.prefill_tile = 32;
+    try std.testing.expectEqual(@as(u32, 257), p.maxTokens());
+    try std.testing.expectEqual(@as(u32, 32), p.prefillTile());
+}

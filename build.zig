@@ -30,6 +30,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
 
+    // Mutation checks of the parity harness itself need neither fixtures
+    // nor a GPU; use the same frozen Python environment as the checks.
+    const harness_tests = b.addSystemCommand(&.{ "uv", "run", "--frozen", "--project" });
+    harness_tests.addDirectoryArg(b.path("tools"));
+    harness_tests.addArgs(&.{ "python", "-m", "unittest", "discover", "-s" });
+    harness_tests.addDirectoryArg(b.path("tools"));
+    harness_tests.addArgs(&.{ "-p", "test_*.py" });
+    harness_tests.has_side_effects = true;
+    b.step("check-harness", "Run fixture-free parity-harness mutation tests").dependOn(&harness_tests.step);
+    test_step.dependOn(&harness_tests.step);
+
     // zllm.wasm for the browser shim (web/src/zllm), installed as
     // zig-out/web/zllm.wasm. Safety checks stay on by default.
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });

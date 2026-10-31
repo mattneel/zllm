@@ -296,6 +296,9 @@ pub const Mm = struct {
     /// (quantize_q8), per block size: [0] Q8_K (256), [1] Q8_0 (32).
     act: [2]?Act,
     tuning: Tuning,
+    /// Preserve float activations for Q8_0 weights (Qwen4Exp's reference
+    /// does not round them to Q8 blocks).
+    float_q8: bool = false,
 
     pub const Act = struct { qx: Arg, dx: Arg };
 
@@ -305,17 +308,19 @@ pub const Mm = struct {
 
     /// Scratch for x rounded to `block`-value blocks, for steps of `cap`
     /// tokens, if any quantized weight takes that block.
-    pub fn actScratch(a: *Alloc, m: anytype, cap: u64, block: u32) BuildError!?Act {
+    pub fn actScratch(a: *Alloc, m: anytype, cap: u64, block: u32, float_q8: bool) BuildError!?Act {
         const Widest = struct {
             block: u32,
+            float_q8: bool,
             k: u64 = 0,
             fn add(s: *@This(), w: *const Matrix) void {
                 for (w.chunks) |ch| {
+                    if (s.float_q8 and ch.type == .q8_0) continue;
                     if (!kernels.isHalf(ch.type) and kernels.actBlock(ch.type) == s.block) s.k = @max(s.k, w.k);
                 }
             }
         };
-        var widest: Widest = .{ .block = block };
+        var widest: Widest = .{ .block = block, .float_q8 = float_q8 };
         m.eachMatrix(&widest, Widest.add);
         if (widest.k == 0) return null;
         return .{ .qx = try a.storage(cap * widest.k / 4), .dx = try a.storage(cap * widest.k / block) };
@@ -372,21 +377,21 @@ pub const Mm = struct {
     pub fn tiled(mm: Mm, out: Arg, in: Input, w: *const Matrix, accumulate: bool) Allocator.Error![]const kernels.Launch {
         std.debug.assert(w.k % kernels.matmul_tile_k == 0);
         var list: std.ArrayList(kernels.Launch) = .empty;
-        var half = false;
-        for (w.chunks) |ch| half = half or kernels.isHalf(ch.type);
+        var plain = false;
+        for (w.chunks) |ch| plain = plain or kernels.isHalf(ch.type) or (mm.float_q8 and ch.type == .q8_0);
         const x: Arg = switch (in) {
             .plain => |a| a,
             .rmsnorm => |r| r.out,
             .silu => |s| s.out,
         };
-        if (half) switch (in) {
+        if (plain) switch (in) {
             .plain => {},
             .rmsnorm => |r| try list.append(mm.arena, try mm.b.add(.rmsnorm, P.RmsNorm{ .rows = mm.cap, .dim = w.k, .eps = mm.eps }, &.{ r.x, r.w, r.out }, .rows_x)),
             .silu => |s| try list.append(mm.arena, try mm.b.add(.silu_mul, P.SiluMul{ .count = mm.cap * s.width, .width = s.width }, &.{ s.gu, s.out }, .{ .elems = s.width })),
         };
         var rounded: [2]bool = @splat(false);
         for (w.chunks) |ch| {
-            if (kernels.isHalf(ch.type)) continue;
+            if (kernels.isHalf(ch.type) or (mm.float_q8 and ch.type == .q8_0)) continue;
             // quantize_q8 takes 256 values per workgroup.
             std.debug.assert(w.k % 256 == 0);
             const block = kernels.actBlock(ch.type);
@@ -402,7 +407,8 @@ pub const Mm = struct {
             try list.append(mm.arena, try mm.b.add(.quantize_q8, q, &.{ src, act.qx, act.dx, nw }, .{ .rows_y = w.k / 256 }));
         }
         for (w.chunks) |ch| {
-            const tiles = kernels.matmulTiles(ch.type);
+            const float_q8 = mm.float_q8 and ch.type == .q8_0;
+            const tiles: [2]u32 = if (float_q8) .{ 64, 16 } else kernels.matmulTiles(ch.type);
             const x_tiles = std.math.divCeil(u32, ch.rows, tiles[0]) catch unreachable;
             if (kernels.isHalf(ch.type)) {
                 try list.append(mm.arena, try mm.b.add(weightKernel(.matmul, ch.type), P.MatmulBf16{
@@ -416,8 +422,10 @@ pub const Mm = struct {
                 continue;
             }
             const s = kernels.matmulSlices(ch.rows, w.k);
-            const kernel = weightKernel(.matmul, ch.type);
-            const act = mm.act[actIndex(kernels.actBlock(ch.type))].?;
+            const kernel = if (float_q8) .matmul_q8_0_float else weightKernel(.matmul, ch.type);
+            const act = if (float_q8) null else mm.act[actIndex(kernels.actBlock(ch.type))];
+            const inputs = if (act) |q| [_]Arg{ q.qx, ch.arg, out, q.dx } else [_]Arg{ x, ch.arg, out, out };
+            const nargs: usize = if (float_q8) 3 else 4;
             if (s.count == 1) {
                 try list.append(mm.arena, try mm.b.add(kernel, P.MatmulQuant{
                     .rows = mm.cap,
@@ -427,11 +435,13 @@ pub const Mm = struct {
                     .out_stride = w.n,
                     .accumulate = @intFromBool(accumulate),
                     .k_slice = w.k,
-                }, &.{ act.qx, ch.arg, out, act.dx }, .{ .tiles_y = .{ .x = x_tiles, .tile = tiles[1] } }));
+                }, inputs[0..nargs], .{ .tiles_y = .{ .x = x_tiles, .tile = tiles[1] } }));
                 continue;
             }
             const stride = mm.cap * ch.rows;
             std.debug.assert(@as(u64, s.count) * stride * 4 <= mm.partials.size);
+            var partial_inputs = inputs;
+            partial_inputs[2] = mm.partials;
             try list.append(mm.arena, try mm.b.add(kernel, P.MatmulQuant{
                 .rows = mm.cap,
                 .n = ch.rows,
@@ -440,7 +450,7 @@ pub const Mm = struct {
                 .out_stride = ch.rows,
                 .k_slice = s.k_slice,
                 .slice_stride = stride,
-            }, &.{ act.qx, ch.arg, mm.partials, act.dx }, .{ .tiles_y = .{ .x = x_tiles, .tile = tiles[1], .z = s.count } }));
+            }, partial_inputs[0..nargs], .{ .tiles_y = .{ .x = x_tiles, .tile = tiles[1], .z = s.count } }));
             try list.append(mm.arena, try mm.b.add(.matmul_reduce, P.MatmulReduce{
                 .rows = mm.cap,
                 .n = ch.rows,

@@ -359,9 +359,10 @@ cross-workgroup fusion or a complete implementation of every planned rule.
 `src/plan/qwen4exp.zig` is the Gyro-Coder's step program. It is built from
 the parts it shares with Qwen 3.5's (`src/plan/common.zig`: weight upload,
 buffers, the multiplies' launches, the sampler). The engine drives either
-through `plan.Program`. This program runs the decode kernels only, in steps
-of up to 4 tokens, with up to 32,768 positions of context. Its attention
-is sparse: past 2,051 visible cells (top-k 2,048 + ratio 4 − 1) each query
+through `plan.Program`. Steps of up to 4 tokens use decode matvecs;
+larger steps use tiled dense projections and grouped expert matmuls,
+with a default capacity of 512 tokens and up to 32,768 context positions.
+Its attention is sparse: past 2,051 visible cells (top-k 2,048 + ratio 4 − 1) each query
 attends to its tail and the 4-cell blocks its indexer scores highest, about
 2,051 cells in all, whatever the position. Each attention layer has its
 indexer's weights (query heads and key, one BF16 multiply), an f16 key
@@ -370,9 +371,12 @@ cache and its pooled blocks; the rows' scores and selections are shared.
 - **Weights:** the dense Q8_0 matrices as Qwen 3.5 uploads them, stacked
   where they share an input (the DeltaNet projections; Q, K and V; the
   shared expert's gate and up; the hyper-connection matrices). The routed
-  experts go up as stored, TQ2_T, read by `gyro_matvec` at the ids the
-  router wrote; then the router, the codebook and the Hadamard sign
-  vectors. Everything but the PLE table is about 21 GB of GPU memory.
+  experts go up as stored, TQ2_T. Decode's `gyro_matvec` reads the ids the
+  router wrote; prefill groups slots by expert and shares decoded weights
+  across four tokens in `gyro_matmul`. Dense prefill Q8_0 multiplies keep
+  float activations to match the reference, using the common tiled and
+  split-K machinery. The router, codebook and Hadamard sign vectors are
+  uploaded too. Everything but the PLE table is about 21 GB of GPU memory.
 - **PLE:** the 50.7 GiB n-gram table stays in the file. Each step hashes
   its tokens' histories (the two tokens before each) and records a
   `write_file` of each of their 16 Q8_0 rows, which the host serves from

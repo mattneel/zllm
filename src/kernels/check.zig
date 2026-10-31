@@ -54,7 +54,7 @@ pub fn run(gpa: Allocator, device: platform.Device, host: *Host, out: *std.Io.Wr
         Quant(.q3_k).embed,   Quant(.q4_k).matvec,    Quant(.q4_k).matmul,      Quant(.q4_k).embed,     Quant(.q5_k).matvec,
         Quant(.q5_k).matmul,  Quant(.q5_k).embed,     Quant(.q6_k).matvec,      Quant(.q6_k).matmul,    Quant(.q6_k).embed,
         checkQuantTiles,      checkQuantSiluPair,     checkQuantAct,            checkQuantizeQ8K,       checkQuantizeQ80,
-        checkQuantizeNorm,    checkQuantizeSilu,
+        checkQuantizeNorm,    checkQuantizeSilu,      checkGyroMatmul,          checkMatmulQ80Float,
     }) |f| {
         ok = try report(&ctx, f, out) and ok;
         _ = arena_state.reset(.retain_capacity);
@@ -445,7 +445,7 @@ const Act = struct { qx: kernels.Arg, dx: kernels.Arg };
 fn quantizeX(c: *Ctx, t: gguf.TensorType, x: kernels.Arg, rows: u32, k: u32) !Act {
     const block = kernels.actBlock(t);
     const act: Act = .{ .qx = try c.output(rows * k / 4), .dx = try c.output(rows * k / block) };
-    try c.launcher().launch(.quantize_q8, P.QuantizeQ8{ .k = k, .block = block }, &.{ x, act.qx, act.dx, x }, .{ k / 256, rows, 1 });
+    try c.launcher().launch(.quantize_q8, P.QuantizeQ8{ .k = k, .block = block }, &.{ x, act.qx, act.dx, x }, .{ std.math.divCeil(u32, k, 256) catch unreachable, rows, 1 });
     return act;
 }
 
@@ -525,6 +525,94 @@ fn checkQuantizeQ8K(c: *Ctx) !Result {
 
 fn checkQuantizeQ80(c: *Ctx) !Result {
     return checkQuantize(c, .q8_0, "quantize_q8 Q8_0 (32)");
+}
+
+fn floatQ8Accurate(got: []const f32, want: []const f64) bool {
+    return relErr(got, want) <= 1e-5;
+}
+
+test "float Q8_0 matmul checker rejects activation quantization" {
+    var x: [320]f32 = @splat(0);
+    x[0] = 1;
+    x[1] = 0.003;
+    const want = [_]f64{@as(f64, x[0]) + x[1]};
+    const exact = [_]f32{x[0] + x[1]};
+    try std.testing.expect(floatQ8Accurate(&exact, &want));
+    ref_matmul.roundLikeLlama(.q8_0, &x);
+    const quantized = [_]f32{x[0] + x[1]};
+    try std.testing.expect(!floatQ8Accurate(&quantized, &want));
+}
+
+/// Two weight chunks exercise nonzero col0 and a padded output stride.
+/// Split-k partials are dense per chunk, as matmul_reduce requires.
+fn launchFloatQ8Check(c: *Ctx, x: kernels.Arg, weights: [3]kernels.Arg, out: kernels.Arg, rows: u32, accumulate: u32, slices: u32, chunked: u32) !void {
+    const l = c.launcher();
+    for ([_][2]u32{ .{ 0, 70 }, .{ 0, 27 }, .{ 27, 43 } }, weights, 0..) |chunk, w, index| {
+        if ((chunked == 0 and index != 0) or (chunked == 1 and index == 0)) continue;
+        const start = chunk[0];
+        const n = chunk[1];
+        const grid: [3]u32 = .{ std.math.divCeil(u32, n, 64) catch unreachable, std.math.divCeil(u32, rows, 16) catch unreachable, slices };
+        if (slices == 1) {
+            try l.launch(.matmul_q8_0_float, P.MatmulQuant{ .rows = rows, .n = n, .k = 320, .col0 = 3 + start, .out_stride = 79, .accumulate = accumulate, .k_slice = 320 }, &.{ x, w, out }, grid);
+        } else {
+            const partial = try c.output(slices * rows * n);
+            try l.launch(.matmul_q8_0_float, P.MatmulQuant{ .rows = rows, .n = n, .k = 320, .col0 = 0, .out_stride = n, .k_slice = 160, .slice_stride = rows * n }, &.{ x, w, partial }, grid);
+            try l.launch(.matmul_reduce, P.MatmulReduce{ .rows = rows, .n = n, .slices = slices, .col0 = 3 + start, .out_stride = 79, .accumulate = accumulate, .slice_stride = rows * n }, &.{ partial, out }, kernels.Launcher.elementwise(rows * n));
+        }
+    }
+}
+
+/// Unrounded float activations, k=320, partial 16-token/64-output tiles,
+/// weight chunks, padded outputs, overwrite/accumulate, and split-k.
+/// Within each split-k path, token chunking must remain bitwise identical.
+fn checkMatmulQ80Float(c: *Ctx) !Result {
+    const rows = 17;
+    const n = 70;
+    const k = 320;
+    const stride = 79;
+    const x = try c.random(rows * k, 1);
+    const w = try quantRows(c, .q8_0, n, k);
+    const row_bytes = k / 32 * 34;
+    const weights: [3]kernels.Arg = .{
+        try gpuWeights(c, .q8_0, w.bytes, k),
+        try gpuWeights(c, .q8_0, w.bytes[0 .. 27 * row_bytes], k),
+        try gpuWeights(c, .q8_0, w.bytes[27 * row_bytes ..], k),
+    };
+    const xa = try c.upload(x);
+    const init = try c.random(rows * stride, 0.25);
+    const want = try c.arena.alloc(f64, rows * n);
+    const compact = try c.arena.alloc(f32, rows * n);
+    var pass = true;
+    for ([_]u32{ 0, 1 }) |accumulate| {
+        for (0..rows) |r| for (0..n) |j| {
+            var sum: f64 = if (accumulate == 1) init[r * stride + 3 + j] else 0;
+            for (0..k) |i| sum += @as(f64, x[r * k + i]) * w.values[j * k + i];
+            want[r * n + j] = sum;
+        };
+        for ([_][2]u32{ .{ 1, 0 }, .{ 1, 1 }, .{ 2, 0 }, .{ 2, 1 } }) |path| {
+            const slices = path[0];
+            const chunked = path[1];
+            const out = try c.upload(init);
+            try launchFloatQ8Check(c, xa, weights, out, rows, accumulate, slices, chunked);
+            const got = try c.readWords(out);
+            for (0..rows) |r| for (0..n) |j| {
+                compact[r * n + j] = @bitCast(got[r * stride + 3 + j]);
+            };
+            pass = floatQ8Accurate(compact, want) and pass;
+            for (0..rows) |r| for (0..stride) |j| {
+                if (j >= 3 and j < 3 + n) continue;
+                pass = (got[r * stride + j] == @as(u32, @bitCast(init[r * stride + j]))) and pass;
+            };
+            for ([_][2]u32{ .{ 0, 3 }, .{ 3, 14 } }) |chunk| {
+                const first = chunk[0];
+                const count = chunk[1];
+                const chunk_out = try c.upload(init[first * stride ..][0 .. count * stride]);
+                try launchFloatQ8Check(c, try c.upload(x[first * k ..][0 .. count * k]), weights, chunk_out, count, accumulate, slices, chunked);
+                pass = std.mem.eql(u32, got[first * stride ..][0 .. count * stride], try c.readWords(chunk_out)) and pass;
+            }
+        }
+    }
+    return .{ .name = "matmul Q8_0 float x (chunks, split k)", .err = if (pass) 0 else 1, .tolerance = 0 };
 }
 
 /// The quantized kernels for type `t`: the decode multiply with its norm
@@ -1798,6 +1886,122 @@ fn checkGyroMatvec(c: *Ctx) !Result {
         worst = @max(worst, relErr(got, want));
     }
     return .{ .name = "gyro_matvec tq2_t (routed, gate+up, down)", .err = worst, .tolerance = 1e-5 };
+}
+
+/// Used by the GPU check and its mutation test: validate stable grouping,
+/// not merely the set of slots (which would miss reordered token tiles).
+fn groupedExact(ids: []const u32, counts: []const u32, slots: []const u32, max_slots: usize, got: []const u32, want: []const u32) bool {
+    for (counts, 0..) |count, expert| {
+        var n: usize = 0;
+        for (ids, 0..) |id, slot| {
+            if (id != expert) continue;
+            if (n >= count or slots[expert * max_slots + n] != slot) return false;
+            n += 1;
+        }
+        if (n != count) return false;
+    }
+    return std.mem.eql(u32, got, want);
+}
+
+test "grouped Gyro checker rejects grouping and output mutations" {
+    const ids = [_]u32{ 1, 0, 1, 0, 1 };
+    var counts = [_]u32{ 2, 3, 0 };
+    var slots = [_]u32{ 1, 3, 99, 99, 99, 0, 2, 4, 99, 99, 99, 99, 99, 99, 99 };
+    const want = [_]u32{ 0x3f800000, 0x40000000, 0x40400000 };
+    var got = want;
+    try std.testing.expect(groupedExact(&ids, &counts, &slots, 5, &got, &want));
+    slots[5] = 2;
+    try std.testing.expect(!groupedExact(&ids, &counts, &slots, 5, &got, &want));
+    slots[5] = 0;
+    counts[2] = 1;
+    try std.testing.expect(!groupedExact(&ids, &counts, &slots, 5, &got, &want));
+    counts[2] = 0;
+    got[1] ^= 1;
+    try std.testing.expect(!groupedExact(&ids, &counts, &slots, 5, &got, &want));
+}
+
+/// Repeated routes (7, 4, 3, 0 slots), partial four-token and 32-row tiles,
+/// token- and slot-indexed inputs, padded strides, and stale capacity rows.
+/// Whole versus split token chunks is bitwise on both backends. WGSL also
+/// compares bitwise to gyro_matvec; HLSL's old WaveActiveSum is unspecified.
+fn checkGyroMatmul(c: *Ctx) !Result {
+    const q4 = @import("../ref/qwen4exp/kernels.zig");
+    const book = try c.upload(@import("../ref/gyro/gyro.zig").codebook_bytes);
+    const rows = 37;
+    const tokens = 7;
+    const used = 2;
+    const n_expert = 4;
+    const max_slots = 22;
+    const active_ids = [_]u32{ 0, 1, 0, 2, 0, 1, 0, 2, 0, 1, 0, 2, 0, 1 };
+    var ids: [max_slots]u32 = @splat(0);
+    @memcpy(ids[0..active_ids.len], &active_ids);
+    var pass = true;
+    for ([_]u32{ 2560, 640 }, [_]u32{ 2, 1 }) |cols, projections| {
+        const x_stride = cols + 8;
+        const out_z = rows + 2;
+        const out_stride = projections * out_z + 3;
+        const per_slot = projections == 1;
+        var w: [2][]u8 = undefined;
+        var wa: [2]kernels.Arg = undefined;
+        for (&w, &wa) |*bytes, *arg| {
+            const blocks = n_expert * rows * cols / 128;
+            bytes.* = try c.arena.alloc(u8, std.mem.alignForward(usize, blocks * 34, 4));
+            c.rand.bytes(bytes.*);
+            for (0..blocks) |b| std.mem.writeInt(u16, bytes.*[b * 34 ..][0..2], @bitCast(@as(f16, @floatCast((c.rand.float(f32) * 2 - 1) * 0.05))), .little);
+            arg.* = try c.upload(bytes.*);
+        }
+        const x = try c.random((if (per_slot) @as(u32, tokens * used) else tokens) * x_stride, 1);
+        const xa = try c.upload(x);
+        const init = try c.arena.alloc(u32, tokens * used * out_stride);
+        @memset(init, 0x42f60000);
+        const whole = try c.upload(init);
+        const old = try c.upload(init);
+        const counts = try c.output(n_expert);
+        const slots = try c.output(n_expert * max_slots);
+        const p: P.GyroMatmul = .{ .rows = rows, .cols = cols, .n_used = used, .x_per_slot = @intFromBool(per_slot), .x_stride = x_stride, .out_stride = out_stride, .out_z = out_z, .max_slots = max_slots };
+        const group: P.MoeGroup = .{ .n_used = used, .n_expert = n_expert, .max_slots = max_slots };
+        const grid: [3]u32 = .{ std.math.divCeil(u32, rows, kernels.gyro_rows) catch unreachable, n_expert, projections };
+        const l = c.launcher();
+        try l.launch(.moe_group, group, &.{ try c.upload(&ids), counts, slots, try c.step(tokens, 0, 0) }, .{ 1, 1, 1 });
+        try l.launch(.gyro_matmul, p, &.{ wa[0], wa[1], xa, whole, counts, slots, book }, grid);
+        const got = try c.readWords(whole);
+        const whole_counts = try c.readWords(counts);
+        const whole_slots = try c.readWords(slots);
+        const split = try c.arena.dupe(u32, init);
+        for ([_][2]u32{ .{ 0, 2 }, .{ 2, 1 }, .{ 3, 4 } }) |chunk| {
+            const start = chunk[0];
+            const len = chunk[1];
+            const first_slot = start * used;
+            const n_slots = len * used;
+            const chunk_out = try c.upload(init[first_slot * out_stride ..][0 .. n_slots * out_stride]);
+            const x0 = (if (per_slot) first_slot else start) * x_stride;
+            const xn = (if (per_slot) n_slots else len) * x_stride;
+            try l.launch(.moe_group, group, &.{ try c.upload(active_ids[first_slot..][0..n_slots]), counts, slots, try c.step(len, 0, 0) }, .{ 1, 1, 1 });
+            try l.launch(.gyro_matmul, p, &.{ wa[0], wa[1], try c.upload(x[x0..][0..xn]), chunk_out, counts, slots, book }, grid);
+            @memcpy(split[first_slot * out_stride ..][0 .. n_slots * out_stride], try c.readWords(chunk_out));
+        }
+        pass = groupedExact(&active_ids, whole_counts, whole_slots, max_slots, got, split) and pass;
+        if (c.device.backend() == .webgpu) {
+            try l.launch(.gyro_matvec, P.GyroMatvec{ .rows = rows, .cols = cols, .n_used = used, .x_per_slot = @intFromBool(per_slot), .x_stride = x_stride, .out_stride = out_stride, .out_z = out_z }, &.{ wa[0], wa[1], xa, old, try c.upload(&active_ids), book }, .{ grid[0], tokens * used, projections });
+            pass = std.mem.eql(u32, got, try c.readWords(old)) and pass;
+        }
+        const cpu = try c.arena.alloc(f64, tokens * used * projections * rows);
+        const gpu = try c.arena.alloc(f32, cpu.len);
+        const row_bytes = cols / 128 * 34;
+        for (active_ids, 0..) |expert, slot| for (0..projections) |z| for (0..rows) |j| {
+            const off = (expert * rows + j) * row_bytes;
+            const xr = (if (per_slot) slot else slot / used) * x_stride;
+            const compact = (slot * projections + z) * rows + j;
+            cpu[compact] = q4.dotRow(.tq2_t, w[z][off..][0..row_bytes], x[xr..][0..cols]);
+            gpu[compact] = @bitCast(got[slot * out_stride + z * out_z + j]);
+        };
+        pass = relErr(gpu, cpu) <= 1e-5 and pass;
+        for (0..tokens * used) |slot| for (0..out_stride) |j| {
+            if (j / out_z < projections and j % out_z < rows) continue;
+            pass = (got[slot * out_stride + j] == init[slot * out_stride + j]) and pass;
+        };
+    }
+    return .{ .name = "gyro_matmul grouped (bitwise chunks)", .err = if (pass) 0 else 1, .tolerance = 0 };
 }
 
 /// Routing for 3 tokens over 256 experts, the model's top 10, through

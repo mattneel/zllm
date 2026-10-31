@@ -16,6 +16,7 @@ const implemented = [_]Kernel{
     .rmsnorm,
     .matmul_bf16,
     .matmul_f16,
+    .matmul_q8_0_float,
     .matvec_bf16,
     .matvec_f16,
     .embed_bf16,
@@ -34,6 +35,8 @@ const implemented = [_]Kernel{
     .qsa_score,
     .qsa_select,
     .gyro_matvec,
+    .gyro_matmul,
+    .moe_group,
     .moe_logits,
     .moe_route,
     .rotate128,
@@ -91,6 +94,7 @@ pub fn source(k: Kernel) ?[]const u8 {
 ///   anything else         <name>.hlsl
 fn composed(comptime name: []const u8) []const u8 {
     @setEvalBranchQuota(10_000);
+    if (std.mem.eql(u8, name, "matmul_q8_0_float")) return @embedFile("kernels/matmul_q8_0_float.hlsl");
     for (std.enums.values(kernels.QuantOp)) |op| {
         for ([_][]const u8{ "bf16", "f16" }) |h| {
             if (std.mem.eql(u8, name, @tagName(op) ++ "_" ++ h)) {
@@ -162,4 +166,10 @@ test "every kernel writes only the bindings its WGSL contract declares read_writ
 test hlslWrites {
     try std.testing.expectEqual(@as(u32, 0b1010), hlslWrites("stf(3, i, v); x = ldf(2, i); stu(1, 0, w); rw(2).Load(0);"));
     try std.testing.expectEqual(@as(u32, 0b100), hlslWrites("rw(2).InterlockedAdd(0, 1, o); mystf(5, 1);"));
+}
+
+test "grouped Gyro HLSL writes exactly its WGSL write set" {
+    inline for (.{ Kernel.moe_group, Kernel.gyro_matmul }) |k| {
+        try std.testing.expectEqual(k.contract().writes, hlslWrites(source(k).?[common.len..]));
+    }
 }

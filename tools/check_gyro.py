@@ -10,9 +10,11 @@ reference runtime, AgentionAI's llama.cpp fork.
    layer's streams (l_last) and chosen experts (ffn_moe_topk) and the logits.
    Every layer must choose the same experts; streams and logits must stay
    within the bounds below; every position's top-1 must agree, so the GPU's
-   greedy choices are the runtime's 40 tokens. One-token and four-token steps
-   must give bitwise identical results, and so must the program with and
-   without the fusion pass (fuse.lower), record by record.
+   greedy choices are the runtime's 40 tokens. Forced prefill and decode
+   paths each match the CPU's f16 KV with the existing bounds below.
+   Step splits and fusion must be bitwise invariant separately within
+   each path (the two paths may round differently). Prefill covers full
+   and partial tiles, 7-token steps, and forced 1-token steps.
 2. The runtime's 6,430-token prompt (a fact buried in filler, past the sparse
    attention's 2,051-cell width), greedy through `zllm generate` on the host:
    the runtime's 10 tokens.
@@ -45,9 +47,77 @@ LOGITS_MEDIAN_MAX = 1e-4
 LOGITS_MAX = 1e-3
 STREAMS_MAX = 1e-3
 
+# name, forced path, chunk, KV format, unfused. All runs share the complete
+# ref1 sequence, including all 40 greedy tokens; the model loads only once.
+FORWARD_RUNS = (
+    ("prefill", "prefill", 512, "f16", False),
+    ("prefill-7", "prefill", 7, "f16", False),
+    ("prefill-1", "prefill", 1, "f16", False),
+    ("prefill-unfused", "prefill", 512, "f16", True),
+    ("decode", "decode", 4, "f16", False),
+    ("decode-1", "decode", 1, "f16", False),
+    ("decode-unfused", "decode", 4, "f16", True),
+)
+
 
 def rel_l2(got: np.ndarray, want: np.ndarray) -> np.ndarray:
     return np.linalg.norm(got - want, axis=1) / np.linalg.norm(want, axis=1)
+
+
+def compare_reference(fail: Failures, label: str, gpu: dict, cpu: dict, tokens: np.ndarray, n_prompt: int) -> None:
+    """Check every layer and position, retaining routing and greedy gates."""
+    # The CPU observer also records intermediate activations that the GPU
+    # deliberately does not read back. Require the complete shared boundary.
+    layers = sorted(int(k.rsplit("-", 1)[1]) for k in cpu if k.startswith("l_last-"))
+    expected = {"result_output"} | {f"{kind}-{i}" for i in layers for kind in ("l_last", "ffn_moe_topk")}
+    names_match = set(gpu) == expected and expected <= set(cpu)
+    fail.expect(f"{label}: tensor names", names_match, f"expected {len(expected)} shared records, got {len(gpu)}")
+    if not names_match:
+        return
+    shapes_match = all(gpu[k].shape == cpu[k].shape for k in expected)
+    fail.expect(f"{label}: tensor shapes", shapes_match, "record shapes differ from the CPU")
+    if not shapes_match:
+        return
+    n = len(tokens)
+    fail.expect(f"{label}: layers", bool(layers), "missing layer records")
+    streams_max = 0.0
+    flips = 0
+    for i in layers:
+        g = gpu[f"l_last-{i}"].reshape(n, -1)
+        c = cpu[f"l_last-{i}"].reshape(n, -1)
+        rel = rel_l2(g, c)
+        streams_max = max(streams_max, float(rel.max()))
+        fail.expect(f"{label}: streams layer {i}", bool(np.all(rel <= STREAMS_MAX)), f"max rel L2 {rel.max():.2e} > {STREAMS_MAX}")
+        ge = gpu[f"ffn_moe_topk-{i}"].reshape(n, -1)
+        ce = cpu[f"ffn_moe_topk-{i}"].reshape(n, -1)
+        flips += sum(set(ge[t]) != set(ce[t]) for t in range(n))
+    g = gpu["result_output"].reshape(n, -1)
+    c = cpu["result_output"].reshape(n, -1)
+    logits = rel_l2(g, c)
+    top1 = int((g.argmax(1) == c.argmax(1)).sum())
+    greedy = int((g[n_prompt - 1 : -1].argmax(1) == tokens[n_prompt:]).sum())
+    fail.expect(f"{label}: expert routing", flips == 0, f"{flips} (position, layer) expert sets differ")
+    fail.expect(f"{label}: logits median", float(np.median(logits)) <= LOGITS_MEDIAN_MAX, f"{np.median(logits):.2e}")
+    fail.expect(f"{label}: logits max", bool(np.all(logits <= LOGITS_MAX)), f"{logits.max():.2e} > {LOGITS_MAX}")
+    fail.expect_eq(f"{label}: top-1", top1, n)
+    fail.expect_eq(f"{label}: greedy tokens", greedy, n - n_prompt)
+    print(f"  {label}: expert flips {flips}; streams max rel L2 {streams_max:.2e}; logits median {np.median(logits):.2e}, max {logits.max():.2e}")
+    print(f"    top-1 {top1}/{n}; greedy {greedy}/{n - n_prompt} of the runtime's tokens")
+
+
+def compare_runs(fail: Failures, runs: dict, cpu: dict, tokens: np.ndarray, n_prompt: int) -> None:
+    """Only compare bit patterns within the same forced kernel path."""
+    for path, splits in (("prefill", ("prefill-7", "prefill-1")), ("decode", ("decode-1",))):
+        base = runs[path]
+        compare_reference(fail, path, base, cpu, tokens, n_prompt)
+        for name in (*splits, f"{path}-unfused"):
+            other = runs[name]
+            names_match = sorted(base) == sorted(other)
+            differ = [k for k in base if k not in other or base[k].shape != other[k].shape or not np.array_equal(base[k].view(np.uint32), other[k].view(np.uint32))]
+            same = names_match and not differ
+            kind = "fusion" if name.endswith("-unfused") else "step splits"
+            fail.expect(f"{name}: {kind}", same, f"records differ from {path}: {differ or 'tensor names'}")
+            print(f"  {name} vs {path}: {'bitwise identical' if same else 'DIFFER'}")
 
 
 def main() -> int:
@@ -76,53 +146,18 @@ def main() -> int:
         cpu_path = work / "cpu.bin"
         cached_reference(paths, "zllm-forward", args.model, tok, cpu_path, [args.zllm, "forward", str(args.model), str(tok), str(cpu_path)])
         cpu = read_records(cpu_path)
-        # The three runs in one gpu-forward process: the model loads once.
         with GpuRuns(args, paths, args.model, work) as batch:
-            outs = {name: batch.add(tok, f"gpu{name}.bin", *opts, "--kv", "f16") for name, opts in (("4", ("--chunk", "4")), ("1", ("--chunk", "1")), ("unfused", ("--chunk", "4", "--no-fuse")))}
+            outs = {
+                name: batch.add(tok, f"gpu-{name}.bin", "--path", path, "--chunk", str(chunk), "--kv", kv, *(("--no-fuse",) if unfused else ()))
+                for name, path, chunk, kv, unfused in FORWARD_RUNS
+            }
             timing = batch.run()
             runs = {}
             for name, out in outs.items():
-                print(f"  [{timing[out]}]")
+                print(f"  {name} [{timing[out]}]")
                 runs[name] = read_records(out)
-        gpu = runs["4"]
-
-        n = len(tokens)
-        layers = sorted({int(k.rsplit("-", 1)[1]) for k in gpu if k.startswith("l_last-")})
-        fail.expect("layers", len(layers) > 0 and all(f"l_last-{i}" in cpu for i in layers), "missing layer records")
-        streams_max = 0.0
-        flips = 0
-        for i in layers:
-            g = gpu[f"l_last-{i}"].reshape(n, -1)
-            c = cpu[f"l_last-{i}"].reshape(n, -1)
-            streams_max = max(streams_max, float(rel_l2(g, c).max()))
-            ge = gpu[f"ffn_moe_topk-{i}"].reshape(n, -1).astype(int)
-            ce = cpu[f"ffn_moe_topk-{i}"].reshape(n, -1).astype(int)
-            flips += sum(set(ge[t]) != set(ce[t]) for t in range(n))
-        g = gpu["result_output"].reshape(n, -1)
-        c = cpu["result_output"].reshape(n, -1)
-        logits = rel_l2(g, c)
-        top1 = int((g.argmax(1) == c.argmax(1)).sum())
-        greedy = int((g[n_prompt - 1 : -1].argmax(1) == tokens[n_prompt:]).sum())
-        same = sorted(runs["1"]) == sorted(gpu) and all(np.array_equal(runs["1"][k].view(np.uint32), gpu[k].view(np.uint32)) for k in gpu)
-        # The fusion pass against the unfused program, layer by layer: its
-        # fused kernels stage exactly what the separate kernels wrote.
-        unfused = runs["unfused"]
-        differ = [k for k in sorted(gpu) if k not in unfused or not np.array_equal(unfused[k].view(np.uint32), gpu[k].view(np.uint32))]
-        print(f"{args.host}, ref1 ({n} positions, {len(layers)} layers):")
-        print(f"  expert sets differing from the CPU reference: {flips} (want 0)")
-        print(f"  streams max rel L2 {streams_max:.2e} (max {STREAMS_MAX})")
-        print(f"  logits rel L2 median {np.median(logits):.2e} (max {LOGITS_MEDIAN_MAX}), max {logits.max():.2e} (max {LOGITS_MAX})")
-        print(f"  top-1 agreement {top1}/{n}; greedy {greedy}/{len(ref1['greedy'])} of the runtime's tokens")
-        print(f"  1-token vs 4-token steps: {'bitwise identical' if same else 'DIFFER'}")
-        print(f"  fused vs unfused, {len(gpu)} records (every layer's streams and experts, the logits): {'bitwise identical' if not differ else 'first differing: ' + differ[0]}")
-        fail.expect("expert routing", flips == 0, f"{flips} (position, layer) expert sets differ")
-        fail.expect("streams", streams_max <= STREAMS_MAX, f"{streams_max:.2e}")
-        fail.expect("logits median", float(np.median(logits)) <= LOGITS_MEDIAN_MAX, f"{np.median(logits):.2e}")
-        fail.expect("logits max", float(logits.max()) <= LOGITS_MAX, f"{logits.max():.2e}")
-        fail.expect_eq("top-1", top1, n)
-        fail.expect_eq("greedy tokens", greedy, len(ref1["greedy"]))
-        fail.expect("step splits", same, "1-token and 4-token steps differ")
-        fail.expect("fusion", not differ, f"{len(differ)} records differ from the unfused program, first {differ[0] if differ else ''}")
+        print(f"{args.host}, ref1 ({len(tokens)} positions):")
+        compare_runs(fail, runs, cpu, tokens, n_prompt)
 
     if args.fast:
         return fail.report()

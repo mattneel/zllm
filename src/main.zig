@@ -55,9 +55,9 @@ const usage =
     \\                                       as `forward`, on the GPU through Dawn, in
     \\                                       steps of N tokens (default 512; f32 KV;
     \\                                       the decode kernels for steps of up to 4).
-    \\                                       Qwen4Exp: decode kernels only, up to 2,048
-    \\                                       tokens; writes each layer's streams and
-    \\                                       experts (l_last, ffn_moe_topk) and logits
+    \\                                       Qwen4Exp: up to 32,768 tokens; writes each
+    \\                                       layer's streams and experts (l_last,
+    \\                                       ffn_moe_topk) and logits; no --mtp/--tune
     \\
 ++ gen.usage ++
     \\environment:
@@ -527,6 +527,19 @@ const ForwardOptions = struct {
     }
 };
 
+test "gpu-forward options retain forced paths and requested chunks" {
+    const prefill = try ForwardOptions.parse(&.{ "--path", "prefill", "--chunk", "67", "--kv", "f32" });
+    try std.testing.expectEqual(zllm.plan.qwen35.Path.prefill, prefill.path.?);
+    try std.testing.expectEqual(@as(u32, 67), prefill.chunk);
+    const tiny = try ForwardOptions.parse(&.{ "--path", "prefill", "--chunk", "1" });
+    try std.testing.expectEqual(zllm.plan.qwen35.Path.prefill, tiny.path.?);
+    const decode = try ForwardOptions.parse(&.{ "--path", "decode", "--chunk", "4" });
+    try std.testing.expectEqual(zllm.plan.qwen35.Path.decode, decode.path.?);
+    try std.testing.expectEqual(@as(u32, 4), decode.chunk);
+    const automatic = try ForwardOptions.parse(&.{});
+    try std.testing.expectEqual(@as(?zllm.plan.qwen35.Path, null), automatic.path);
+}
+
 /// One gpu-forward run: token ids in, activation records out.
 const ForwardRun = struct {
     tokens_path: []const u8,
@@ -626,23 +639,29 @@ const Gpu = struct {
     }
 };
 
-/// A Qwen4Exp run: the decode kernels in steps of up to
-/// min(chunk, decode_max_rows) tokens, the PLE rows read from the mapped
-/// file. Writes the records the reference names alike: each layer's
-/// streams (`l_last-<layer>`) and chosen experts (`ffn_moe_topk-<layer>`),
-/// and every position's logits.
+/// A Qwen4Exp run: steps of `chunk` tokens, through the path `opts`
+/// forces or the step's own, with PLE rows read from the mapped file.
+/// Writes the records the reference names alike: each layer's streams
+/// (`l_last-<layer>`) and chosen experts (`ffn_moe_topk-<layer>`), and
+/// every position's logits.
 fn gpuRunQwen4exp(g: *Gpu, arena: std.mem.Allocator, set: *zllm.kernels.Set, model: *const zllm.plan.qwen4exp.Model, limits: zllm.plan.common.Limits, tokens: []const u32, out_path: []const u8, opts: ForwardOptions) !void {
     const plan = zllm.plan.qwen4exp;
-    if (opts.path == .prefill or opts.mtp or opts.tune) {
-        std.log.err("gpu-forward runs Qwen4Exp with the decode kernels only, without --mtp or --tune", .{});
+    if (opts.mtp or opts.tune) {
+        std.log.err("gpu-forward runs Qwen4Exp without --mtp or --tune", .{});
         return error.InvalidUsage;
     }
     const gpa = g.gpa;
     const t_start = Io.Timestamp.now(g.io, .awake);
     const n: u32 = @intCast(tokens.len);
     if (n > plan.max_context) return error.ContextTooLong;
-    const chunk: u32 = @min(opts.chunk, zllm.kernels.decode_max_rows, n);
-    var program = try plan.Program.build(arena, gpa, &g.rec, set, model, .{ .context = @max(n, 1), .kv = opts.kv, .fuse = !opts.no_fuse }, limits);
+    const chunk = @min(opts.chunk, n);
+    var program = try plan.Program.build(arena, gpa, &g.rec, set, model, .{
+        .max_tokens = chunk,
+        .logit_rows = chunk,
+        .context = @max(n, 1),
+        .kv = opts.kv,
+        .fuse = !opts.no_fuse,
+    }, limits);
     try program.recordReset(gpa, &g.rec);
     try g.run(0);
     const t_loaded = Io.Timestamp.now(g.io, .awake);
@@ -675,6 +694,7 @@ fn gpuRunQwen4exp(g: *Gpu, arena: std.mem.Allocator, set: *zllm.kernels.Set, mod
             .tokens = tokens[pos0..][0..m],
             .logit_rows = m,
             .logits = logits[pos0 * vocab ..][0 .. m * vocab],
+            .path = opts.path,
             .readback = &readback,
         });
         try g.run(steps + 1);

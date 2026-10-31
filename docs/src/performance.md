@@ -29,6 +29,54 @@ measurements distinguish HTTP loading, OPFS caching and picked files.
 These are different workloads; they should not be compared as though they
 were one benchmark.
 
+## Gyro-Coder Agility prefill cutover
+
+Measured on 2026-10-31 with the RTX 5090 Laptop, native Agility,
+`Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf` (75,796,732,256 bytes),
+8,192 context positions, f16 KV and the default tuned matvecs. The
+baseline is an immutable worktree of `a1fe958`; both versions ran these
+same commands, with only one GPU job at a time:
+
+```sh
+ZLLM_BACKEND=agility scripts/d3d12.sh benchmark 'C:\models\Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf'
+ZLLM_BACKEND=agility scripts/d3d12.sh profile 'C:\models\Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf' 4
+```
+
+| Workload | Decode-only baseline | Tiled/grouped prefill |
+|---|---:|---:|
+| `benchmark`: 1,024-token prompt | 92.91 tok/s, 257 steps | 107.29 tok/s, 65 steps |
+| `benchmark`: greedy decode | 52.73 tok/s | 54.41 tok/s |
+| `benchmark`: plain decode | 51.56 tok/s | 54.47 tok/s |
+| `profile ... 4`: unprofiled 4-token step | 40.70 ms (98.28 tok/s) | 41.23 ms (97.02 tok/s) |
+| Same profile's one-token decode | 21.88 ms | 19.64 ms |
+
+The end-to-end prefill improvement is **15.5% (1.155×)**, not a claim of
+250 tok/s. The remaining gap to that comparison point is 142.71 tok/s,
+requiring another 2.33× over this benchmark snapshot. Four-token steps
+deliberately stay on the decode path, so the required `profile ... 4`
+comparison does not measure the new prefill kernels.
+
+An additional `profile ... 64` run exercises the new path: 462.11 ms per
+unprofiled 64-token step (138.50 tok/s), at positions 64–448. Its GPU
+timestamp sum is 349.36 ms; per-dispatch profiling and wall-clock timing
+are different measurements. The top phases are:
+
+| Phase | GPU ms per 64-token step | Timestamp share |
+|---|---:|---:|
+| Grouped TQ2_T experts (`gyro_matmul`) | 224.19 | 64.2% |
+| Float-activation Q8_0 dense projections | 94.81 | 27.1% |
+| Sequential DeltaNet recurrence | 8.58 | 2.5% |
+| Expert grouping | 4.57 | 1.3% |
+| Sparse attention | 4.16 | 1.2% |
+
+Grouped gate/up alone accounts for 166.41 ms (47.6%); grouped down for
+57.77 ms (16.5%). Expert matmul, then dense projection throughput, remain
+the principal gap rather than routing or the PLE kernels. These are
+ordinary compute shaders, not a tensor-core performance claim. Both
+Agility and Dawn D3D12 `check-fast` gates passed before recording these
+results, with unchanged Gyro reference bounds and bitwise chunking checks
+separately within each path; see [Gyro-Coder](gyro.md).
+
 ## Per-device records
 
 `benchmarks/rtx5090-laptop-d3d12.jsonl` stores the committed native benchmark

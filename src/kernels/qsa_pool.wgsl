@@ -1,7 +1,7 @@
 // The sparse attention's indexer, part 2: pools each block of `ratio`
-// cached keys this step completes (blocks b with (b + 1) · ratio ≤ pos0 + m,
-// at most two for a step of up to 4 tokens). The mean of its keys, in
-// position order, RMSNormed with k_norm and rotated (NeoX RoPE) at its first
+// cached keys this step completes (blocks b with (b + 1) · ratio ≤ pos0 + m).
+// The mean of its keys, in position order, is RMSNormed with k_norm and
+// rotated (NeoX RoPE) at its first
 // position, b · ratio. Workgroup x takes block pos0 / ratio + x.
 
 struct Qsa {

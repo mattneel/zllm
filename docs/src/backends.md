@@ -38,10 +38,11 @@ available backend, option or performance claim.
 | CUDA Graphs | Not applicable to this API | Not applicable to this API | Not applicable to this API | Not implemented |
 
 The matrix describes backend capabilities. Model-specific restrictions still
-apply: Qwen3.8-Flash-Next uses decode kernels in steps of at most four tokens,
-reads PLE rows from the file for every step, and cannot chain sampled tokens
-entirely on the GPU. It has no MTP speculation path. The Qwen 3.5 program can
-use prefill kernels, pipelined decode and an MTP block when the model and
+apply: Qwen3.8-Flash-Next uses tiled prefill for larger prompt chunks and
+decode matvecs for steps of at most four tokens. It reads PLE rows from
+the file for every step and cannot chain sampled tokens entirely on the
+GPU. It has no MTP speculation path. The Qwen 3.5 program also supports
+prefill kernels, pipelined decode and an MTP block when the model and
 binding limits permit them. See [Generation](generation.md) and
 [Gyro-Coder](gyro.md).
 

@@ -26,10 +26,23 @@ and results are in
 | `src/kernels/` and `src/agility/kernels/` | WGSL and HLSL implementations |
 
 The GPU program runs on WebGPU and Agility through the common engine.
-It uses decode kernels only, including for prompt ingestion, in steps of
-up to 4 tokens. Its context cap is 32,768 positions; that is an
-implementation cap, not a claim about every context advertised upstream.
-It has no MTP block or speculative decoding path.
+Like Qwen 3.5, steps of up to 4 tokens retain the decode matrix-vector
+path; larger prompt chunks use tiled prefill, with a default capacity of
+512 tokens. Dense projections reuse the common tiled/split-K machinery,
+but Q8_0 weights multiply **float activations**: the Gyro reference does
+not round activations to Q8 blocks. Both paths support explicit selection
+with `gpu-forward --path prefill|decode` for validation.
+
+Its context cap is 32,768 positions; that is an implementation cap, not a
+claim about every context advertised upstream. It has no MTP block or
+speculative decoding path. Bitwise step-split and fused/unfused checks
+apply within each kernel path, not between prefill and decode; both paths
+are independently compared with the CPU reference.
+
+The measured Agility cutover improves the 1,024-token benchmark prefill
+from 92.91 to 107.29 tok/s, with decode retained on matvecs. See the
+[matched commands and phase breakdown](performance.md#gyro-coder-agility-prefill-cutover);
+this does not close the gap to the roughly 250 tok/s comparison point.
 
 ## Hyper-connections
 
@@ -97,6 +110,14 @@ and nontrivial. Selected experts run a SwiGLU FFN. A separate shared
 expert contributes through a sigmoid gate, and the routed and shared
 outputs are summed before residual injection.
 
+During prefill, a stable GPU grouping pass buckets routed slots by expert.
+The grouped expert matmul shares each decoded TQ2_T weight across four
+tokens and scatters results back to their original token/expert slots.
+Partial expert tiles keep the same accumulation and reduction order as
+full tiles, so changing prompt chunk boundaries cannot change an active
+token's result within the prefill path. Decode continues to use the
+existing routed matvec kernels.
+
 Routed expert weights are stored in a Hadamard-rotated basis with sign
 vectors declared in `prism.hadamard.*`. The input must be rotated into
 that basis before the gate/up products, and the intermediate activation
@@ -159,3 +180,13 @@ runtime's greedy tokens, but its f32 operands do not reproduce every
 intermediate activation of that runtime's rounded multiplies. These are
 different claims; the detailed
 [validation table](validation.md#qwen38-flash-next-gyro-coder) records both.
+
+The prefill cutover passed `check-fast` on Agility and Dawn D3D12.
+Each forced path is compared with the same f16-cache CPU reference and
+unchanged bounds (streams and maximum logits relative L2 `1e-3`, median
+logits `1e-4`), with zero expert-set flips, all 66 top-1 predictions and
+all 40 reference-runtime greedy tokens agreeing. Prefill chunks of
+66, 7 and 1 tokens are bitwise identical, as are fused/unfused runs;
+decode chunks of 4 and 1 retain the same invariant. Float-cache GPU
+results are not compared to this f16-cache reference as if cache
+precision were identical.

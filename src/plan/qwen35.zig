@@ -525,7 +525,7 @@ pub const Program = struct {
             .cap = capn,
             .eps = hp.rms_eps,
             .partials = try a.storage(Mm.partialFloats(m, cap)),
-            .act = .{ try Mm.actScratch(&a, m, cap, 256), try Mm.actScratch(&a, m, cap, 32) },
+            .act = .{ try Mm.actScratch(&a, m, cap, 256, false), try Mm.actScratch(&a, m, cap, 32, false) },
             .tuning = cfg.tuning,
         };
 
