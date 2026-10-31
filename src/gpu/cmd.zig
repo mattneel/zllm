@@ -29,7 +29,7 @@ pub const Op = enum(u8) {
     /// `variant` (0: the default), whose contract (Kernel.contract) writes
     /// the bindings set in `writes` and only reads the rest, from the
     /// backend's artifact for it: WGSL with one
-    /// entry point named "main" on WebGPU, HLSL on Velocity. The ids say
+    /// entry point named "main" on WebGPU, HLSL on Agility. The ids say
     /// which kernel a pipeline is (profiles, capability reports). An empty
     /// artifact marks a kernel the backend does not implement: dispatching
     /// its pipeline fails the batch with error.UnsupportedKernel.

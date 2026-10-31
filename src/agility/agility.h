@@ -1,4 +1,4 @@
-/* Velocity: zllm's native Direct3D 12 host (src/velocity/host.cpp).
+/* Agility: zllm's native Direct3D 12 host (src/agility/host.cpp).
  *
  * A thin C interface over D3D12 with the Agility SDK and DirectStorage:
  * bindless raw buffers, one root signature of root constants, DXIL
@@ -6,8 +6,8 @@
  * range reads from files straight into buffers. The Zig host (host.zig)
  * executes zllm's command stream on it. Windows only; compiled into zllm.
  */
-#ifndef ZLLM_VELOCITY_H
-#define ZLLM_VELOCITY_H
+#ifndef ZLLM_AGILITY_H
+#define ZLLM_AGILITY_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -101,7 +101,7 @@ VEL_API vel_result vel_create_resource(vel_context *context, uint64_t bytes, uin
 VEL_API vel_result vel_create_pipeline(vel_context *context, const void *dxil, size_t dxil_bytes,
     vel_pipeline **out_pipeline);
 /* Compiles HLSL (entry point "main") for `target` (e.g. "cs_6_6") with
- * velocity\dxcompiler.dll beside the executable, then creates its pipeline.
+ * agility\dxcompiler.dll beside the executable, then creates its pipeline.
  * On a compile error, vel_last_error holds the compiler's messages. */
 VEL_API vel_result vel_compile_pipeline(vel_context *context, const char *source, size_t bytes,
     const char *target, vel_pipeline **out_pipeline);

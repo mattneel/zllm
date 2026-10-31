@@ -18,8 +18,8 @@ reference runtime, AgentionAI's llama.cpp fork.
    the runtime's 10 tokens.
 
 Hosts as in check_gpu.py: `native` (this build, ZLLM_DAWN's adapter) or
-`d3d12` (the Windows build through scripts/d3d12.sh) or `velocity` (that build on
-Velocity).
+`d3d12` (the Windows build through scripts/d3d12.sh) or `agility` (that build on
+Agility).
 """
 
 from __future__ import annotations

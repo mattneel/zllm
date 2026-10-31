@@ -1,9 +1,9 @@
-//! Velocity's kernels: for each kernels.Kernel it implements, its HLSL,
+//! Agility's kernels: for each kernels.Kernel it implements, its HLSL,
 //! composed the way kernels.zig composes the WGSL: kernels/common.hlsli,
 //! then the kernel's parts from kernels/ (see `composed`). Each keeps its
 //! WGSL counterpart's contract (params block, bindings, grid) and is written
 //! for Direct3D 12. Kernels not listed in `implemented` are missing on
-//! Velocity (kernels.Set.missing).
+//! Agility (kernels.Set.missing).
 
 const std = @import("std");
 const kernels = @import("../kernels/kernels.zig");
@@ -11,7 +11,7 @@ const Kernel = kernels.Kernel;
 
 const common = @embedFile("kernels/common.hlsli");
 
-/// The kernels Velocity implements.
+/// The kernels Agility implements.
 const implemented = [_]Kernel{
     .rmsnorm,
     .matmul_bf16,
@@ -69,7 +69,7 @@ const implemented = [_]Kernel{
 };
 
 /// Kernel `k`'s HLSL (for a template, kernels.Kernel.isTemplate, the
-/// template's source), or null where Velocity does not implement it.
+/// template's source), or null where Agility does not implement it.
 pub fn source(k: Kernel) ?[]const u8 {
     inline for (implemented) |i| {
         if (k == i) return comptime common ++ composed(@tagName(i));
@@ -116,7 +116,7 @@ fn composed(comptime name: []const u8) []const u8 {
     return @embedFile("kernels/" ++ name ++ ".hlsl");
 }
 
-test "Velocity implements every kernel" {
+test "Agility implements every kernel" {
     for (std.enums.values(Kernel)) |k| {
         const s = source(k) orelse return error.TestUnexpectedResult;
         try std.testing.expect(s.len > common.len);

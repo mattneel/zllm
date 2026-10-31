@@ -23,9 +23,9 @@ and results are in
 | `src/ref/qwen4exp/ple.zig` | PLE row hashing and token history |
 | `src/ref/qwen4exp/engine.zig` | CPU reference graph |
 | `src/plan/qwen4exp.zig` | Weight upload, GPU steps, checkpoints and PLE file reads |
-| `src/kernels/` and `src/velocity/kernels/` | WGSL and HLSL implementations |
+| `src/kernels/` and `src/agility/kernels/` | WGSL and HLSL implementations |
 
-The GPU program runs on WebGPU and Velocity through the common engine.
+The GPU program runs on WebGPU and Agility through the common engine.
 It uses decode kernels only, including for prompt ingestion, in steps of
 up to 4 tokens. Its context cap is 32,768 positions; that is an
 implementation cap, not a claim about every context advertised upstream.

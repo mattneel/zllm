@@ -21,7 +21,7 @@
 | `scripts/fixtures.sh` | Pinned fixture downloads |
 | `scripts/d3d12.sh` | Builds the Windows binary and runs it on the D3D12 host from WSL |
 | `third_party/dawn` | The vendored `webgpu.h` matching the pinned Dawn release |
-| `src/velocity/` | Native D3D12 host, HLSL kernels and Windows SDK interface |
+| `src/agility/` | Native D3D12 host, HLSL kernels and Windows SDK interface |
 | `benchmarks/` | Committed per-device benchmark records |
 
 ## Checks
@@ -60,10 +60,10 @@ inputs recomputes the reference.
 CI passes `-Dengine-check=false` on llvmpipe. The software renderer makes
 engine-check expensive and its prefix-reuse rounding can exceed the
 bound. This is an explicit coverage gap, not a relaxed bound.
-Engine-check still runs on real GPUs with `d3d12` and `velocity`.
+Engine-check still runs on real GPUs with `d3d12` and `agility`.
 
 Run GPU work one job at a time. Use `-Dgpu-host=d3d12` for Dawn on a Windows
-GPU from WSL, or `-Dgpu-host=velocity` for Velocity. The default native host
+GPU from WSL, or `-Dgpu-host=agility` for Agility. The default native host
 uses Dawn; llvmpipe model/reference checks are not real-GPU performance
 evidence. Backend-specific gates matter even when hosts share the core.
 

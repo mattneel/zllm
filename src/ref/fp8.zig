@@ -1,5 +1,5 @@
 //! FP8 E4M3FN, as the FP8 KV cache stores it (kernels/fp8.wgsl,
-//! velocity/kernels/fp8.hlsli): 1 sign, 4 exponent (bias 7) and 3 mantissa
+//! agility/kernels/fp8.hlsli): 1 sign, 4 exponent (bias 7) and 3 mantissa
 //! bits, no infinities, largest finite 448. Each (position, KV head) row is
 //! divided by its scale: the smallest power of two with amax / scale ≤ 448,
 //! so applying it is exact on every backend.

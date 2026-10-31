@@ -1,4 +1,4 @@
-//! The ordering Velocity's host keeps between operations in a command list:
+//! The ordering Agility's host keeps between operations in a command list:
 //! a UAV barrier only where an operation touches a buffer range one since
 //! the last barrier wrote, or writes a range one of them read.
 

@@ -1,6 +1,6 @@
-//! Stands in for velocity/host.zig in builds without Velocity (-Dvelocity
+//! Stands in for agility/host.zig in builds without Agility (-Dagility
 //! off, or not Windows): its types exist for gpu/host.zig, but no device
-//! ever opens (gpu.Device.open returns error.VelocityNotBuilt).
+//! ever opens (gpu.Device.open returns error.AgilityNotBuilt).
 
 const std = @import("std");
 const cmd = @import("../gpu/cmd.zig");
@@ -11,8 +11,8 @@ pub const Error = error{};
 pub const Device = struct {
     caps: struct { vendor_id: u32, device_id: u32, shader_model: u32, linalg_tier: u32 },
 
-    pub fn init(_: std.mem.Allocator, _: u32) error{VelocityNotBuilt}!*Device {
-        return error.VelocityNotBuilt;
+    pub fn init(_: std.mem.Allocator, _: u32) error{AgilityNotBuilt}!*Device {
+        return error.AgilityNotBuilt;
     }
     pub fn deinit(_: *Device, _: std.mem.Allocator) void {
         unreachable;

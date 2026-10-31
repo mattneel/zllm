@@ -72,7 +72,7 @@ are all 1; a model with others (Granite 3) is refused on the GPU. The CPU
 reference runs them.
 
 The same dense plan runs through WebGPU (browser or native Dawn) and
-Velocity's native D3D12 implementation. It has the shared plan's prefill
+Agility's native D3D12 implementation. It has the shared plan's prefill
 and decode paths, sampler, prefix reuse and device recovery, but no MTP
 block. KV storage can be f32, f16 or FP8 E4M3; f16 remains the generation
 default. The lower FP8 diagnostic bounds are not authorization to change

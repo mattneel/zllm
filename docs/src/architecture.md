@@ -12,12 +12,12 @@ flowchart TB
   JS[Browser TypeScript facade] --> WASM[Same core as wasm32-freestanding]
   CORE --> PLATFORM[Platform layer: gpu.Device / gpu.Host]
   PLATFORM --> DAWN[Dawn: WebGPU / WGSL]
-  PLATFORM --> VEL[Velocity: D3D12 / HLSL]
+  PLATFORM --> VEL[Agility: D3D12 / HLSL]
   WASM --> SHIM[Browser WebGPU shim / WGSL]
 ```
 
 `src/backend/backend.zig` defines the implemented backend identities:
-`webgpu` and `velocity`. Native code uses `src/gpu/host.zig` to open a device,
+`webgpu` and `agility`. Native code uses `src/gpu/host.zig` to open a device,
 read its limits and adapter identity, and execute batches without reaching
 into Dawn or D3D12. The browser implements the WebGPU side in
 `web/src/zllm/gpu.ts`. See the [backend capability matrix](backends.md)
@@ -64,7 +64,7 @@ whether every item in the [design specification](spec.md) is complete.
 | `kernels` | Kernel identities, parameter structs, binding contracts, WGSL implementations, variants and launch construction |
 | `backend` | Implemented backend identities and the shared backend contract |
 | `gpu` | Command recorder, native platform interface, Dawn device and host, and shared profiling results |
-| `velocity` | Windows D3D12 host, DirectStorage and hand-written HLSL implementations |
+| `agility` | Windows D3D12 host, DirectStorage and hand-written HLSL implementations |
 | `tune` | Non-blocking load-time sweep of quantized decode multiply variants, checked against the default before timing |
 | `fuse` | Buffer-use legality and lowering for the implemented `hc_act` → quantized decode multiply fusion |
 | `plan` | Weight layout and upload, activation and state buffers, prebuilt launches, architecture-neutral `Model`/`Program`, and tuning-cache serialization |
@@ -96,7 +96,7 @@ The core is a state machine driven by its host:
    of the `submit` and `read_buffer` operations they answer.
 
 The core does not block on a GPU API and uses no Asyncify. Browser WebGPU
-promises feed completions back into wasm. The native Dawn and Velocity hosts
+promises feed completions back into wasm. The native Dawn and Agility hosts
 can block on a submission and deliver completions immediately. Both drive
 the same scheduler and program interface.
 

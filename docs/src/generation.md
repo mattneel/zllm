@@ -3,7 +3,7 @@
 The generation engine turns a loaded GGUF model into streamed text. It
 schedules GPU work under a time budget, keeps model state between requests,
 and samples on the GPU. The same scheduler drives the native CLI through
-Dawn or Velocity and the [browser API](browser.md) through WebGPU.
+Dawn or Agility and the [browser API](browser.md) through WebGPU.
 
 ```sh
 zllm chat model.gguf                        # thinking on; --no-think to skip it
@@ -391,7 +391,7 @@ about 1.3 (two tokens decode each weight once), the draft the rest.
 
 The prefill results were recorded in `1bea429` (2026-10-29); the
 speculative comparison and its code prompt were recorded in `bfa5353`
-(2026-10-29). These snapshots predate Velocity and later kernel changes.
+(2026-10-29). These snapshots predate Agility and later kernel changes.
 The spec targets are acceptance goals, not additional measurements.
 
 `zllm bench` at position 288 measured the steps:

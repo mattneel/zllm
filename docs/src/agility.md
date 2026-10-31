@@ -1,6 +1,6 @@
-# Velocity (native D3D12)
+# Agility (native D3D12)
 
-Velocity is zllm's native Direct3D 12 backend. It runs the same Zig plans
+Agility is zllm's native Direct3D 12 backend. It runs the same Zig plans
 and command stream as the WebGPU backend ([GPU backend](gpu.md)), with
 hand-written HLSL kernels compiled by DXC.
 
@@ -26,16 +26,16 @@ legality, tuning, the scheduler and sampling stay in the Zig core. The
 backend supplies an artifact for each kernel identity, not a separate
 model implementation.
 
-| | WebGPU | Velocity |
+| | WebGPU | Agility |
 |---|---|---|
-| Kernels | WGSL (`src/kernels/`) | HLSL (`src/velocity/kernels/`) |
+| Kernels | WGSL (`src/kernels/`) | HLSL (`src/agility/kernels/`) |
 | Compiled by | Dawn or the browser, at `create_kernel` | DXC (`dxcompiler.dll`, pinned preview), at `create_kernel` |
-| Host | `src/gpu/dawn_host.zig`; `web/src/zllm/gpu.ts` | `src/velocity/host.zig` over `host.cpp` |
+| Host | `src/gpu/dawn_host.zig`; `web/src/zllm/gpu.ts` | `src/agility/host.zig` over `host.cpp` |
 | Weights | `write_file` from a mapping or HTTP range reads | `write_file` through DirectStorage |
 
 ## The native layer
 
-`src/velocity/host.cpp` is a C interface (`velocity.h`) over D3D12 with
+`src/agility/host.cpp` is a C interface (`agility.h`) over D3D12 with
 DirectStorage. It is built by `zig c++` for `x86_64-windows-gnu`.
 
 - **Bindless:** every buffer has a raw SRV and a raw UAV in one
@@ -75,7 +75,7 @@ read uploaded weights through SRVs (`ro`) and everything else through UAVs
 
 ## Kernels
 
-`src/velocity/kernels.zig` lists the kernels Velocity implements. Each one
+`src/agility/kernels.zig` lists the kernels Agility implements. Each one
 keeps its WGSL counterpart's contract:
 
 - the params block at binding 0;
@@ -90,7 +90,7 @@ quantized types' decoders, the attention masks, and f16 rounding are
 shared fragments (`.hlsli`). The quantized decode multiply is a template
 (`matvec_quant.hlsl.hbs`) over the same variants WebGPU's tuner explores.
 
-Velocity implements every current kernel identity; the source contains a
+Agility implements every current kernel identity; the source contains a
 coverage test for that catalog. A missing artifact is explicit:
 `kernels.Set.missing` records it, dispatch fails with
 `error.UnsupportedKernel`, `gpu-check` reports `MISSING`, and native model
@@ -100,13 +100,13 @@ The load-time tuner renders the same twelve `MatvecVariant` candidates
 from the HLSL template. The shared fuser can fold `hc_act` into the
 quantized multiply's prologue under its single-reader and layout rules.
 Native tuning is cached through the same JSON cache as Dawn, with
-`velocity` as the runtime identity. The current key hashes the WGSL
+`agility` as the runtime identity. The current key hashes the WGSL
 catalog, not the HLSL catalog: an HLSL-only change with an unchanged
 version can reuse an old tuning entry. See [Plan cache](gpu.md#plan-cache).
 
 ### Native optimizations
 
-Velocity is no longer only a translation of the initial WGSL algorithms:
+Agility is no longer only a translation of the initial WGSL algorithms:
 
 - `gyro_matvec` computes 32 rows per workgroup. It stages both the input
   and the codebook in groupshared memory, exchanges stream bytes with
@@ -132,7 +132,7 @@ The following table preserves the existing RTX 5090 Laptop validation
 record from the full HLSL port. Counts describe that revision's gates, not
 a test run of the current checkout:
 
-| Gate | Recorded result on Velocity |
+| Gate | Recorded result on Agility |
 |---|---|
 | `gpu-check` | 69/69 kernel cases at the full-port revision, before the later FP8 cases |
 | `check-gpu` (Qwen3.5-0.8B, dense models) | prefill 1264/1264 and decode 320/320 top-1, max rel L2 1.4e-5; f16 KV 818/818; engine-check 15/15, including speculation, pipelined decode and lost-device recovery |
@@ -142,7 +142,7 @@ a test run of the current checkout:
 FP8 KV was added after the full port (`ecec4af`). The cache encoding is
 E4M3FN with a power-of-two scale per position and KV head, implemented in
 `fp8.hlsli` and checked byte-for-byte against the CPU encoder. That commit
-records 1233/1264 top-1 agreement with the f32 reference on Velocity's
+records 1233/1264 top-1 agreement with the f32 reference on Agility's
 small-model evaluation, versus 1231/1264 on Dawn. f16 remains the default.
 FP8 KV storage does not imply FP8 matrix compute or automatic
 quality-gated precision selection.
@@ -154,16 +154,16 @@ a promise for another adapter:
 
 | Change | Recorded result | Commit |
 |---|---|---|
-| Split Q8_0 rows and vectorized decode tasks | After the 6,430-token prompt: Velocity 30.6 → 40.5 tok/s; Dawn 35.9 tok/s | `823d6de` |
-| More rows per expert workgroup, staged codebook and wave operations | Routed experts on Velocity: 4.7 → 3.2 ms per decode step | `d406cae` |
-| One word load per f16 scale | Velocity decode: 23.4–23.7 → 22.2–22.5 ms per step | `30362f6` |
-| One workgroup per router row | Velocity routing: 1.56 → 0.3 ms per decode step | `1713119` |
+| Split Q8_0 rows and vectorized decode tasks | After the 6,430-token prompt: Agility 30.6 → 40.5 tok/s; Dawn 35.9 tok/s | `823d6de` |
+| More rows per expert workgroup, staged codebook and wave operations | Routed experts on Agility: 4.7 → 3.2 ms per decode step | `d406cae` |
+| One word load per f16 scale | Agility decode: 23.4–23.7 → 22.2–22.5 ms per step | `30362f6` |
+| One workgroup per router row | Agility routing: 1.56 → 0.3 ms per decode step | `1713119` |
 
 For quality gates and their tolerances, see [Validation](validation.md).
 
 ## Building and running
 
-Velocity builds for Windows only, against pinned SDKs:
+Agility builds for Windows only, against pinned SDKs:
 
 - Agility SDK 1.722.0-preview;
 - DirectStorage 1.3.0;
@@ -171,17 +171,17 @@ Velocity builds for Windows only, against pinned SDKs:
 
 ```sh
 scripts/fixtures.sh dawn        # the D3D12 host stage
-scripts/fixtures.sh velocity    # Velocity's SDKs, and its DLLs in the stage
-ZLLM_BACKEND=velocity scripts/d3d12.sh gpu-info
-ZLLM_BACKEND=velocity scripts/d3d12.sh gpu-check
+scripts/fixtures.sh agility    # Agility's SDKs, and its DLLs in the stage
+ZLLM_BACKEND=agility scripts/d3d12.sh gpu-info
+ZLLM_BACKEND=agility scripts/d3d12.sh gpu-check
 ```
 
-`scripts/d3d12.sh` adds `-Dvelocity` when the SDKs are present.
-`-Dgpu-host=velocity` runs the parity checks (`gpu-check`, `check-gpu`,
-`check-quant`, `check-gyro`) on Velocity.
+`scripts/d3d12.sh` adds `-Dagility` when the SDKs are present.
+`-Dgpu-host=agility` runs the parity checks (`gpu-check`, `check-gpu`,
+`check-quant`, `check-gyro`) on Agility.
 
 `ZLLM_BACKEND` selects the backend for every GPU command: `webgpu` (the
-default) or `velocity`. `ZLLM_ADAPTER` picks Velocity's adapter, in DXGI's
+default) or `agility`. `ZLLM_ADAPTER` picks Agility's adapter, in DXGI's
 high-performance order.
 
 Windows Developer Mode is needed to enable the experimental shader-model

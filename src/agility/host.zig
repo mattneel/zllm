@@ -1,5 +1,5 @@
-//! Velocity's host: executes command batches (gpu/cmd.zig) on the native
-//! Direct3D 12 layer (velocity.h, host.cpp).
+//! Agility's host: executes command batches (gpu/cmd.zig) on the native
+//! Direct3D 12 layer (agility.h, host.cpp).
 //!
 //! The same semantics as the Dawn host (gpu/dawn_host.zig), blocking: a
 //! `submit` returns once the GPU has finished it, with one completion per
@@ -22,13 +22,13 @@ const cmd = @import("../gpu/cmd.zig");
 const Timings = @import("../gpu/timings.zig").Timings;
 const Kernel = @import("../kernels/kernels.zig").Kernel;
 const hazards = @import("hazards.zig");
-pub const c = @import("velocity_c");
+pub const c = @import("agility_c");
 
 pub const timeout_ms: u32 = 60_000;
 
 pub const Error = error{ GpuError, DeviceLost, BadCommand, BadId, NoTimestamps, UnsupportedKernel } || cmd.DecodeError || Allocator.Error;
 
-/// A Velocity device: one D3D12 adapter with its compute and DirectStorage
+/// A Agility device: one D3D12 adapter with its compute and DirectStorage
 /// queues.
 pub const Device = struct {
     ctx: *c.vel_context,
@@ -44,7 +44,7 @@ pub const Device = struct {
         var ctx: ?*c.vel_context = null;
         const r = c.vel_create(&options, &ctx);
         if (r < 0) {
-            std.log.err("velocity: cannot create a device on adapter {d}: HRESULT 0x{x:0>8}", .{ adapter, @as(u32, @bitCast(r)) });
+            std.log.err("agility: cannot create a device on adapter {d}: HRESULT 0x{x:0>8}", .{ adapter, @as(u32, @bitCast(r)) });
             return error.GpuError;
         }
         const d = try gpa.create(Device);
@@ -82,11 +82,11 @@ pub const Device = struct {
         }
     }
 
-    /// Fails a dispatch of kernel `k` (kernels.Kernel), which Velocity
+    /// Fails a dispatch of kernel `k` (kernels.Kernel), which Agility
     /// does not implement.
     fn missing(d: *Device, k: u32) Error {
         const name = if (std.enums.fromInt(Kernel, k)) |kernel| @tagName(kernel) else "?";
-        const msg = std.fmt.bufPrint(&d.message, "kernel {s} has no Velocity implementation", .{name}) catch &.{};
+        const msg = std.fmt.bufPrint(&d.message, "kernel {s} has no Agility implementation", .{name}) catch &.{};
         d.message_len = msg.len;
         return error.UnsupportedKernel;
     }
@@ -107,7 +107,7 @@ pub const Device = struct {
 };
 
 /// A kernel's pipeline and the bindings its contract writes, or `missing`
-/// where Velocity has no implementation of the kernel (an empty artifact).
+/// where Agility has no implementation of the kernel (an empty artifact).
 const Pipeline = union(enum) {
     ready: struct { p: *c.vel_pipeline, writes: u32 },
     missing: u32,
@@ -306,7 +306,7 @@ pub const Host = struct {
                 const source = command.ptrAt([*]const u8, 4)[0..a[6]];
                 var p: ?*c.vel_pipeline = null;
                 h.d.check(c.vel_compile_pipeline(h.d.ctx, source.ptr, source.len, target(source), &p)) catch |err| {
-                    std.log.err("velocity: kernel {d} (variant {d}) does not compile: {s}", .{ a[1], a[2], h.d.errorMessage() });
+                    std.log.err("agility: kernel {d} (variant {d}) does not compile: {s}", .{ a[1], a[2], h.d.errorMessage() });
                     return err;
                 };
                 try put(Pipeline, h.gpa, &h.pipelines, a[0], .{ .ready = .{ .p = p.?, .writes = a[3] } });
@@ -604,9 +604,9 @@ fn groupsFor(words: u32) u32 {
 }
 
 /// The shader target a kernel's source asks for with a line
-/// "// velocity: cs_6_10" (LinAlg); cs_6_6 (bindless) otherwise.
+/// "// agility: cs_6_10" (LinAlg); cs_6_6 (bindless) otherwise.
 fn target(source: []const u8) [*:0]const u8 {
-    return if (std.mem.indexOf(u8, source, "\n// velocity: cs_6_10\n") != null) "cs_6_10" else "cs_6_6";
+    return if (std.mem.indexOf(u8, source, "\n// agility: cs_6_10\n") != null) "cs_6_10" else "cs_6_6";
 }
 
 fn need(args: []const u32, n: usize) error{BadCommand}!void {

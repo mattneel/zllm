@@ -3,7 +3,7 @@
 The GPU path has three layers: the shared Zig core records a **command
 stream**, a backend **host** executes it, and backend-specific **kernels**
 perform the work. WebGPU uses WGSL in the browser and through native Dawn;
-[Velocity](velocity.md) uses hand-written HLSL on native D3D12. Both run the
+[Agility](agility.md) uses hand-written HLSL on native D3D12. Both run the
 same model plans, scheduler, sampler, tuner and fusion legality rules.
 
 The plans are **step programs**: buffers, bindings and launch lists built
@@ -21,13 +21,13 @@ The existing documentation records these exercised host paths:
 | Native Linux | Dawn → Vulkan | llvmpipe (Mesa's software renderer) | Kernel and forward-pass correctness |
 | Windows, run from WSL | Dawn → D3D12 | RTX 5090 Laptop | Native parity and timing |
 | Browser | Chrome WebGPU → D3D12 | RTX 5090 Laptop | Browser inference and parity |
-| Native Windows | Velocity → D3D12 | RTX 5090 Laptop | HLSL parity, DirectStorage and native optimization |
+| Native Windows | Agility → D3D12 | RTX 5090 Laptop | HLSL parity, DirectStorage and native optimization |
 
 WebGPU also provides Metal and hardware Vulkan paths, but the existing
 validation record does not establish runs on those adapters. The current
 WGSL kernels use portable compute and packed integer operations, not native
-tensor-core or matrix intrinsics. Velocity's capabilities and remaining
-matrix-kernel work are described separately in [Velocity](velocity.md).
+tensor-core or matrix intrinsics. Agility's capabilities and remaining
+matrix-kernel work are described separately in [Agility](agility.md).
 
 Dawn comes from the pinned prebuilt release. Its static archive is wrapped
 into a shared library (`libwebgpu_dawn.so`, `webgpu_dawn.dll`) that exports
@@ -54,7 +54,7 @@ native Linux host falls back to llvmpipe.
 The core never calls a GPU API. It appends commands to a `Recorder`
 (`src/gpu/cmd.zig`), a host executes the batch, and the core consumes one
 completion per `submit` and per `read_buffer`. The native platform interface
-(`src/gpu/host.zig`) selects Dawn or Velocity. The browser host
+(`src/gpu/host.zig`) selects Dawn or Agility. The browser host
 (`web/src/zllm/gpu.ts`) interprets the same words, crossing the wasm/JS
 boundary once per batch rather than once per dispatch.
 
@@ -70,7 +70,7 @@ boundary once per batch rather than once per dispatch.
 |---|---|
 | `create_buffer` | id, size, usage (WebGPU `GPUBufferUsage` bits) |
 | `write_buffer` | buffer, offset, data, length |
-| `create_kernel` | id, kernel, variant, the bindings its contract writes, artifact (the backend's implementation: WGSL with entry point `main` on WebGPU, HLSL on Velocity; empty where the backend lacks the kernel) |
+| `create_kernel` | id, kernel, variant, the bindings its contract writes, artifact (the backend's implementation: WGSL with entry point `main` on WebGPU, HLSL on Agility; empty where the backend lacks the kernel) |
 | `create_bind_group` | id, pipeline, group, then (binding, buffer, offset, size)… |
 | `dispatch` | pipeline, workgroups x/y/z, bind groups |
 | `copy_buffer` | src, offset, dst, offset, size |
@@ -96,7 +96,7 @@ counts as shared GPU memory, on top of 22 GB of dedicated memory.
 
 The WebGPU implementations live in `src/kernels/*.wgsl`. Kernel identities,
 uniform parameter structs and binding contracts are in `kernels.zig`;
-Velocity supplies the corresponding HLSL artifacts. Weights retain their
+Agility supplies the corresponding HLSL artifacts. Weights retain their
 BF16, F16 or supported quantized values and are decoded in the shader.
 Activations and accumulation are f32, except that quantized prefill
 multiplies round their input to 8 bits as llama.cpp does (below).
@@ -130,7 +130,7 @@ Three weight layouts change at load:
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling). One more phase undoes the last draw's output count (a rejected speculative round's second sample) |
 | `draft` | The speculative draft: the first index of the maximum of a row of logits, into the next step's token input | One workgroup |
-| `gyro_matvec` | Routed-expert products on Gyro TQ2_T weights (Gyro-Coder) | The expert comes from the router's GPU buffer, with no readback. A workgroup computes 32 rows; a lane per trellis step decodes four weights from the 2,048-pair codebook; gate and up share a dispatch. Velocity stages the codebook and uses lane exchange and wave sums; WGSL reads the codebook from storage to stay within the guaranteed workgroup-memory limit |
+| `gyro_matvec` | Routed-expert products on Gyro TQ2_T weights (Gyro-Coder) | The expert comes from the router's GPU buffer, with no readback. A workgroup computes 32 rows; a lane per trellis step decodes four weights from the 2,048-pair codebook; gate and up share a dispatch. Agility stages the codebook and uses lane exchange and wave sums; WGSL reads the codebook from storage to stay within the guaranteed workgroup-memory limit |
 | `moe_logits`, `moe_route` | Expert routing: router · x (f32) and the shared expert's gate logit, then softmax, top-k (ties to the lower index) and normalized weights | `moe_logits` assigns a workgroup per router row with vector loads, then reduces with a tree in WGSL or wave sums in HLSL. `moe_route` performs selection in one workgroup per token |
 | `rotate128` | H₁₂₈ · (signs · x) per 128-value block: the basis Gyro expert weights are stored in. Optionally of silu(gate) · up | 64 butterflies a stage in workgroup memory |
 | `moe_combine` | The expert block's output: the routed experts' weighted sum plus the gated shared expert | |
@@ -151,12 +151,12 @@ the binding count and writes from WGSL declarations. Every implementation
 keeps the same parameter layout and binding order; a native implementation
 may use a different reduction strategy within the checks' tolerances.
 
-Velocity's catalog has implementations for every current kernel. Missing
+Agility's catalog has implementations for every current kernel. Missing
 implementations are represented by `kernels.Set.missing`, not replaced by
 another backend: dispatch fails with `error.UnsupportedKernel`, and the
 native model loader calls `requireAll()` before loading. Contract tests
 check that HLSL writes only bindings declared writable. See
-[Velocity's ordering rules](velocity.md#the-native-layer).
+[Agility's ordering rules](agility.md#the-native-layer).
 
 ## Tuning
 
@@ -196,7 +196,7 @@ request in flight with `error.DeviceLost`. The shared native runtime then
 rebuilds before returning: a new device on the selected backend, uploaded
 weights, tuning from the plan cache when available, and a fresh engine with
 no resident sequence (`Runtime.recover`). This applies to Dawn and
-Velocity; Velocity maps D3D12 removed/hung/reset errors to the typed error
+Agility; Agility maps D3D12 removed/hung/reset errors to the typed error
 and allows teardown of a removed device. An unavailable cache means a new
 sweep, not preserved tuning in GPU memory.
 
@@ -216,10 +216,10 @@ The CLI keeps the sweep's non-default variants in the plan cache
 directory, or disables the native cache when empty.
 
 The SHA-256 key covers the adapter strings and API, the runtime (`dawn` or
-`velocity` natively), plan binding limits, the model's GGUF header and
+`agility` natively), plan binding limits, the model's GGUF header and
 tensor index, the zllm version, and every `Kernel.source()` WGSL/template
-source. It does not hash tensor payloads or Velocity's HLSL sources. Thus
-an HLSL-only change with an unchanged zllm version can leave a Velocity
+source. It does not hash tensor payloads or Agility's HLSL sources. Thus
+an HLSL-only change with an unchanged zllm version can leave a Agility
 cache valid under the current key.
 
 A valid hit skips tuning. A different key or malformed/unknown variant is
@@ -399,7 +399,7 @@ optimizations, not current backend comparisons. The model occupied about
 moved buffers into shared system memory and decode fell to 6 tok/s.
 
 See [Gyro-Coder](gyro.md) for the model's data path and
-[Velocity](velocity.md#kernels) for later native-kernel changes.
+[Agility](agility.md#kernels) for later native-kernel changes.
 
 Each hyper-connection mixer's down projection carries the stream weights'
 (inject) rows: 324 rows in one multiply instead of 320, then 4 rows of

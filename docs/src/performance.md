@@ -7,7 +7,7 @@ A faster kernel is useful only after its reference gate passes.
 ## Recorded results
 
 All rows below use an RTX 5090 Laptop GPU. Native rows use Dawn's D3D12
-host, not Velocity. Dates identify the commit that recorded the result;
+host, not Agility. Dates identify the commit that recorded the result;
 the repository does not separately timestamp every execution. These
 snapshots predate later kernel and precision changes.
 
@@ -58,7 +58,7 @@ and no submission over 250 ms. The scheduler aims for a 150 ms submission
 budget. These numbers are design and acceptance thresholds, not measured
 performance on every adapter.
 
-There is no committed performance table here for Velocity tensor-core
+There is no committed performance table here for Agility tensor-core
 execution, CUDA, every browser/driver combination, or the future image and
 video models. Do not infer a speedup from an exposed hardware capability.
 Read [Backends](backends.md) for what is actually executed and

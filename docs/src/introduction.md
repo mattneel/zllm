@@ -8,7 +8,7 @@ One Zig core loads GGUF models, builds graphs and execution plans, applies
 fusion, tunes kernels, caches plans, schedules work and samples on the GPU.
 It also owns tokenization and chat-template rendering. Backends sit behind
 a platform layer: WebGPU through Dawn natively or the browser through wasm,
-and Velocity for native Direct3D 12. CUDA is a roadmap target, not an
+and Agility for native Direct3D 12. CUDA is a roadmap target, not an
 available backend.
 
 **[Try the browser demo](https://mattneel.github.io/zllm/demo/).** It uses
@@ -30,7 +30,7 @@ from gaps and planned work.
 | Dense models | Qwen 3, Llama 3 and Granite 4, including model tokenizers and GGUF chat templates | [Dense transformers](dense.md) |
 | Gyro-Coder | Qwen3.8-Flash-Next MoE, hyper-connections, sparse attention and streamed per-layer embeddings | [Gyro-Coder](gyro.md) |
 | WebGPU | Native Dawn and browser wasm hosts execute the shared command stream | [WebGPU](gpu.md) |
-| Velocity | Native D3D12 backend, HLSL kernels, LinAlg capability queries and DirectStorage integration | [Velocity](velocity.md) |
+| Agility | Native D3D12 backend, HLSL kernels, LinAlg capability queries and DirectStorage integration | [Agility](agility.md) |
 | Planning | Kernel identity and contracts, fusion pass, decode-multiply tuning and persistent plan cache | [Architecture](architecture.md) |
 | Precision | Quantized GGUF weights and selectable KV formats, including FP8; automatic quality-gated precision selection remains a separate goal | [Precision](precision.md) |
 | Generation | Single-sequence scheduler, prefix reuse, GPU sampling, MTP speculation and device-lost rebuilding | [Generation and serving](generation.md) |

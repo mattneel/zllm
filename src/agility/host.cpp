@@ -1,4 +1,4 @@
-// Velocity's native half (see velocity.h). Compiled by zig c++ for
+// Agility's native half (see agility.h). Compiled by zig c++ for
 // x86_64-windows-gnu against the pinned Agility SDK and DirectStorage headers.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -8,7 +8,7 @@
 #include <dstorage.h>
 #include <dxcapi.h>
 #include "mingw_uuid.h"
-#include "velocity.h"
+#include "agility.h"
 
 // The Agility SDK release staged in .\\D3D12\\ (scripts/fixtures.sh agility_ver).
 static constexpr UINT agility_version = 722;
@@ -116,7 +116,7 @@ struct vel_context {
     Com<ID3D12Resource> timestamp_readback;
     uint32_t timestamp_count = 0;
     uint64_t timestamp_frequency = 0;
-    // The HLSL compiler (velocity\\dxcompiler.dll next to the executable), loaded on first use.
+    // The HLSL compiler (agility\\dxcompiler.dll next to the executable), loaded on first use.
     HMODULE dxc_module = nullptr;
     Com<IDxcUtils> dxc_utils;
     Com<IDxcCompiler3> dxc;
@@ -300,7 +300,7 @@ extern "C" vel_result vel_create(const vel_options *options, vel_context **out) 
         if (c->queue_capacity < 128 || c->queue_capacity > DSTORAGE_MAX_QUEUE_CAPACITY ||
             (c->queue_capacity & (c->queue_capacity - 1)) != 0) return E_INVALIDARG;
         if (c->staging_bytes < 4096) return E_INVALIDARG;
-        // Velocity's device comes from the Agility SDK runtime (.\D3D12\D3D12Core.dll beside the
+        // Agility's device comes from the Agility SDK runtime (.\D3D12\D3D12Core.dll beside the
         // executable) through a device factory, with experimental shader models (LinAlg) enabled
         // on that factory only: the rest of the process (Dawn) keeps the system runtime.
         // MinGW's d3d12 import library lacks D3D12GetInterface.
@@ -673,7 +673,7 @@ extern "C" vel_result vel_create_pipeline(vel_context *c, const void *dxil, size
     } VEL_CATCH
 }
 
-// Loads velocity\\dxcompiler.dll from the executable's directory, so its dxil.dll resolves
+// Loads agility\\dxcompiler.dll from the executable's directory, so its dxil.dll resolves
 // beside it rather than to another DXC in the process (Dawn's).
 static HRESULT load_dxc(vel_context *c) {
     if (c->dxc.p) return S_OK;
@@ -682,10 +682,10 @@ static HRESULT load_dxc(vel_context *c) {
     if (!n || n >= MAX_PATH) return HRESULT_FROM_WIN32(GetLastError());
     std::wstring dll(path, n);
     dll.resize(dll.find_last_of(L'\\') + 1);
-    dll += L"velocity\\dxcompiler.dll";
+    dll += L"agility\\dxcompiler.dll";
     c->dxc_module = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!c->dxc_module) {
-        c->last_error = "cannot load velocity\\dxcompiler.dll";
+        c->last_error = "cannot load agility\\dxcompiler.dll";
         return HRESULT_FROM_WIN32(GetLastError());
     }
     auto create = reinterpret_cast<DxcCreateInstanceProc>(

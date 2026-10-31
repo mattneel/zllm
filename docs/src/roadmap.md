@@ -15,7 +15,7 @@ capabilities.
 | Plan cache | Device/model/build-keyed tuning choices | Not serialized GPU pipelines or the full future precision policy |
 | Precision | Explicit KV formats, including FP8, with reference/model checks | Automatic fastest-passing-rung selection and persistence of quality decisions are not implemented |
 | Serving | Single-sequence scheduler, browser async generation and OpenAI-style chat chunks | No HTTP server, multi-sequence batching or general native C API |
-| Platforms | Browser WebGPU, native Dawn and native Velocity | Validation and performance coverage must be established per adapter and backend |
+| Platforms | Browser WebGPU, native Dawn and native Agility | Validation and performance coverage must be established per adapter and backend |
 
 See [Architecture](architecture.md), [Precision](precision.md), and
 [Validation](validation.md) for the exact implementation boundaries.

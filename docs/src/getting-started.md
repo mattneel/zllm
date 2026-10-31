@@ -38,7 +38,7 @@ and DXC DLLs when the Windows toolchain is available.
 
 Other fixture selectors include `vocab` (tokenizers and GGUF headers),
 `dense` (dense-model files), `model27b`, `llama` (the reference runtime),
-and `velocity` (the Windows backend SDKs). Model files can be large; the
+and `agility` (the Windows backend SDKs). Model files can be large; the
 fixture script is the authority for their names, revisions and digests.
 
 ## Native CLI on Dawn
@@ -77,21 +77,21 @@ Windows directory. Model paths passed to it must be Windows paths.
 | Selection | Meaning | Requirement |
 |---|---|---|
 | `ZLLM_BACKEND=webgpu` | Native Dawn; the default | Dawn runtime library |
-| `ZLLM_BACKEND=velocity` | Native Direct3D 12, without Dawn execution | Windows build with `-Dvelocity` and staged SDK/runtime files |
+| `ZLLM_BACKEND=agility` | Native Direct3D 12, without Dawn execution | Windows build with `-Dagility` and staged SDK/runtime files |
 | Browser | WebGPU through the wasm host | WebGPU-capable browser; no native backend environment variable |
 
-For Velocity from WSL:
+For Agility from WSL:
 
 ```sh
 scripts/fixtures.sh dawn
-scripts/fixtures.sh velocity
-ZLLM_BACKEND=velocity scripts/d3d12.sh chat \
+scripts/fixtures.sh agility
+ZLLM_BACKEND=agility scripts/d3d12.sh chat \
   "$(wslpath -w .fixtures/models/Qwen3.5-0.8B-BF16.gguf)"
 ```
 
-The wrapper includes Velocity when the fetched Agility SDK is present.
-`ZLLM_ADAPTER` selects a Velocity adapter index. For build prerequisites
-and capability limits, read [Velocity](velocity.md) and
+The wrapper includes Agility when the fetched Agility SDK is present.
+`ZLLM_ADAPTER` selects a Agility adapter index. For build prerequisites
+and capability limits, read [Agility](agility.md) and
 [Backends](backends.md). CUDA is not a selectable backend.
 
 ## Browser development

@@ -78,7 +78,7 @@ no Gyro-Coder download target. The 27B fixture is optional and fetched with
 `scripts/fixtures.sh model27b`.
 
 Add `-Dgpu-host=d3d12` (Dawn WebGPU on D3D12) or
-`-Dgpu-host=velocity` (native D3D12/HLSL) to any GPU check
+`-Dgpu-host=agility` (native D3D12/HLSL) to any GPU check
 (`gpu-check`, `check-gpu`, `check-quant`, `check-gyro`, `check-fast`) to run
 it on the Windows GPU from WSL; see [Backends](backends.md). The default
 `native` host uses this build and Dawn's available adapter.
@@ -123,7 +123,7 @@ There are two tiers:
 
 | Tier | What it runs | When |
 |---|---|---|
-| Fast: `zig build check-fast` | `gpu-check`; `check-gpu` on the first eval text (both kernel paths, step splits, every KV format) with engine-check; `check-gyro` on its short sequence (step splits and fusion bitwise) with `-Dgyro-model` | every iteration; about a minute on Velocity once the references are cached |
+| Fast: `zig build check-fast` | `gpu-check`; `check-gpu` on the first eval text (both kernel paths, step splits, every KV format) with engine-check; `check-gyro` on its short sequence (step splits and fusion bitwise) with `-Dgyro-model` | every iteration; about a minute on Agility once the references are cached |
 | Full: every check | every eval text and model, the long prompts, `check-quant`, each backend | hardware validation before a commit; not all run in hosted CI |
 
 `check-gpu` and `check-gyro` take `--fast` themselves; `check-fast` runs
@@ -132,7 +132,7 @@ them one after another, since the GPU runs one job at a time.
 `-Dengine-check=false` skips the engine scenarios in `check-gpu` and
 `check-fast`; the harness equivalent is `--no-engine-check`. The default
 remains to run them. Hosted llvmpipe CI uses this opt-out, while the real
-GPU checks on `d3d12` and `velocity` keep the engine gate enabled.
+GPU checks on `d3d12` and `agility` keep the engine gate enabled.
 
 The fast tier's approximate runtime was recorded in `c316cfc`
 (2026-10-31). It is a shorter input set, not a replacement for the full
@@ -159,13 +159,13 @@ reference entries also use the model and token ids as described above.
 The hosted workflow skips `engine-check` on llvmpipe because of CPU cost
 and the documented prefix-reuse rounding drift beyond its bound
 ([Engine](#engine)). It also does not run the full multi-model checks,
-large-model forward checks, hardware soaks, Velocity, or browser WebGPU
+large-model forward checks, hardware soaks, Agility, or browser WebGPU
 inference. Those need the corresponding fixtures and device. A green CI
 run is therefore not a claim that every model/backend combination passed.
 
 The detailed tables below mostly record Dawn D3D12 results on the RTX
 5090 Laptop and selected llvmpipe results. Later backend evidence includes
-`01b247e` (2026-10-30), which records every Velocity kernel check and
+`01b247e` (2026-10-30), which records every Agility kernel check and
 engine scenario passing, and `823d6de` (2026-10-31), which records
 `gpu-check` and Gyro-Coder split/fusion gates passing on both native
 backends. These commits do not turn a Dawn-only table into a universal
@@ -307,7 +307,7 @@ attention output gate scores 2.4% top-1 and fails every position.
 seeded random inputs. It compares each implementation against a float64
 CPU computation of the same formula, or the sampler's CPU reference, with
 shapes that hit tile and chunk remainders. The same suite selects WGSL
-through Dawn or HLSL through Velocity; passing against the other GPU
+through Dawn or HLSL through Agility; passing against the other GPU
 implementation alone is not the reference criterion.
 
 Load-time tuning is a separate check: `src/tune/tune.zig` compares each
@@ -601,7 +601,7 @@ the dense models' first:
 
 The FP8 bounds catch a broken cache path, not the quality a model needs.
 `ecec4af` (2026-10-31) records 1,231/1,264 top-1 agreement on Dawn and
-1,233/1,264 on Velocity for this model/input set. These small models stay
+1,233/1,264 on Agility for this model/input set. These small models stay
 on f16 by default; automatic selection under the spec's precision ladder
 is not implemented. Choosing FP8 explicitly accepts a different accuracy
 profile, even when its encoding and attention kernels pass their tests.

@@ -63,9 +63,9 @@ const usage =
     \\environment:
     \\  ZLLM_THREADS   worker threads for `forward` (default: one per physical core)
     \\  ZLLM_DAWN      path to the Dawn library (default: libwebgpu_dawn.so / webgpu_dawn.dll)
-    \\  ZLLM_BACKEND   GPU backend: webgpu (Dawn; default) or velocity (native D3D12; builds
-    \\                 with -Dvelocity)
-    \\  ZLLM_ADAPTER   Velocity's adapter index (default 0: the high-performance one)
+    \\  ZLLM_BACKEND   GPU backend: webgpu (Dawn; default) or agility (native D3D12; builds
+    \\                 with -Dagility)
+    \\  ZLLM_ADAPTER   Agility's adapter index (default 0: the high-performance one)
     \\
 ;
 
@@ -452,7 +452,7 @@ const FileBytes = struct {
 fn gpuOpen(env: *const std.process.Environ.Map) !zllm.gpu.Open {
     var o: zllm.gpu.Open = .{};
     if (env.get("ZLLM_BACKEND")) |b| o.backend = std.meta.stringToEnum(zllm.gpu.Backend, b) orelse {
-        std.log.err("ZLLM_BACKEND={s}: not a backend (webgpu, velocity)", .{b});
+        std.log.err("ZLLM_BACKEND={s}: not a backend (webgpu, agility)", .{b});
         return error.InvalidUsage;
     };
     if (env.get("ZLLM_DAWN")) |lib| o.dawn_lib = lib;
@@ -465,7 +465,7 @@ fn openGpu(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) !zllm.gp
     return zllm.gpu.Device.open(gpa, o) catch |err| {
         switch (o.backend) {
             .webgpu => std.log.err("cannot open Dawn ({s}): {t}", .{ o.dawn_lib, err }),
-            .velocity => std.log.err("cannot open Velocity (adapter {d}): {t}", .{ o.adapter, err }),
+            .agility => std.log.err("cannot open Agility (adapter {d}): {t}", .{ o.adapter, err }),
         }
         return err;
     };
@@ -826,13 +826,13 @@ fn gpuInfo(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *Io
                 },
             });
         },
-        .velocity => {
+        .agility => {
             var arena_state: std.heap.ArenaAllocator = .init(gpa);
             defer arena_state.deinit();
             const info = try d.adapter(arena_state.allocator());
             const limits = d.limits();
             try s.write(.{
-                .backend = "velocity",
+                .backend = "agility",
                 .vendor = info.vendor,
                 .architecture = info.architecture,
                 .device = info.device,

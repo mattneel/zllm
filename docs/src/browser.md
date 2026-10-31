@@ -203,7 +203,7 @@ The timings below are historical hardware observations, not performance
 guarantees or new measurements of the current checkout. Source commits are
 identified where the repository records them; their dates are commit
 dates, not independently recorded benchmark execution dates. Native
-comparisons in these tables use Dawn's D3D12 host, not Velocity.
+comparisons in these tables use Dawn's D3D12 host, not Agility.
 
 ### Weight cache
 

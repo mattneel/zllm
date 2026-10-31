@@ -1,6 +1,6 @@
-// zllm's HLSL kernel header for Velocity, prefixed to every kernel's source.
+// zllm's HLSL kernel header for Agility, prefixed to every kernel's source.
 //
-// Velocity binds bindlessly: the root signature is 60 32-bit root constants at
+// Agility binds bindlessly: the root signature is 60 32-bit root constants at
 // b0, and every buffer has a raw SRV and a raw UAV in one shader-visible heap.
 // Binding i of a kernel (its WGSL @binding(i): 0 is the params block, then the
 // kernel's buffers in contract order) is three constants: the buffer's SRV
@@ -13,7 +13,7 @@
 // per command list, and the host runs a submission's uploads as a list of
 // their own, so uploaded buffers start the kernels' list in the common
 // state. Use rw(i) for everything kernels, copies or clears write. Waves
-// have 32 lanes on the devices Velocity targets; kernels that depend on it
+// have 32 lanes on the devices Agility targets; kernels that depend on it
 // say so.
 
 cbuffer Bindings : register(b0) { uint4 bindings[15]; }

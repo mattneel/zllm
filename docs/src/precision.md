@@ -89,8 +89,8 @@ encoding and decoding, not a requirement for native FP8 matrix hardware.
 
 `rope_append` writes the chosen format. Dense, wide-group and sparse
 attention readers consume it. The CPU oracle is `src/ref/fp8.zig`; WGSL
-uses `src/kernels/fp8.wgsl`, and Velocity uses
-`src/velocity/kernels/fp8.hlsli`.
+uses `src/kernels/fp8.wgsl`, and Agility uses
+`src/agility/kernels/fp8.hlsli`.
 
 ### FP8 on each backend
 
@@ -98,7 +98,7 @@ uses `src/kernels/fp8.wgsl`, and Velocity uses
 |---|---|---|
 | Browser WebGPU | Shared WGSL FP8 writer and attention readers | The browser uses the same kernel source and format; this is not a separate published browser FP8 model-quality measurement |
 | Native Dawn WebGPU | Shared WGSL FP8 writer and attention readers | Recorded exact encoding and model comparisons on the tested native hosts; see [GPU forward validation](validation.md#gpu-forward-pass) |
-| Velocity, native D3D12 | HLSL counterparts using the same buffer/parameter contract | Commit `ecec4af` records the parity checks and FP8 model comparisons on Velocity; see also [Velocity](velocity.md#kernels) |
+| Agility, native D3D12 | HLSL counterparts using the same buffer/parameter contract | Commit `ecec4af` records the parity checks and FP8 model comparisons on Agility; see also [Agility](agility.md#kernels) |
 
 Availability on a backend is not a claim that every adapter has been
 measured, nor that FP8 is acceptable for every model. The encoding gate
@@ -164,7 +164,7 @@ least 0.975 at every checked position. For f16 the corresponding bounds are
 quality approvals. The recorded D3D12 small-model FP8 result is
 1,231/1,264 top-1 agreement,
 versus the f32 reference, and commit `ecec4af` records 1,233/1,264 on
-Velocity. These results establish an implemented FP8 path, not a
+Agility. These results establish an implemented FP8 path, not a
 quality-approved FP8 default. The small models remain on f16. See
 [GPU forward validation](validation.md#gpu-forward-pass) for each model
 and the scope of the comparisons.

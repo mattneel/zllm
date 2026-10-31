@@ -18,7 +18,7 @@ const ops = @import("../ref/ops.zig");
 const gguf = @import("../gguf/gguf.zig");
 const tmpl = @import("../tmpl/tmpl.zig");
 pub const Backend = @import("../backend/backend.zig").Backend;
-const velocity_kernels = @import("../velocity/kernels.zig");
+const agility_kernels = @import("../agility/kernels.zig");
 
 pub const Kernel = enum {
     rmsnorm,
@@ -93,7 +93,7 @@ pub const Kernel = enum {
     }
 
     /// The kernel's bindings as its WGSL declares them: the contract every
-    /// backend's implementation keeps, and what hosts may rely on (Velocity
+    /// backend's implementation keeps, and what hosts may rely on (Agility
     /// orders dispatches by it).
     pub fn contract(k: Kernel) Contract {
         return switch (k) {
@@ -775,8 +775,8 @@ pub const Set = struct {
 fn artifact(backend: Backend, arena: Allocator, k: Kernel, v: MatvecVariant) (Set.Error || error{UnsupportedKernel})![]const u8 {
     return switch (backend) {
         .webgpu => if (k.isTemplate()) v.render(arena, k.source()) else k.source(),
-        .velocity => {
-            const source = velocity_kernels.source(k) orelse return error.UnsupportedKernel;
+        .agility => {
+            const source = agility_kernels.source(k) orelse return error.UnsupportedKernel;
             return if (k.isTemplate()) v.render(arena, source) else source;
         },
     };
@@ -788,7 +788,7 @@ fn artifact(backend: Backend, arena: Allocator, k: Kernel, v: MatvecVariant) (Se
 pub fn backendSource(backend: Backend, k: Kernel) []const u8 {
     return switch (backend) {
         .webgpu => k.source(),
-        .velocity => velocity_kernels.source(k) orelse "",
+        .agility => agility_kernels.source(k) orelse "",
     };
 }
 

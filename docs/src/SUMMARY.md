@@ -6,7 +6,7 @@
 - [Architecture](architecture.md)
 - [Backends](backends.md)
   - [WebGPU](gpu.md)
-  - [Velocity (native D3D12)](velocity.md)
+  - [Agility (native D3D12)](agility.md)
 - [Models](models.md)
   - [Qwen 3.5 GGUF semantics](qwen35.md)
   - [Dense transformers](dense.md)

@@ -26,7 +26,7 @@ why the reference is checked against llama.cpp itself
 
 The implementation is `src/graph/qwen35.zig` (hyperparameters),
 `src/ref/qwen35.zig` (the f32 reference) and `src/plan/qwen35.zig` (the
-GPU step program shared by WebGPU and Velocity).
+GPU step program shared by WebGPU and Agility).
 
 ## Metadata
 

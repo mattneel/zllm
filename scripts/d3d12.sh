@@ -5,10 +5,10 @@
 #
 #   scripts/d3d12.sh gpu-info
 #   scripts/d3d12.sh gpu-check
-#   ZLLM_BACKEND=velocity scripts/d3d12.sh gpu-check
+#   ZLLM_BACKEND=agility scripts/d3d12.sh gpu-check
 #
-# With the Velocity SDKs fetched (scripts/fixtures.sh velocity), the build
-# includes Velocity. ZLLM_BACKEND and ZLLM_ADAPTER pass through to Windows.
+# With the Agility SDKs fetched (scripts/fixtures.sh agility), the build
+# includes Agility. ZLLM_BACKEND and ZLLM_ADAPTER pass through to Windows.
 # Paths in the arguments must be Windows paths (see `wslpath -w`).
 set -euo pipefail
 
@@ -21,9 +21,9 @@ if [[ ! -f "$stage_file" ]]; then
 fi
 stage="$(wslpath -u "$(cat "$stage_file")")"
 
-velocity=()
-if [[ -d "$dir/velocity/agility" ]]; then velocity=(-Dvelocity "-Dvelocity-sdk=$dir/velocity"); fi
-(cd "$root" && zig build -Dtarget=x86_64-windows-gnu -Doptimize="${ZLLM_OPTIMIZE:-ReleaseSafe}" "${velocity[@]}" -p .zig-out-windows)
+agility=()
+if [[ -d "$dir/agility/agility" ]]; then agility=(-Dagility "-Dagility-sdk=$dir/agility"); fi
+(cd "$root" && zig build -Dtarget=x86_64-windows-gnu -Doptimize="${ZLLM_OPTIMIZE:-ReleaseSafe}" "${agility[@]}" -p .zig-out-windows)
 cp "$root/.zig-out-windows/bin/zllm.exe" "$stage/zllm.exe"
 cd "$stage"
 export WSLENV="${WSLENV:+$WSLENV:}ZLLM_BACKEND:ZLLM_ADAPTER"

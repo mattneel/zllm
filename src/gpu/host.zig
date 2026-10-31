@@ -10,18 +10,18 @@ const dawn = @import("dawn.zig");
 const dawn_host = @import("dawn_host.zig");
 const Timings = @import("timings.zig").Timings;
 pub const Backend = @import("../backend/backend.zig").Backend;
-const velocity = if (build_options.velocity) @import("../velocity/host.zig") else @import("../velocity/absent.zig");
+const agility = if (build_options.agility) @import("../agility/host.zig") else @import("../agility/absent.zig");
 
 /// error.UnsupportedKernel: a kernel the backend lacks was dispatched
 /// (kernels.Set.missing); the submission in progress is dropped.
-pub const Error = dawn_host.Host.Error || velocity.Error || error{ VelocityNotBuilt, UnsupportedKernel };
+pub const Error = dawn_host.Host.Error || agility.Error || error{ AgilityNotBuilt, UnsupportedKernel };
 
 /// Which device to open.
 pub const Open = struct {
     backend: Backend = .webgpu,
     /// The Dawn library (WebGPU).
     dawn_lib: []const u8 = dawn.default_library,
-    /// The adapter index (Velocity: DXGI's high-performance order).
+    /// The adapter index (Agility: DXGI's high-performance order).
     adapter: u32 = 0,
 };
 
@@ -40,18 +40,18 @@ pub const Adapter = struct {
     device: []const u8,
     description: []const u8,
     /// The API underneath: "d3d12", "vulkan", "metal", ... for WebGPU;
-    /// "d3d12" for Velocity.
+    /// "d3d12" for Agility.
     api: []const u8,
 };
 
 pub const Device = union(Backend) {
     webgpu: *dawn.Device,
-    velocity: *velocity.Device,
+    agility: *agility.Device,
 
     pub fn open(gpa: Allocator, o: Open) !Device {
         return switch (o.backend) {
             .webgpu => .{ .webgpu = try dawn.Device.init(gpa, o.dawn_lib) },
-            .velocity => if (!build_options.velocity) error.VelocityNotBuilt else .{ .velocity = try velocity.Device.init(gpa, o.adapter) },
+            .agility => if (!build_options.agility) error.AgilityNotBuilt else .{ .agility = try agility.Device.init(gpa, o.adapter) },
         };
     }
 
@@ -68,10 +68,10 @@ pub const Device = union(Backend) {
     pub fn limits(d: Device) Limits {
         return switch (d) {
             .webgpu => |x| .{ .max_binding = x.limits.maxStorageBufferBindingSize, .offset_align = x.limits.minStorageBufferOffsetAlignment },
-            // Velocity's raw views address bytes with 32 bits and its
+            // Agility's raw views address bytes with 32 bits and its
             // offsets need 4, but Dawn's D3D12 limits (2 GiB, 256) keep the
             // plans the same as WebGPU's on the same machine.
-            .velocity => .{ .max_binding = 1 << 31, .offset_align = 256 },
+            .agility => .{ .max_binding = 1 << 31, .offset_align = 256 },
         };
     }
 
@@ -90,7 +90,7 @@ pub const Device = union(Backend) {
                     .api = try arena.dupe(u8, info.backend),
                 };
             },
-            .velocity => |x| return .{
+            .agility => |x| return .{
                 .vendor = try std.fmt.allocPrint(arena, "0x{x:0>4}", .{x.caps.vendor_id}),
                 .architecture = try std.fmt.allocPrint(arena, "sm_{d}_{d} linalg {d}", .{ x.caps.shader_model >> 4, x.caps.shader_model & 15, x.caps.linalg_tier }),
                 .device = try arena.dupe(u8, x.adapterName()),
@@ -118,12 +118,12 @@ pub const Device = union(Backend) {
 
 pub const Host = union(Backend) {
     webgpu: dawn_host.Host,
-    velocity: velocity.Host,
+    agility: agility.Host,
 
     pub fn init(gpa: Allocator, d: Device) !Host {
         return switch (d) {
             .webgpu => |x| .{ .webgpu = .init(gpa, x) },
-            .velocity => |x| .{ .velocity = try .init(gpa, x) },
+            .agility => |x| .{ .agility = try .init(gpa, x) },
         };
     }
 
@@ -141,11 +141,11 @@ pub const Host = union(Backend) {
     }
 
     /// The model file `write_file` reads: its mapping (`bytes`, Dawn), or
-    /// its path (Velocity reads it with DirectStorage).
+    /// its path (Agility reads it with DirectStorage).
     pub fn setFile(h: *Host, gpa: Allocator, bytes: []const u8, path: []const u8) Error!void {
         switch (h.*) {
             .webgpu => |*x| x.file = bytes,
-            .velocity => |*x| try x.setFile(gpa, path),
+            .agility => |*x| try x.setFile(gpa, path),
         }
     }
 
@@ -166,7 +166,7 @@ pub const Host = union(Backend) {
     pub fn timings(h: *Host) ?*const Timings {
         return switch (h.*) {
             .webgpu => |*x| if (x.profile) |*p| &p.timings else null,
-            .velocity => |*x| if (x.timings) |*t| t else null,
+            .agility => |*x| if (x.timings) |*t| t else null,
         };
     }
 };

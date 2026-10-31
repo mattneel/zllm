@@ -38,7 +38,7 @@ test {
     _ = @import("tokenizer/stream.zig");
     _ = @import("chat/jinja.zig");
     _ = @import("fuse/fuse.zig");
-    _ = @import("velocity/kernels.zig");
-    _ = @import("velocity/hazards.zig");
+    _ = @import("agility/kernels.zig");
+    _ = @import("agility/hazards.zig");
     _ = @import("ref/fp8.zig");
 }

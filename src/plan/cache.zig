@@ -127,10 +127,10 @@ test "round trip, and a cache made under another key is ignored" {
     var other = inputs;
     other.adapter = &.{ "nvidia", "blackwell", "RTX", "driver 2", "d3d12" };
     try std.testing.expect(!std.mem.eql(u8, &k, &key(other)));
-    // Velocity's tuning is keyed by its own kernels, not WebGPU's.
-    var velocity = inputs;
-    velocity.backend = .velocity;
-    try std.testing.expect(!std.mem.eql(u8, &k, &key(velocity)));
+    // Agility's tuning is keyed by its own kernels, not WebGPU's.
+    var agility = inputs;
+    agility.backend = .agility;
+    try std.testing.expect(!std.mem.eql(u8, &k, &key(agility)));
     try std.testing.expect(parse(arena, bytes.items, key(other)) == null);
 }
 

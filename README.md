@@ -11,7 +11,7 @@ as accurately as the hardware allows, on every supported platform.
 - **One Zig core:** GGUF loading, graphs, execution plans, fusion, tuning,
   plan caching, scheduling, GPU sampling, tokenizers and chat templates.
 - **Platform backends:** WebGPU through Dawn natively and wasm in the
-  browser; Velocity for native D3D12 with Agility SDK and DirectStorage
+  browser; Agility for native D3D12 with Agility SDK and DirectStorage
   integration. CUDA is planned, not implemented.
 - **Models:** Qwen 3.5/3.6/3.8 hybrid; Qwen 3, Llama 3 and Granite 4 dense;
   Qwen3.8-Flash-Next Gyro-Coder with MoE, hyper-connections, sparse attention
@@ -44,10 +44,10 @@ ZLLM_DAWN=.fixtures/dawn/libwebgpu_dawn.so \
   zig-out/bin/zllm chat .fixtures/models/Qwen3.5-0.8B-BF16.gguf
 ```
 
-The command above uses Linux Dawn. For Windows/WSL and Velocity, see
+The command above uses Linux Dawn. For Windows/WSL and Agility, see
 [Getting started](https://mattneel.github.io/zllm/getting-started.html).
-`ZLLM_BACKEND=webgpu` is the native default; `ZLLM_BACKEND=velocity`
-requires a Windows build with Velocity enabled and its SDK/runtime files.
+`ZLLM_BACKEND=webgpu` is the native default; `ZLLM_BACKEND=agility`
+requires a Windows build with Agility enabled and its SDK/runtime files.
 
 For the local browser demo, with [Bun](https://bun.sh):
 

@@ -32,7 +32,7 @@ Pass criteria (docs/src/validation.md):
 
 Hosts: `native` runs the Linux build on the Vulkan adapter Dawn finds
 (llvmpipe in CI); `d3d12` runs the Windows build through scripts/d3d12.sh;
-`velocity` runs it there on the Velocity backend (ZLLM_BACKEND=velocity).
+`agility` runs it there on the Agility backend (ZLLM_BACKEND=agility).
 """
 
 from __future__ import annotations
@@ -73,8 +73,8 @@ def win(path: Path) -> str:
 
 
 # Where GPU checks run: this build on Dawn's adapter, the Windows build on
-# Dawn's D3D12, or the Windows build on Velocity.
-HOSTS = ["native", "d3d12", "velocity"]
+# Dawn's D3D12, or the Windows build on Agility.
+HOSTS = ["native", "d3d12", "agility"]
 
 
 def zllm_on_host(args, paths, command: str, *argv: Path | str) -> subprocess.CompletedProcess:
@@ -88,7 +88,7 @@ def host_command(args, paths, command: str, *argv: Path | str) -> tuple[list[str
     if args.host in HOSTS[1:]:
         mapped = [win(a) if isinstance(a, Path) else a for a in argv]
         cmd = [str(ROOT / "scripts" / "d3d12.sh"), command, *mapped]
-        env = {**os.environ, "ZLLM_BACKEND": "velocity" if args.host == "velocity" else "webgpu"}
+        env = {**os.environ, "ZLLM_BACKEND": "agility" if args.host == "agility" else "webgpu"}
     else:
         cmd = [args.zllm, command, *map(str, argv)]
         env = {**os.environ, "ZLLM_DAWN": str(paths.root / "dawn" / "libwebgpu_dawn.so")}

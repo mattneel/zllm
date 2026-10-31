@@ -151,7 +151,7 @@ pub const Runtime = struct {
     gpu: zllm.gpu.Open,
     file: zllm.gguf.File,
     bytes: []const u8,
-    /// The model file's path (Velocity reads weights with DirectStorage).
+    /// The model file's path (Agility reads weights with DirectStorage).
     path: []const u8,
     options: Options,
     device: zllm.gpu.Device,
@@ -246,7 +246,7 @@ pub const Runtime = struct {
         rt.device = zllm.gpu.Device.open(rt.gpa, rt.gpu) catch |err| {
             switch (rt.gpu.backend) {
                 .webgpu => std.log.err("cannot open Dawn ({s}): {t}", .{ rt.gpu.dawn_lib, err }),
-                .velocity => std.log.err("cannot open Velocity (adapter {d}): {t}", .{ rt.gpu.adapter, err }),
+                .agility => std.log.err("cannot open Agility (adapter {d}): {t}", .{ rt.gpu.adapter, err }),
             }
             return err;
         };
@@ -277,14 +277,14 @@ pub const Runtime = struct {
         const info = try rt.device.adapter(arena);
         rt.adapter = switch (backend) {
             .webgpu => try std.fmt.allocPrint(arena, "{s} ({s})", .{ info.device, info.api }),
-            .velocity => try std.fmt.allocPrint(arena, "{s} (velocity)", .{info.device}),
+            .agility => try std.fmt.allocPrint(arena, "{s} (agility)", .{info.device}),
         };
         // What the plan cache's tuning is valid for (plan.cache.key).
         const plan_key = plan.cache.key(.{
             .adapter = &.{ info.vendor, info.architecture, info.device, info.description, info.api },
             .runtime = switch (backend) {
                 .webgpu => "dawn",
-                .velocity => "velocity",
+                .agility => "agility",
             },
             .limits = &.{ limits.max_binding, limits.offset_align },
             .model_header = bytes[0..@intCast(file.data_offset)],

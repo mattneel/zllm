@@ -4,17 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Velocity, the native D3D12 backend: Windows only, against the SDKs
-    // scripts/fixtures.sh velocity fetches.
-    const velocity = b.option(bool, "velocity", "Build the Velocity backend (Windows; needs scripts/fixtures.sh velocity)") orelse false;
-    if (velocity and target.result.os.tag != .windows) @panic("-Dvelocity needs a Windows target (-Dtarget=x86_64-windows-gnu)");
-    const velocity_sdk: std.Build.LazyPath = if (b.option([]const u8, "velocity-sdk", "Velocity SDK directory (default: .fixtures/velocity)")) |p|
+    // Agility, the native D3D12 backend: Windows only, against the SDKs
+    // scripts/fixtures.sh agility fetches.
+    const agility = b.option(bool, "agility", "Build the Agility backend (Windows; needs scripts/fixtures.sh agility)") orelse false;
+    if (agility and target.result.os.tag != .windows) @panic("-Dagility needs a Windows target (-Dtarget=x86_64-windows-gnu)");
+    const agility_sdk: std.Build.LazyPath = if (b.option([]const u8, "agility-sdk", "Agility SDK directory (default: .fixtures/agility)")) |p|
         .{ .cwd_relative = p }
     else
-        b.path(".fixtures/velocity");
+        b.path(".fixtures/agility");
     const options = b.addOptions();
-    options.addOption(bool, "velocity", velocity);
-    const platform: Platform = .{ .options = options.createModule(), .velocity = if (velocity) velocity_sdk else null };
+    options.addOption(bool, "agility", agility);
+    const platform: Platform = .{ .options = options.createModule(), .agility = if (agility) agility_sdk else null };
 
     const mod = b.addModule("zllm", zllmOptions(b, target, optimize));
     mod.addImport("webgpu", webgpuModule(b, target, optimize));
@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const wasm_optimize = b.option(std.builtin.OptimizeMode, "wasm-optimize", "Optimize mode for zllm.wasm (default: safe)") orelse .safe;
     const wasm_options = b.addOptions();
-    wasm_options.addOption(bool, "velocity", false);
+    wasm_options.addOption(bool, "agility", false);
     const wasm = b.addExecutable(.{
         .name = "zllm",
         .root_module = b.createModule(.{
@@ -75,9 +75,9 @@ pub fn build(b: *std.Build) void {
 
     // Where GPU checks run: `native` is this build on whatever adapter Dawn
     // finds (llvmpipe in CI); `d3d12` is the Windows build run from WSL
-    // through scripts/d3d12.sh, on Dawn; `velocity` is that build on the
-    // Velocity backend.
-    const gpu_host = b.option(enum { native, d3d12, velocity }, "gpu-host", "Where GPU checks run (default: native)") orelse .native;
+    // through scripts/d3d12.sh, on Dawn; `agility` is that build on the
+    // Agility backend.
+    const gpu_host = b.option(enum { native, d3d12, agility }, "gpu-host", "Where GPU checks run (default: native)") orelse .native;
     // llvmpipe (CI) skips engine-check: hours of CPU, and its rounding drifts
     // past the prefix-reuse bound (docs/src/validation.md).
     const engine_check = b.option(bool, "engine-check", "Run engine-check in check-gpu and check-fast (default: true)") orelse true;
@@ -117,11 +117,11 @@ pub fn build(b: *std.Build) void {
             run.has_side_effects = true;
             kernel_step.dependOn(&run.step);
         },
-        .d3d12, .velocity => {
+        .d3d12, .agility => {
             const run = b.addSystemCommand(&.{"bash"});
             run.addFileArg(b.path("scripts/d3d12.sh"));
             run.addArg("gpu-check");
-            run.setEnvironmentVariable("ZLLM_BACKEND", if (gpu_host == .velocity) "velocity" else "webgpu");
+            run.setEnvironmentVariable("ZLLM_BACKEND", if (gpu_host == .agility) "agility" else "webgpu");
             run.has_side_effects = true;
             kernel_step.dependOn(&run.step);
         },
@@ -140,37 +140,37 @@ fn zllmOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     };
 }
 
-/// The backends a build has: its build options, and Velocity's SDK when
-/// Velocity is built.
+/// The backends a build has: its build options, and Agility's SDK when
+/// Agility is built.
 const Platform = struct {
     options: *std.Build.Module,
-    velocity: ?std.Build.LazyPath,
+    agility: ?std.Build.LazyPath,
 };
 
 /// Adds the platform to a zllm module: the build options, and with
-/// Velocity its native layer (src/velocity/host.cpp), its C interface as
-/// the module `velocity_c`, and the D3D12, DXGI and DirectStorage libraries.
+/// Agility its native layer (src/agility/host.cpp), its C interface as
+/// the module `agility_c`, and the D3D12, DXGI and DirectStorage libraries.
 fn addPlatform(b: *std.Build, mod: *std.Build.Module, platform: Platform) void {
     mod.addImport("build_options", platform.options);
-    const sdk = platform.velocity orelse return;
+    const sdk = platform.agility orelse return;
     const includes = [_]std.Build.LazyPath{
-        b.path("src/velocity"),
+        b.path("src/agility"),
         sdk.path(b, "agility/build/native/include"),
         sdk.path(b, "directstorage/native/include"),
         sdk.path(b, "dxc/inc"),
     };
     for (includes) |p| mod.addIncludePath(p);
-    mod.addCSourceFile(.{ .file = b.path("src/velocity/host.cpp"), .flags = &.{ "-std=c++20", "-fms-extensions" }, .language = .cpp });
+    mod.addCSourceFile(.{ .file = b.path("src/agility/host.cpp"), .flags = &.{ "-std=c++20", "-fms-extensions" }, .language = .cpp });
     mod.link_libcpp = true;
     mod.linkSystemLibrary("d3d12", .{});
     mod.linkSystemLibrary("dxgi", .{});
     mod.addObjectFile(sdk.path(b, "directstorage/native/lib/x64/dstorage.lib"));
     const tc = b.addTranslateC(.{
-        .root_source_file = b.path("src/velocity/velocity.h"),
+        .root_source_file = b.path("src/agility/agility.h"),
         .target = mod.resolved_target.?,
         .optimize = mod.optimize.?,
     });
-    mod.addImport("velocity_c", tc.createModule());
+    mod.addImport("agility_c", tc.createModule());
 }
 
 /// Zig bindings for the vendored Dawn `webgpu.h`. Only the `WGPUProc*`
