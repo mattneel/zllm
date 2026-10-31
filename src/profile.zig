@@ -123,6 +123,8 @@ fn report(rt: *gen.Runtime, steps: u64, out: *Io.Writer) !void {
     var names: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
     defer names.deinit(rt.gpa);
     for (std.enums.values(Kernel)) |k| try names.put(rt.gpa, @backingInt(rt.set.pipelines.get(k)), @tagName(k));
+    // Tuned variants under their kernel's name.
+    for (rt.set.variants[0..rt.set.n_variants]) |v| try names.put(rt.gpa, @backingInt(v.pipeline), @tagName(v.kernel));
 
     var by_kernel: std.StringArrayHashMapUnmanaged(Total) = .empty;
     defer by_kernel.deinit(rt.gpa);
