@@ -635,8 +635,9 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
     const xa = try c.upload(x);
     const wa = try gpuWeights(c, t, w.bytes, k);
     const na = try c.upload(nw);
-    var got: [kernels.MatvecVariant.candidates.len][]f32 = undefined;
+    var got: [kernels.MatvecVariant.candidates.len][]f32 = @splat(&.{});
     for (kernels.MatvecVariant.candidates, &got) |v, *g| {
+        if (!v.suits(t)) continue;
         const out = try c.upload(init);
         try c.launcher().launchPipeline(try c.set.matvec(c.gpa, c.arena, &c.rec, kernel, v), P.MatvecBf16{
             .n = n,
@@ -664,7 +665,9 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
         }
     }
     var worst: f64 = 0;
-    for (got) |g| worst = @max(worst, relErr(g, want));
+    for (got) |g| if (g.len > 0) {
+        worst = @max(worst, relErr(g, want));
+    };
     return .{ .name = name, .err = worst, .tolerance = 1e-5 };
 }
 

@@ -318,13 +318,28 @@ pub const MatvecVariant = struct {
         return v.wg <= d.invocations and 2048 * 4 + 2 * v.wg * v.rows * 4 <= d.workgroup_storage;
     }
 
-    /// The sweep: lanes 8, 16 or 32 per row (each divides the 32 tasks of a
-    /// tile, so token pairs keep each token's sums), 1 or 2 rows per lane
-    /// group, 128 or 256 threads.
+    /// Whether `n` rows fit its grid: one workgroup per groupRows rows,
+    /// at most 65,535 along x.
+    pub fn fitsRows(v: MatvecVariant, n: u32) bool {
+        return (std.math.divCeil(u32, n, v.groupRows()) catch unreachable) <= 65535;
+    }
+
+    /// Whether it may run weights of type `t`: its lanes must divide the
+    /// tasks of both tiles (TILE_PAIR and TILE_ONE floats), so a token's sums
+    /// are the same whether it runs alone or in a pair. Every type has 32
+    /// tasks in a pair tile or more; Q8_0 has 64 (two per 32-weight block),
+    /// so it also takes 64 lanes a row, which gives long rows more
+    /// workgroups.
+    pub fn suits(v: MatvecVariant, t: gguf.TensorType) bool {
+        return v.lanes <= 32 or (t == .q8_0 and v.lanes == 64);
+    }
+
+    /// The sweep: lanes 8, 16, 32 (or for Q8_0 64) per row, 1 or 2 rows
+    /// per lane group, 128 or 256 threads.
     pub const candidates = blk: {
-        var list: [12]MatvecVariant = undefined;
+        var list: [16]MatvecVariant = undefined;
         var i: usize = 0;
-        for ([_]u32{ 256, 128 }) |wg| for ([_]u32{ 32, 16, 8 }) |lanes| for ([_]u32{ 1, 2 }) |rows| {
+        for ([_]u32{ 256, 128 }) |wg| for ([_]u32{ 32, 16, 8, 64 }) |lanes| for ([_]u32{ 1, 2 }) |rows| {
             list[i] = .{ .wg = wg, .lanes = lanes, .rows = rows };
             i += 1;
         };

@@ -188,6 +188,8 @@ pub const Sweep = struct {
         s.batch = 0;
         s.diverged = false;
         s.candidate += 1;
+        // Candidates the shape's weights cannot take are not run.
+        while (s.candidate < s.candidates.len and !(s.candidates[s.candidate].suits(sh.key.type) and s.candidates[s.candidate].fitsRows(sh.rows))) s.candidate += 1;
         if (s.candidate < s.candidates.len) return;
 
         // The shape is done: keep its winner unless it is the default.
