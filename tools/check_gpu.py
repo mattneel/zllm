@@ -134,7 +134,13 @@ class GpuRuns:
 
 
 def main() -> int:
-    args = parse_args(__doc__, lambda p: p.add_argument("--host", choices=HOSTS, default="native"))
+    args = parse_args(
+        __doc__,
+        lambda p: (
+            p.add_argument("--host", choices=HOSTS, default="native"),
+            p.add_argument("--fast", action="store_true", help="the fast tier: the first eval text and engine-check, no dense models"),
+        ),
+    )
     paths = fixture_paths(args.fixtures)
     hf = Tokenizer.from_file(str(paths.hf_tokenizer))
     evals = [json.loads(line) for line in EVAL.read_text(encoding="utf-8").split("\n") if line]
@@ -189,7 +195,7 @@ def main() -> int:
         # Every eval text's runs on the 0.8B in one gpu-forward process.
         runs = stack.enter_context(GpuRuns(args, paths, paths.gguf, tmp))
         cases = []
-        for ev in evals:
+        for ev in evals[:1] if args.fast else evals:
             ids = hf.encode(ev["text"]).ids
             name = ev["name"]
             tok = tmp / f"{name}.i32"
@@ -231,7 +237,7 @@ def main() -> int:
         # The dense models (graph/dense.zig) run the same program with
         # attention layers only: the first eval sequence on each kernel path,
         # each model's runs in one process.
-        for model in DENSE_MODELS:
+        for model in () if args.fast else DENSE_MODELS:
             gguf = model.gguf(paths.root)
             if not gguf.is_file():
                 raise SystemExit(f"missing {gguf}; run scripts/fixtures.sh dense")

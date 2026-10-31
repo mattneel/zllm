@@ -56,6 +56,7 @@ def main() -> int:
         lambda p: (
             p.add_argument("--host", choices=HOSTS, default="native"),
             p.add_argument("--model", type=Path, required=True, help="Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf"),
+            p.add_argument("--fast", action="store_true", help="the fast tier: ref1 only, without the long prompt"),
         ),
     )
     paths = fixture_paths(args.fixtures)
@@ -123,6 +124,8 @@ def main() -> int:
         fail.expect("step splits", same, "1-token and 4-token steps differ")
         fail.expect("fusion", not differ, f"{len(differ)} records differ from the unfused program, first {differ[0] if differ else ''}")
 
+    if args.fast:
+        return fail.report()
     # The long prompt, greedy, end to end.
     long = json.loads((CORPUS / "gyro_reflong.json").read_text())
     hf = Tokenizer.from_file(str(paths.hf_tokenizer))

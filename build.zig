@@ -84,10 +84,25 @@ pub fn build(b: *std.Build) void {
     quant_run.addArgs(&.{ "--host", @tagName(gpu_host) });
     if (b.option([]const u8, "quant-model", "Quantized GGUF for check-quant (default: the 27B fixture)")) |m| quant_run.addArgs(&.{ "--model", m });
     // The Gyro-Coder is read in place (75.8 GB): its path is an option.
+    const gyro_model = b.option([]const u8, "gyro-model", "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf for check-gyro");
     const gyro_run = addCheck(b, check_exe, fixtures, "check-gyro", "Compare the Qwen3.8-Flash-Next Gyro-Coder on the GPU with the CPU reference and its runtime's greedy tokens", "check_gyro.py");
-    gyro_run.addArgs(&.{ "--host", @tagName(gpu_host), "--model", b.option([]const u8, "gyro-model", "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf for check-gyro") orelse "" });
+    gyro_run.addArgs(&.{ "--host", @tagName(gpu_host), "--model", gyro_model orelse "" });
 
     const kernel_step = b.step("gpu-check", "Check every GPU kernel against a CPU computation");
+    // The fast tier, for iterating: gpu-check, then check-gpu on the first
+    // eval text with engine-check, then check-gyro without its long prompt
+    // (with -Dgyro-model). One after another: the GPU runs one job at a time.
+    const fast_step = b.step("check-fast", "The fast tier: gpu-check, check-gpu --fast and check-gyro --fast (with -Dgyro-model)");
+    const fast_gpu = checkRun(b, check_exe, fixtures, "check_gpu.py");
+    fast_gpu.addArgs(&.{ "--host", @tagName(gpu_host), "--fast" });
+    fast_gpu.step.dependOn(kernel_step);
+    fast_step.dependOn(&fast_gpu.step);
+    if (gyro_model) |m| {
+        const fast_gyro = checkRun(b, check_exe, fixtures, "check_gyro.py");
+        fast_gyro.addArgs(&.{ "--host", @tagName(gpu_host), "--model", m, "--fast" });
+        fast_gyro.step.dependOn(&fast_gpu.step);
+        fast_step.dependOn(&fast_gyro.step);
+    }
     switch (gpu_host) {
         .native => {
             // The Dawn path is only known at run time, so set it in a shell.
@@ -187,6 +202,13 @@ fn addCheck(
     description: []const u8,
     script: []const u8,
 ) *std.Build.Step.Run {
+    const run = checkRun(b, exe, fixtures, script);
+    b.step(name, description).dependOn(&run.step);
+    return run;
+}
+
+/// A run of harness script `script` (tools/) against `exe` and `fixtures`.
+fn checkRun(b: *std.Build, exe: *std.Build.Step.Compile, fixtures: std.Build.LazyPath, script: []const u8) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{ "uv", "run", "--frozen", "--project" });
     run.addDirectoryArg(b.path("tools"));
     run.addArg("python");
@@ -196,6 +218,5 @@ fn addCheck(
     run.addArg("--fixtures");
     run.addDirectoryArg(fixtures);
     run.has_side_effects = true;
-    b.step(name, description).dependOn(&run.step);
     return run;
 }

@@ -73,6 +73,16 @@ Two things keep the checks fast. Neither changes what they compare.
 With both, `check-gpu` on the RTX 5090 (D3D12) went from 28 minutes to 2.5
 once the references are cached.
 
+There are two tiers:
+
+| Tier | What it runs | When |
+|---|---|---|
+| Fast: `zig build check-fast` | `gpu-check`; `check-gpu` on the first eval text (both kernel paths, step splits, every KV format) with engine-check; `check-gyro` on its short sequence (step splits and fusion bitwise) with `-Dgyro-model` | every iteration; about a minute on Velocity once the references are cached |
+| Full: every check | every eval text and model, the long prompts, `check-quant`, each backend | before each commit |
+
+`check-gpu` and `check-gyro` take `--fast` themselves; `check-fast` runs
+them one after another, since the GPU runs one job at a time.
+
 ## GGUF reader
 
 `check-gguf` compares `zllm gguf-index` with `gguf_dump.py --json
