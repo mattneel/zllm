@@ -248,6 +248,59 @@ unchanged Gyro checks retain zero routing flips, 66/66 top-1 agreement and
 execution remain bitwise identical within each backend's prefill path.
 Agility's prefill logits median/max rel L2 remain 2.02e-5/1.63e-4.
 
+## Larger LinAlg expert tiles
+
+The reference `gyro-dx` checkout uses `gemm_q8` tiles of 16 tokens by
+64 outputs with KT64 and four computing waves. Its single-FP16 operand
+path is not interchangeable with zllm's unchanged accuracy gates.
+Its expert `moe_gyro` path does **not** group tokens by expert: the host
+dispatches `n_tok * n_used` selected slots, and each workgroup decodes
+32 output rows for one slot using scalar wave reductions. zllm already
+shares decoded weights across 16 routed slots per expert.
+
+The larger expert tile increases output rows from 32 to 64 so all four
+waves compute, reusing activation and codebook staging across twice as many
+outputs. It preserves the shared dispatch grid by returning odd x groups.
+Wave exchange removes the second trellis-byte load; wave broadcasts and
+direct matrix-coordinate output stores replace shared scale/result/slot
+staging. Both activation products and the complete 128-K block order are
+unchanged. This is not a lower-precision path.
+
+Same benchmark protocol, model, context, f16 KV and adapter as above:
+
+| Measurement | Before (`917438f`) | 64-output expert tile |
+|---|---:|---:|
+| 1,024-token prefill, 65 steps | 154.07 tok/s | 160.64 tok/s |
+| Greedy decode | 61.53 tok/s | 61.81 tok/s |
+| Plain decode | 61.31 tok/s | 62.11 tok/s |
+| Unprofiled 64-token step | 277.56 ms | 248.61 ms |
+| Profiled wall time | 270.16 ms | 268.27 ms |
+
+| 64-token phase | Before GPU ms / share | 64-output expert GPU ms / share |
+|---|---:|---:|
+| Grouped experts | 156.969 / 62.2% | 148.957 / 60.9% |
+| Dense float Q8_0 | 65.126 / 25.8% | 66.064 / 27.0% |
+| DeltaNet recurrence | 8.901 / 3.5% | 8.547 / 3.5% |
+| Expert grouping | 4.450 / 1.8% | 4.443 / 1.8% |
+| Sparse attention | 4.216 / 1.7% | 4.209 / 1.7% |
+| Router logits | 3.244 / 1.3% | 3.179 / 1.3% |
+| BF16 matmul | 2.848 / 1.1% | 2.764 / 1.1% |
+| Other kernels | 6.569 | 6.338 |
+| **Sum** | **252.323** | **244.501** |
+
+Grouped down falls from 48.953 to 42.195 ms; gate/up changes from 108.016
+to 106.763 ms. Prefill throughput improves 4.26%; the remaining gap to
+250 tok/s is 89.36 tok/s. Decode kernels are unchanged. The differing
+warm-up and profiled step times are reported separately, not used to
+substitute for the end-to-end benchmark.
+
+The expert tile passed `zig fmt --check .`, `zig build`, `zig build test`,
+`zig build wasm`, standalone Agility `gpu-check`, and `check-fast` on both
+Agility and Dawn D3D12. GPU checks now include 69 expert output rows and
+67 dense token rows, crossing the larger tile boundaries and their tails.
+Gyro routing has zero flips, logits median/max rel L2 remain
+2.02e-5/1.63e-4, and split/unfused prefill results remain bitwise identical.
+
 ## Per-device records
 
 `benchmarks/rtx5090-laptop-d3d12.jsonl` stores the committed native benchmark

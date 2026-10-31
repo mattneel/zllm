@@ -562,11 +562,11 @@ fn launchFloatQ8Check(c: *Ctx, x: kernels.Arg, weights: [3]kernels.Arg, out: ker
     }
 }
 
-/// Unrounded float activations, k=320, partial 16-token/64-output tiles,
-/// weight chunks, padded outputs, overwrite/accumulate, and split-k.
+/// Unrounded float activations, k=320, full and partial 16-/64-token and
+/// 64-output tiles, weight chunks, padding, accumulate, and split-k.
 /// Within each split-k path, token chunking must remain bitwise identical.
 fn checkMatmulQ80Float(c: *Ctx) !Result {
-    const rows = 17;
+    const rows = 67;
     const n = 70;
     const k = 320;
     const stride = 79;
@@ -605,7 +605,7 @@ fn checkMatmulQ80Float(c: *Ctx) !Result {
                 if (j >= 3 and j < 3 + n) continue;
                 pass = (got[r * stride + j] == @as(u32, @bitCast(init[r * stride + j]))) and pass;
             };
-            for ([_][2]u32{ .{ 0, 3 }, .{ 3, 14 } }) |chunk| {
+            for ([_][2]u32{ .{ 0, 3 }, .{ 3, 14 }, .{ 17, 50 } }) |chunk| {
                 const first = chunk[0];
                 const count = chunk[1];
                 const chunk_out = try c.upload(init[first * stride ..][0 .. count * stride]);
@@ -1923,13 +1923,13 @@ test "grouped Gyro checker rejects grouping and output mutations" {
 }
 
 /// Repeated routes (19, 12, 7, 0 slots), partial four-/16-token and
-/// 32-row tiles, token-/slot-indexed inputs, padding, and stale capacity.
+/// 32-/64-row tiles, token-/slot-indexed inputs, padding, and stale capacity.
 /// Whole versus split token chunks is bitwise on both backends. WGSL also
 /// compares bitwise to gyro_matvec; HLSL's old WaveActiveSum is unspecified.
 fn checkGyroMatmul(c: *Ctx) !Result {
     const q4 = @import("../ref/qwen4exp/kernels.zig");
     const book = try c.upload(@import("../ref/gyro/gyro.zig").codebook_bytes);
-    const rows = 37;
+    const rows = 69;
     const tokens = 19;
     const used = 2;
     const n_expert = 4;

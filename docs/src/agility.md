@@ -149,6 +149,15 @@ f32 operands at their unchanged
 1e-5 bounds and require whole/split-token results to match bitwise within
 each path. The full Gyro gates retain their existing bounds.
 
+The grouped expert variant computes 64 output rows for 16 routed slots,
+with all four wave matrices doing useful work. Even x workgroups cover the
+next 32-row group's outputs and odd x groups return, preserving the shared
+dispatch grid. It keeps the complete 128-K block, activation high/residual
+products and post-block scales in the same order. A wave exchange supplies
+the preceding trellis byte; wave broadcasts supply row scales; direct
+matrix-coordinate output stores avoid shared result staging. Its shared
+storage is exactly 32 KiB. WGSL and scalar HLSL keep their existing tiles.
+
 The pinned DXC HLSL matrix headers are staged by
 `scripts/fixtures.sh agility` under `agility/include` beside its compiler
 DLL; the host supplies that absolute include directory at load-time compilation.
