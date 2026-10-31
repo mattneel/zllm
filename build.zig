@@ -73,10 +73,11 @@ pub fn build(b: *std.Build) void {
     _ = addCheck(b, check_exe, fixtures, "check-forward", "Compare the reference forward pass with llama.cpp", "check_forward.py");
     _ = addCheck(b, check_exe, fixtures, "check-dequant", "Compare CPU dequantization with ggml's, bit for bit", "check_dequant.py");
 
-    // GPU checks run on a Dawn host: `native` is this build on whatever
-    // adapter Dawn finds (llvmpipe in CI); `d3d12` is the Windows build run
-    // from WSL through scripts/d3d12.sh.
-    const gpu_host = b.option(enum { native, d3d12 }, "gpu-host", "Dawn host for GPU checks (default: native)") orelse .native;
+    // Where GPU checks run: `native` is this build on whatever adapter Dawn
+    // finds (llvmpipe in CI); `d3d12` is the Windows build run from WSL
+    // through scripts/d3d12.sh, on Dawn; `velocity` is that build on the
+    // Velocity backend.
+    const gpu_host = b.option(enum { native, d3d12, velocity }, "gpu-host", "Where GPU checks run (default: native)") orelse .native;
     const gpu_run = addCheck(b, check_exe, fixtures, "check-gpu", "Compare the GPU forward pass with the CPU reference", "check_gpu.py");
     gpu_run.addArgs(&.{ "--host", @tagName(gpu_host) });
     const quant_run = addCheck(b, check_exe, fixtures, "check-quant", "Compare the GPU forward pass on the quantized 27B with llama.cpp", "check_quant.py");
@@ -96,10 +97,11 @@ pub fn build(b: *std.Build) void {
             run.has_side_effects = true;
             kernel_step.dependOn(&run.step);
         },
-        .d3d12 => {
+        .d3d12, .velocity => {
             const run = b.addSystemCommand(&.{"bash"});
             run.addFileArg(b.path("scripts/d3d12.sh"));
             run.addArg("gpu-check");
+            run.setEnvironmentVariable("ZLLM_BACKEND", if (gpu_host == .velocity) "velocity" else "webgpu");
             run.has_side_effects = true;
             kernel_step.dependOn(&run.step);
         },

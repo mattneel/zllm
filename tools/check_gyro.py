@@ -18,7 +18,8 @@ reference runtime, AgentionAI's llama.cpp fork.
    the runtime's 10 tokens.
 
 Hosts as in check_gpu.py: `native` (this build, ZLLM_DAWN's adapter) or
-`d3d12` (the Windows build through scripts/d3d12.sh).
+`d3d12` (the Windows build through scripts/d3d12.sh) or `velocity` (that build on
+Velocity).
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ import numpy as np
 from tokenizers import Tokenizer
 
 from check_forward import read_records
-from check_gpu import run_gpu, zllm_on_host
+from check_gpu import HOSTS, run_gpu, zllm_on_host
 from common import Failures, fixture_paths, parse_args
 
 CORPUS = Path(__file__).parent / "corpus"
@@ -54,7 +55,7 @@ def main() -> int:
     args = parse_args(
         __doc__,
         lambda p: (
-            p.add_argument("--host", choices=["native", "d3d12"], default="native"),
+            p.add_argument("--host", choices=HOSTS, default="native"),
             p.add_argument("--model", type=Path, required=True, help="Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf"),
         ),
     )

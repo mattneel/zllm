@@ -60,7 +60,7 @@ from pathlib import Path
 import numpy as np
 
 from check_forward import read_records, row_stats
-from check_gpu import run_gpu
+from check_gpu import HOSTS, run_gpu
 from common import GGUF27_FILE, Failures, fixture_paths, parse_args
 
 EVAL = Path(__file__).parent / "corpus" / "eval.jsonl"
@@ -80,7 +80,7 @@ def layer_names(records: dict) -> list[str]:
 
 def main() -> int:
     def extra(p):
-        p.add_argument("--host", choices=["native", "d3d12"], default="d3d12")
+        p.add_argument("--host", choices=HOSTS, default="d3d12")
         p.add_argument("--model", type=Path, help=f"the quantized GGUF (default: <fixtures>/models/{GGUF27_FILE})")
 
     args = parse_args(__doc__, extra)

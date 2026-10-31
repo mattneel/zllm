@@ -31,7 +31,8 @@ Pass criteria (docs/src/validation.md):
     decode kernels over its first DECODE_TOKENS positions).
 
 Hosts: `native` runs the Linux build on the Vulkan adapter Dawn finds
-(llvmpipe in CI); `d3d12` runs the Windows build through scripts/d3d12.sh.
+(llvmpipe in CI); `d3d12` runs the Windows build through scripts/d3d12.sh;
+`velocity` runs it there on the Velocity backend (ZLLM_BACKEND=velocity).
 """
 
 from __future__ import annotations
@@ -65,12 +66,17 @@ def win(path: Path) -> str:
     return subprocess.run(["wslpath", "-w", str(path)], check=True, capture_output=True, text=True).stdout.strip()
 
 
+# Where GPU checks run: this build on Dawn's adapter, the Windows build on
+# Dawn's D3D12, or the Windows build on Velocity.
+HOSTS = ["native", "d3d12", "velocity"]
+
+
 def zllm_on_host(args, paths, command: str, *argv: Path | str) -> subprocess.CompletedProcess:
     """Runs a zllm command on the selected host; Path arguments are mapped to the host."""
-    if args.host == "d3d12":
+    if args.host in HOSTS[1:]:
         mapped = [win(a) if isinstance(a, Path) else a for a in argv]
         cmd = [str(ROOT / "scripts" / "d3d12.sh"), command, *mapped]
-        env = os.environ.copy()
+        env = {**os.environ, "ZLLM_BACKEND": "velocity" if args.host == "velocity" else "webgpu"}
     else:
         cmd = [args.zllm, command, *map(str, argv)]
         env = {**os.environ, "ZLLM_DAWN": str(paths.root / "dawn" / "libwebgpu_dawn.so")}
@@ -87,7 +93,7 @@ def run_gpu(args, paths, model: Path, tokens: Path, out: Path, *opts: str) -> st
 
 
 def main() -> int:
-    args = parse_args(__doc__, lambda p: p.add_argument("--host", choices=["native", "d3d12"], default="native"))
+    args = parse_args(__doc__, lambda p: p.add_argument("--host", choices=HOSTS, default="native"))
     paths = fixture_paths(args.fixtures)
     hf = Tokenizer.from_file(str(paths.hf_tokenizer))
     evals = [json.loads(line) for line in EVAL.read_text(encoding="utf-8").split("\n") if line]
