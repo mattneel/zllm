@@ -24,10 +24,12 @@ pub const Op = enum(u8) {
     /// buffer, offset: u64, data: ptr, len: u64 — queued immediately (queue.writeBuffer),
     /// so it lands before any later `submit`.
     write_buffer = 2,
-    /// id, code: ptr, len: u32 — WGSL with one compute entry point named "main".
-    create_shader = 3,
-    /// id, shader
-    create_pipeline = 4,
+    /// id, kernel: u32, variant: u32, artifact: ptr, len: u32 — a compute
+    /// pipeline for kernel `kernel` (kernels.Kernel) in variant `variant`
+    /// (0: the default), from the backend's artifact for it: WGSL with one
+    /// entry point named "main" on WebGPU, DXIL on Velocity. The ids say
+    /// which kernel a pipeline is (profiles, capability reports).
+    create_kernel = 3,
     /// id, pipeline, group, count, then count × (binding, buffer, offset: u64, size: u64)
     create_bind_group = 5,
     /// pipeline, x, y, z, count, then count bind groups for groups 0..count
@@ -67,10 +69,9 @@ pub const Usage = packed struct(u32) {
     _: u22 = 0,
 };
 
-pub const Kind = enum(u32) { buffer, shader, pipeline, bind_group };
+pub const Kind = enum(u32) { buffer, pipeline, bind_group };
 
 pub const Buffer = enum(u32) { _ };
-pub const Shader = enum(u32) { _ };
 pub const Pipeline = enum(u32) { _ };
 pub const BindGroup = enum(u32) { _ };
 
@@ -92,7 +93,7 @@ pub const Completion = struct {
 /// are only meaningful to the host executing its batches.
 pub const Recorder = struct {
     words: std.ArrayList(u32) = .empty,
-    next: [4]u32 = @splat(0),
+    next: [3]u32 = @splat(0),
 
     pub fn deinit(r: *Recorder, gpa: Allocator) void {
         r.words.deinit(gpa);
@@ -137,16 +138,10 @@ pub const Recorder = struct {
         try r.put(gpa, .write_file, &(.{@backingInt(buffer)} ++ split(offset) ++ split(file_offset) ++ split(size)));
     }
 
-    /// `code` must stay valid until the batch has been executed.
-    pub fn createShader(r: *Recorder, gpa: Allocator, code: []const u8) Allocator.Error!Shader {
-        const id = r.alloc(.shader);
-        try r.put(gpa, .create_shader, &(.{id} ++ addr(code.ptr) ++ .{@as(u32, @intCast(code.len))}));
-        return @fromBackingInt(@intCast(id));
-    }
-
-    pub fn createPipeline(r: *Recorder, gpa: Allocator, shader: Shader) Allocator.Error!Pipeline {
+    /// `artifact` must stay valid until the batch has been executed.
+    pub fn createKernel(r: *Recorder, gpa: Allocator, kernel: u32, variant: u32, artifact: []const u8) Allocator.Error!Pipeline {
         const id = r.alloc(.pipeline);
-        try r.put(gpa, .create_pipeline, &.{ id, @backingInt(shader) });
+        try r.put(gpa, .create_kernel, &(.{ id, kernel, variant } ++ addr(artifact.ptr) ++ .{@as(u32, @intCast(artifact.len))}));
         return @fromBackingInt(@intCast(id));
     }
 
@@ -248,8 +243,7 @@ test "recorder output decodes back to the same commands" {
     var dst: [8]u8 = undefined;
     const buf = try r.createBuffer(gpa, 1 << 33, .{ .storage = true, .copy_dst = true });
     try r.writeBuffer(gpa, buf, 16, &data);
-    const sh = try r.createShader(gpa, "wgsl");
-    const pl = try r.createPipeline(gpa, sh);
+    const pl = try r.createKernel(gpa, 5, 2, "wgsl");
     const bg = try r.createBindGroup(gpa, pl, 0, &.{
         .{ .binding = 0, .buffer = buf, .size = 64 },
         .{ .binding = 3, .buffer = buf, .offset = 256, .size = 1 << 32 },
@@ -274,11 +268,9 @@ test "recorder output decodes back to the same commands" {
     try std.testing.expectEqualSlices(u8, &data, c.ptrAt([*]const u8, 3)[0..@intCast(c.u64At(5))]);
 
     c = (try it.next()).?;
-    try std.testing.expectEqual(Op.create_shader, c.op);
-    try std.testing.expectEqualStrings("wgsl", c.ptrAt([*]const u8, 1)[0..c.args[3]]);
-
-    c = (try it.next()).?;
-    try std.testing.expectEqual(Op.create_pipeline, c.op);
+    try std.testing.expectEqual(Op.create_kernel, c.op);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 5, 2 }, c.args[0..3]);
+    try std.testing.expectEqualStrings("wgsl", c.ptrAt([*]const u8, 3)[0..c.args[5]]);
 
     c = (try it.next()).?;
     try std.testing.expectEqual(Op.create_bind_group, c.op);

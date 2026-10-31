@@ -352,7 +352,7 @@ const Runtime = struct {
         if (arch == null or arch.? != .string or !zllm.chat.supports(arch.?.string)) {
             rt.template = try zllm.chat.Template.fromGguf(arena, file, &rt.tok);
         }
-        rt.set = try .create(gpa, arena, &rt.setup);
+        rt.set = try .create(gpa, arena, &rt.setup, .webgpu);
         rt.model = try plan.Model.upload(arena, gpa, &rt.setup, &rt.set, file, rt.limits);
         rt.config.mtp = rt.model.canSpeculate(rt.limits);
         try rt.setup.submit(gpa, 0);

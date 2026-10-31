@@ -16,7 +16,6 @@ pub const Host = struct {
     /// The model file `write_file` copies from.
     file: []const u8 = &.{},
     buffers: std.ArrayList(c.WGPUBuffer) = .empty,
-    shaders: std.ArrayList(c.WGPUShaderModule) = .empty,
     pipelines: std.ArrayList(c.WGPUComputePipeline) = .empty,
     bind_groups: std.ArrayList(c.WGPUBindGroup) = .empty,
 
@@ -75,7 +74,6 @@ pub const Host = struct {
         for (h.reads.items) |r| p.BufferRelease(r.staging);
         for (h.bind_groups.items) |o| if (o) |x| p.BindGroupRelease(x);
         for (h.pipelines.items) |o| if (o) |x| p.ComputePipelineRelease(x);
-        for (h.shaders.items) |o| if (o) |x| p.ShaderModuleRelease(x);
         for (h.buffers.items) |o| if (o) |x| {
             p.BufferDestroy(x);
             p.BufferRelease(x);
@@ -83,7 +81,6 @@ pub const Host = struct {
         h.reads.deinit(h.gpa);
         h.bind_groups.deinit(h.gpa);
         h.pipelines.deinit(h.gpa);
-        h.shaders.deinit(h.gpa);
         h.buffers.deinit(h.gpa);
         h.* = undefined;
     }
@@ -160,20 +157,20 @@ pub const Host = struct {
                 p.QueueWriteBuffer(h.d.queue, try get(c.WGPUBuffer, h.buffers, a[0]), command.u64At(1), data.ptr, data.len);
                 try h.queued(data.len);
             },
-            .create_shader => {
-                try need(a, 4);
-                const code = command.ptrAt([*]const u8, 1)[0..a[3]];
+            .create_kernel => {
+                // WebGPU's artifact is WGSL; the module lives as long as its
+                // pipeline needs it, which Dawn tracks itself.
+                try need(a, 6);
+                const code = command.ptrAt([*]const u8, 3)[0..a[5]];
                 var src = std.mem.zeroes(c.WGPUShaderSourceWGSL);
                 src.chain.sType = c.WGPUSType_ShaderSourceWGSL;
                 src.code = dawn.str(code);
-                var desc = std.mem.zeroes(c.WGPUShaderModuleDescriptor);
-                desc.nextInChain = &src.chain;
-                try put(c.WGPUShaderModule, h.gpa, &h.shaders, a[0], p.DeviceCreateShaderModule(h.d.device, &desc));
-            },
-            .create_pipeline => {
-                try need(a, 2);
+                var sdesc = std.mem.zeroes(c.WGPUShaderModuleDescriptor);
+                sdesc.nextInChain = &src.chain;
+                const module = p.DeviceCreateShaderModule(h.d.device, &sdesc);
+                defer p.ShaderModuleRelease(module);
                 var desc = std.mem.zeroes(c.WGPUComputePipelineDescriptor);
-                desc.compute.module = try get(c.WGPUShaderModule, h.shaders, a[1]);
+                desc.compute.module = module;
                 desc.compute.entryPoint = dawn.str("main");
                 try put(c.WGPUComputePipeline, h.gpa, &h.pipelines, a[0], p.DeviceCreateComputePipeline(h.d.device, &desc));
             },
@@ -259,7 +256,6 @@ pub const Host = struct {
                         p.BufferDestroy(x);
                         p.BufferRelease(x);
                     },
-                    .shader => if (try take(c.WGPUShaderModule, h.shaders, a[1])) |x| p.ShaderModuleRelease(x),
                     .pipeline => if (try take(c.WGPUComputePipeline, h.pipelines, a[1])) |x| p.ComputePipelineRelease(x),
                     .bind_group => if (try take(c.WGPUBindGroup, h.bind_groups, a[1])) |x| p.BindGroupRelease(x),
                 }

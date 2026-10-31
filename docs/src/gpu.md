@@ -53,7 +53,7 @@ boundary once per batch rather than once per dispatch.
 - **Encoding:** little-endian `u32` words. Each command starts with
   `opcode | (words << 8)`, so a host can bounds-check every command.
 - **Object ids:** objects are named by ids the core assigns, densely per kind.
-- **Addresses:** buffer contents, WGSL source and readback destinations are
+- **Addresses:** buffer contents, kernel artifacts and readback destinations are
   core-memory addresses, two words each; in wasm32 the high word is 0.
 - **Batching:** commands between two `submit`s go into one fresh command
   buffer, and consecutive dispatches share one compute pass.
@@ -62,8 +62,7 @@ boundary once per batch rather than once per dispatch.
 |---|---|
 | `create_buffer` | id, size, usage (WebGPU `GPUBufferUsage` bits) |
 | `write_buffer` | buffer, offset, data, length |
-| `create_shader` | id, WGSL source (entry point `main`) |
-| `create_pipeline` | id, shader |
+| `create_kernel` | id, kernel, variant, artifact (the backend's implementation: WGSL with entry point `main` on WebGPU, DXIL on Velocity) |
 | `create_bind_group` | id, pipeline, group, then (binding, buffer, offset, size)… |
 | `dispatch` | pipeline, workgroups x/y/z, bind groups |
 | `copy_buffer` | src, offset, dst, offset, size |

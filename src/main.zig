@@ -531,7 +531,7 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file
     const n: u32 = @intCast(tokens.len);
     if (n > plan.max_context) return error.ContextTooLong;
     const chunk: u32 = @min(opts.chunk, zllm.kernels.decode_max_rows, n);
-    var set = try zllm.kernels.Set.create(gpa, arena, &rec);
+    var set = try zllm.kernels.Set.create(gpa, arena, &rec, .webgpu);
     host.file = bytes;
     const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
     var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{ .context = @max(n, 1), .kv = opts.kv, .fuse = !opts.no_fuse }, limits);
@@ -632,7 +632,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
 
     const n: u32 = @intCast(tokens.len);
     const chunk = @min(opts.chunk, n);
-    var set = try zllm.kernels.Set.create(gpa, arena, &rec);
+    var set = try zllm.kernels.Set.create(gpa, arena, &rec, .webgpu);
     host.file = mapped.bytes;
     const model = try plan.Model.uploadAny(arena, gpa, &rec, &set, file, limits);
     // The upload runs before the program is built, which may read what it

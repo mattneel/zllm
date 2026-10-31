@@ -81,8 +81,7 @@ export const Out = {
 export const Op = {
   createBuffer: 1,
   writeBuffer: 2,
-  createShader: 3,
-  createPipeline: 4,
+  createKernel: 3,
   createBindGroup: 5,
   dispatch: 6,
   copyBuffer: 7,
@@ -94,4 +93,4 @@ export const Op = {
 } as const;
 
 /** `destroy` kinds (src/gpu/cmd.zig `Kind`). */
-export const Kind = { buffer: 0, shader: 1, pipeline: 2, bindGroup: 3 } as const;
+export const Kind = { buffer: 0, pipeline: 1, bindGroup: 2 } as const;

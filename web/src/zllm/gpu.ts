@@ -72,7 +72,6 @@ export class Executor {
   readonly #source: ModelSource;
   readonly #decoder = new TextDecoder();
   readonly #buffers: (GPUBuffer | undefined)[] = [];
-  readonly #shaders: (GPUShaderModule | undefined)[] = [];
   readonly #pipelines: (Promise<GPUComputePipeline> | undefined)[] = [];
   readonly #ready: (GPUComputePipeline | undefined)[] = [];
   readonly #bindGroups: (GPUBindGroup | undefined)[] = [];
@@ -163,14 +162,11 @@ export class Executor {
       case Op.writeFile:
         this.#writeFile(this.#buffer(word(a, 0)), u64(a, 1), u64(a, 3), u64(a, 5));
         return;
-      case Op.createShader: {
-        const bytes = new Uint8Array(this.#memory.buffer, u64(a, 1), word(a, 3));
-        put(this.#shaders, word(a, 0), d.createShaderModule({ code: this.#decoder.decode(bytes) }));
-        return;
-      }
-      case Op.createPipeline: {
+      case Op.createKernel: {
+        // id, kernel, variant, then the artifact: WGSL on WebGPU.
         const id = word(a, 0);
-        const module = get(this.#shaders, word(a, 1), "shader");
+        const bytes = new Uint8Array(this.#memory.buffer, u64(a, 3), word(a, 5));
+        const module = d.createShaderModule({ code: this.#decoder.decode(bytes) });
         const pending = d.createComputePipelineAsync({
           layout: "auto",
           compute: { module, entryPoint: "main" },
@@ -332,9 +328,6 @@ export class Executor {
       case Kind.buffer:
         get(this.#buffers, id, "buffer").destroy();
         this.#buffers[id] = undefined;
-        return;
-      case Kind.shader:
-        this.#shaders[id] = undefined;
         return;
       case Kind.pipeline:
         this.#pipelines[id] = undefined;

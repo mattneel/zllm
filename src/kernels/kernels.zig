@@ -17,6 +17,7 @@ const cmd = @import("../gpu/cmd.zig");
 const ops = @import("../ref/ops.zig");
 const gguf = @import("../gguf/gguf.zig");
 const tmpl = @import("../tmpl/tmpl.zig");
+const Backend = @import("../backend/backend.zig").Backend;
 
 pub const Kernel = enum {
     rmsnorm,
@@ -226,6 +227,13 @@ pub const MatvecVariant = struct {
     /// staged as silu(x / act_div) (hc_act folded into the multiply after
     /// it).
     act_div: u32 = 0,
+
+    /// The variant's id in the command stream (create_kernel): 0 for the
+    /// default, else its fields packed (wg / 32, lanes, rows, act_div).
+    pub fn id(v: MatvecVariant) u32 {
+        if (std.meta.eql(v, MatvecVariant{})) return 0;
+        return (v.wg / 32) | (v.lanes << 8) | (v.rows << 16) | (@as(u32, @min(v.act_div, 255)) << 24);
+    }
 
     /// Rows one workgroup computes.
     pub fn groupRows(v: MatvecVariant) u32 {
@@ -606,6 +614,8 @@ pub fn ropeTableScaled(gpa: Allocator, positions: usize, n_rot: usize, base: f32
 /// plus the other decode-multiply variants the plan asks for.
 pub const Set = struct {
     pipelines: std.EnumArray(Kernel, cmd.Pipeline),
+    /// The backend the pipelines are built for.
+    backend: Backend,
     variants: [max_variants]Variant = undefined,
     n_variants: usize = 0,
 
@@ -614,15 +624,19 @@ pub const Set = struct {
     /// prologue.
     const max_variants = 2 * 5 * MatvecVariant.candidates.len;
 
-    pub const Error = Allocator.Error || tmpl.Error;
+    pub const Error = Allocator.Error || tmpl.Error || error{
+        /// The backend has no implementation of a kernel yet (the
+        /// capability matrix lists it as planned).
+        UnsupportedKernel,
+    };
 
-    /// Records shader and pipeline creation for every kernel. Rendered
-    /// sources live in `arena`, which must outlive the batch's execution.
-    pub fn create(gpa: Allocator, arena: Allocator, rec: *cmd.Recorder) Error!Set {
-        var set: Set = .{ .pipelines = undefined };
+    /// Records pipeline creation for every kernel on `backend`. Artifacts
+    /// rendered from templates live in `arena`, which must outlive the
+    /// batch's execution.
+    pub fn create(gpa: Allocator, arena: Allocator, rec: *cmd.Recorder, backend: Backend) Error!Set {
+        var set: Set = .{ .pipelines = undefined, .backend = backend };
         for (std.enums.values(Kernel)) |k| {
-            const code = if (k.isTemplate()) try MatvecVariant.render(.{}, arena, k) else k.source();
-            set.pipelines.set(k, try rec.createPipeline(gpa, try rec.createShader(gpa, code)));
+            set.pipelines.set(k, try rec.createKernel(gpa, @backingInt(k), 0, try artifact(backend, arena, k, .{})));
         }
         return set;
     }
@@ -633,12 +647,23 @@ pub const Set = struct {
         if (std.meta.eql(v, MatvecVariant{})) return s.pipelines.get(k);
         for (s.variants[0..s.n_variants]) |x| if (x.kernel == k and std.meta.eql(x.v, v)) return x.pipeline;
         std.debug.assert(s.n_variants < max_variants);
-        const pipeline = try rec.createPipeline(gpa, try rec.createShader(gpa, try v.render(arena, k)));
+        const pipeline = try rec.createKernel(gpa, @backingInt(k), v.id(), try artifact(s.backend, arena, k, v));
         s.variants[s.n_variants] = .{ .kernel = k, .v = v, .pipeline = pipeline };
         s.n_variants += 1;
         return pipeline;
     }
 };
+
+/// Kernel `k`'s implementation on `backend`, in variant `v` (templated
+/// kernels only; the default otherwise), rendered into `arena` where it is
+/// a template.
+fn artifact(backend: Backend, arena: Allocator, k: Kernel, v: MatvecVariant) Set.Error![]const u8 {
+    return switch (backend) {
+        .webgpu => if (k.isTemplate()) v.render(arena, k) else k.source(),
+        // Velocity's HLSL kernels (port of gyro-dx's) are not registered yet.
+        .velocity => error.UnsupportedKernel,
+    };
+}
 
 /// A buffer range bound at binding 1, 2, ... in kernel order.
 pub const Arg = struct {

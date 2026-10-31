@@ -32,7 +32,7 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
     var prng: std.Random.DefaultPrng = .init(0x5eed);
     var ctx: Ctx = .{ .gpa = gpa, .host = host, .rec = .{}, .arena = arena_state.allocator(), .rand = prng.random() };
     defer ctx.rec.deinit(gpa);
-    ctx.set = try kernels.Set.create(gpa, ctx.arena, &ctx.rec);
+    ctx.set = try kernels.Set.create(gpa, ctx.arena, &ctx.rec, .webgpu);
     try ctx.flush();
 
     var ok = true;
