@@ -37,8 +37,10 @@ Hosts: `native` runs the Linux build on the Vulkan adapter Dawn finds
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,7 +50,7 @@ import numpy as np
 from tokenizers import Tokenizer
 
 from check_forward import read_records, row_stats
-from common import DENSE_MODELS, Failures, fixture_paths, parse_args
+from common import DENSE_MODELS, Failures, cached_reference, fixture_paths, parse_args
 
 EVAL = Path(__file__).parent / "corpus" / "eval.jsonl"
 ROOT = Path(__file__).resolve().parent.parent
@@ -87,13 +89,48 @@ def zllm_on_host(args, paths, command: str, *argv: Path | str) -> subprocess.Com
     return subprocess.run(cmd, env=env, capture_output=True, text=True)
 
 
-def run_gpu(args, paths, model: Path, tokens: Path, out: Path, *opts: str) -> str:
-    proc = zllm_on_host(args, paths, "gpu-forward", model, tokens, out, *opts)
-    if proc.returncode != 0:
-        sys.stderr.write(proc.stdout + proc.stderr)
-        raise SystemExit(f"gpu-forward failed ({args.host})")
-    timing = [line for line in proc.stderr.replace("\r", "").splitlines() if line.startswith("gpu-forward:")]
-    return timing[-1] if timing else ""
+class GpuRuns:
+    """gpu-forward runs on one model, executed in one process: the model
+    loads once for all of them (`gpu-forward --runs`). On the Windows hosts
+    the outputs go to a scratch directory beside the Windows stage: a
+    Windows process writes WSL's filesystem slowly (9P), and the outputs
+    hold whole logits rows, hundreds of MB a run. Use as a context manager:
+    the scratch directory goes on exit."""
+
+    def __init__(self, args, paths, model: Path, tmp: Path):
+        self.args, self.paths, self.model, self.tmp = args, paths, model, tmp
+        self.runs: list[tuple[Path, Path, tuple[str, ...]]] = []
+        self.windows = args.host in HOSTS[1:]
+        if self.windows:
+            stage = Path(subprocess.run(["wslpath", "-u", (paths.root / "dawn" / "win_stage").read_text().strip()], check=True, capture_output=True, text=True).stdout.strip())
+            self.out_dir = Path(tempfile.mkdtemp(prefix="check-", dir=stage))
+        else:
+            self.out_dir = tmp
+
+    def __enter__(self) -> GpuRuns:
+        return self
+
+    def __exit__(self, *_) -> None:
+        if self.windows:
+            shutil.rmtree(self.out_dir, ignore_errors=True)
+
+    def add(self, tokens: Path, name: str, *opts: str) -> Path:
+        """Adds a run writing records named `name`; returns where they will be."""
+        out = self.out_dir / name
+        self.runs.append((tokens, out, opts))
+        return out
+
+    def run(self) -> dict[Path, str]:
+        """Executes the runs; returns each output's timing line."""
+        host_path = win if self.windows else str
+        runs_file = self.tmp / f"runs-{self.model.stem}.txt"
+        runs_file.write_text("".join(" ".join([host_path(t), host_path(o), *opts]) + "\n" for t, o, opts in self.runs))
+        proc = zllm_on_host(self.args, self.paths, "gpu-forward", self.model, "--runs", runs_file)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stdout + proc.stderr)
+            raise SystemExit(f"gpu-forward failed ({self.args.host})")
+        timing = [line for line in proc.stderr.replace("\r", "").splitlines() if line.startswith("gpu-forward:") and "loaded in" not in line]
+        return {o: t for (_, o, _), t in zip(self.runs, timing, strict=True)}
 
 
 def main() -> int:
@@ -131,84 +168,97 @@ def main() -> int:
             fail.expect(f"{label}: MTP top-1 agreement", top_mtp == len(draft), f"{top_mtp}/{len(draft)}")
         return top
 
-    def kv_formats(label: str, gguf: Path, tok: Path, ref: dict, rows: int, *opts: str) -> None:
-        """The 512-token prefill run with each KV_GATES cache format, against the reference."""
+    def kv_formats(label: str, ref: dict, rows: int, outs: dict[str, Path], timing: dict[Path, str]) -> None:
+        """The 512-token prefill runs with each KV_GATES cache format, against the reference."""
         for fmt, (_, cos_min) in KV_GATES.items():
-            out = Path(tmp) / f"{fmt}.bin"
-            timing = run_gpu(args, paths, gguf, tok, out, "--chunk", "512", "--kv", fmt, "--path", "prefill", *opts)
-            got = read_records(out)
+            got = read_records(outs[fmt])
             cos = min(float(row_stats(got[n], ref[n])[0].min()) for n in ref)
             top = int((got["result_output"].argmax(axis=1) == ref["result_output"][:rows].argmax(axis=1)).sum())
             s = kv_stats[fmt]
             s["agree"] += top
             s["total"] += rows
             s["cos"] = min(s["cos"], cos)
-            print(f"  {fmt} KV: top-1 agreement {top}/{rows}, min cosine {cos:.7f}  [{timing}]")
+            print(f"  {fmt} KV: top-1 agreement {top}/{rows}, min cosine {cos:.7f}  [{timing[outs[fmt]]}]")
             fail.expect(f"{label}: {fmt} KV cosine", cos >= cos_min, f"{cos:.7f} < {cos_min}")
 
     def bitwise(a: dict, b: dict, rows: int) -> bool:
         return all(np.array_equal(a[n].view(np.uint32), b[n][: len(a[n])].view(np.uint32)) for n in b)
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp_name, contextlib.ExitStack() as stack:
+        tmp = Path(tmp_name)
+        # Every eval text's runs on the 0.8B in one gpu-forward process.
+        runs = stack.enter_context(GpuRuns(args, paths, paths.gguf, tmp))
+        cases = []
         for ev in evals:
             ids = hf.encode(ev["text"]).ids
-            tok = Path(tmp) / f"{ev['name']}.i32"
+            name = ev["name"]
+            tok = tmp / f"{name}.i32"
             tok.write_bytes(np.asarray(ids, dtype="<i4").tobytes())
-            ref_path, gpu_path = Path(tmp) / "ref.bin", Path(tmp) / "gpu.bin"
-            subprocess.run([args.zllm, "forward", str(paths.gguf), str(tok), str(ref_path), "--mtp"], check=True)
-            ref = read_records(ref_path)
-            mtp = ("--mtp",) if "mtp_logits" in ref else ()
-            timing = run_gpu(args, paths, paths.gguf, tok, gpu_path, "--chunk", "512", "--kv", "f32", "--path", "prefill", *mtp)
-            gpu = read_records(gpu_path)
-            fail.expect_eq(f"{ev['name']}: tensor names", sorted(gpu), sorted(ref))
-            print(f"\n{ev['name']}: {len(ids)} tokens  [{timing}]")
-            agree += compare(ev["name"], "prefill", gpu, ref, len(ids))
-            total += len(ids)
-
-            split_path = Path(tmp) / "split.bin"
-            timing = run_gpu(args, paths, paths.gguf, tok, split_path, "--chunk", "7", "--kv", "f32", "--path", "prefill", *mtp)
-            same = bitwise(read_records(split_path), gpu, len(ids))
-            print(f"  prefill kernels, steps of 7: {'bitwise identical' if same else 'DIFFERENT'}  [{timing}]")
-            fail.expect(f"{ev['name']}: prefill steps of 7 bitwise", same, "outputs differ from 512-token steps")
-
-            part = Path(tmp) / "part.i32"
+            ref_path = tmp / f"{name}-ref.bin"
+            cached_reference(paths, "zllm-forward --mtp", paths.gguf, tok, ref_path, [args.zllm, "forward", str(paths.gguf), str(tok), str(ref_path), "--mtp"])
+            mtp = ("--mtp",) if "mtp_logits" in read_records(ref_path) else ()
+            part = tmp / f"{name}-part.i32"
             part.write_bytes(np.asarray(ids[:DECODE_TOKENS], dtype="<i4").tobytes())
-            one_path, three_path = Path(tmp) / "one.bin", Path(tmp) / "three.bin"
-            timing = run_gpu(args, paths, paths.gguf, part, one_path, "--chunk", "1", "--kv", "f32", "--path", "decode", *mtp)
-            one = read_records(one_path)
-            print(f"  decode kernels, steps of 1, first {DECODE_TOKENS} tokens  [{timing}]")
-            decode_agree += compare(f"{ev['name']} (decode)", "decode", one, ref, DECODE_TOKENS)
+            outs = {
+                "gpu": runs.add(tok, f"{name}-gpu.bin", "--chunk", "512", "--kv", "f32", "--path", "prefill", *mtp),
+                "split": runs.add(tok, f"{name}-split.bin", "--chunk", "7", "--kv", "f32", "--path", "prefill", *mtp),
+                "one": runs.add(part, f"{name}-one.bin", "--chunk", "1", "--kv", "f32", "--path", "decode", *mtp),
+                "three": runs.add(part, f"{name}-three.bin", "--chunk", "3", "--kv", "f32", "--path", "decode", *mtp),
+            }
+            for fmt in KV_GATES:
+                outs[fmt] = runs.add(tok, f"{name}-{fmt}.bin", "--chunk", "512", "--kv", fmt, "--path", "prefill", *mtp)
+            cases.append((name, ids, ref_path, outs))
+        timing = runs.run()
+        for name, ids, ref_path, outs in cases:
+            ref = read_records(ref_path)
+            gpu = read_records(outs["gpu"])
+            fail.expect_eq(f"{name}: tensor names", sorted(gpu), sorted(ref))
+            print(f"\n{name}: {len(ids)} tokens  [{timing[outs['gpu']]}]")
+            agree += compare(name, "prefill", gpu, ref, len(ids))
+            total += len(ids)
+            same = bitwise(read_records(outs["split"]), gpu, len(ids))
+            print(f"  prefill kernels, steps of 7: {'bitwise identical' if same else 'DIFFERENT'}  [{timing[outs['split']]}]")
+            fail.expect(f"{name}: prefill steps of 7 bitwise", same, "outputs differ from 512-token steps")
+            one = read_records(outs["one"])
+            print(f"  decode kernels, steps of 1, first {DECODE_TOKENS} tokens  [{timing[outs['one']]}]")
+            decode_agree += compare(f"{name} (decode)", "decode", one, ref, DECODE_TOKENS)
             decode_total += DECODE_TOKENS
-            timing = run_gpu(args, paths, paths.gguf, part, three_path, "--chunk", "3", "--kv", "f32", "--path", "decode", *mtp)
-            same = bitwise(read_records(three_path), one, DECODE_TOKENS)
-            print(f"  decode kernels, steps of 3: {'bitwise identical' if same else 'DIFFERENT'}  [{timing}]")
-            fail.expect(f"{ev['name']}: decode steps of 3 bitwise", same, "outputs differ from 1-token steps")
-
-            kv_formats(ev["name"], paths.gguf, tok, ref, len(ids), *mtp)
+            same = bitwise(read_records(outs["three"]), one, DECODE_TOKENS)
+            print(f"  decode kernels, steps of 3: {'bitwise identical' if same else 'DIFFERENT'}  [{timing[outs['three']]}]")
+            fail.expect(f"{name}: decode steps of 3 bitwise", same, "outputs differ from 1-token steps")
+            kv_formats(name, ref, len(ids), outs, timing)
 
         # The dense models (graph/dense.zig) run the same program with
-        # attention layers only: the first eval sequence on each kernel path.
+        # attention layers only: the first eval sequence on each kernel path,
+        # each model's runs in one process.
         for model in DENSE_MODELS:
             gguf = model.gguf(paths.root)
             if not gguf.is_file():
                 raise SystemExit(f"missing {gguf}; run scripts/fixtures.sh dense")
             ids = Tokenizer.from_file(str(model.hf_tokenizer(paths.root))).encode(evals[0]["text"]).ids
-            tok = Path(tmp) / f"{model.name}.i32"
+            tok = tmp / f"{model.name}.i32"
             tok.write_bytes(np.asarray(ids, dtype="<i4").tobytes())
-            ref_path, gpu_path = Path(tmp) / "ref.bin", Path(tmp) / "gpu.bin"
-            subprocess.run([args.zllm, "forward", str(gguf), str(tok), str(ref_path)], check=True)
+            ref_path = tmp / f"{model.name}-ref.bin"
+            cached_reference(paths, "zllm-forward", gguf, tok, ref_path, [args.zllm, "forward", str(gguf), str(tok), str(ref_path)])
             ref = read_records(ref_path)
-            timing = run_gpu(args, paths, gguf, tok, gpu_path, "--chunk", "512", "--kv", "f32", "--path", "prefill")
-            print(f"\n{gguf.name}, {evals[0]['name']}: {len(ids)} tokens  [{timing}]")
-            agree += compare(f"{model.name} {evals[0]['name']}", "prefill", read_records(gpu_path), ref, len(ids))
-            total += len(ids)
-            part = Path(tmp) / "part.i32"
+            part = tmp / f"{model.name}-part.i32"
             part.write_bytes(np.asarray(ids[:DECODE_TOKENS], dtype="<i4").tobytes())
-            timing = run_gpu(args, paths, gguf, part, gpu_path, "--chunk", "1", "--kv", "f32", "--path", "decode")
-            print(f"  decode kernels, steps of 1, first {DECODE_TOKENS} tokens  [{timing}]")
-            decode_agree += compare(f"{model.name} {evals[0]['name']} (decode)", "decode", read_records(gpu_path), ref, DECODE_TOKENS)
+            runs = stack.enter_context(GpuRuns(args, paths, gguf, tmp))
+            outs = {
+                "gpu": runs.add(tok, f"{model.name}-gpu.bin", "--chunk", "512", "--kv", "f32", "--path", "prefill"),
+                "one": runs.add(part, f"{model.name}-one.bin", "--chunk", "1", "--kv", "f32", "--path", "decode"),
+            }
+            for fmt in KV_GATES:
+                outs[fmt] = runs.add(tok, f"{model.name}-{fmt}.bin", "--chunk", "512", "--kv", fmt, "--path", "prefill")
+            timing = runs.run()
+            label = f"{model.name} {evals[0]['name']}"
+            print(f"\n{gguf.name}, {evals[0]['name']}: {len(ids)} tokens  [{timing[outs['gpu']]}]")
+            agree += compare(label, "prefill", read_records(outs["gpu"]), ref, len(ids))
+            total += len(ids)
+            print(f"  decode kernels, steps of 1, first {DECODE_TOKENS} tokens  [{timing[outs['one']]}]")
+            decode_agree += compare(f"{label} (decode)", "decode", read_records(outs["one"]), ref, DECODE_TOKENS)
             decode_total += DECODE_TOKENS
-            kv_formats(f"{model.name} {evals[0]['name']}", gguf, tok, ref, len(ids))
+            kv_formats(label, ref, len(ids), outs, timing)
 
     for path, n, a in (("prefill", total, agree), ("decode", decode_total, decode_agree)):
         print(f"\n{args.host}, f32 KV, {path} kernels: top-1 agreement {a}/{n}; min cosine {worst[path][0]:.7f} (min {COSINE_MIN}); max rel L2 {worst[path][1]:.2e} (max {REL_L2_MAX})", end="")

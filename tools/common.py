@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import shutil
+import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +72,50 @@ class FixturePaths:
     @property
     def gguf_py(self) -> Path:
         return self.root / "llama.cpp" / "gguf-py"
+
+
+# What `zllm forward` (the CPU reference) is built from: its output depends
+# on these, the model and the token ids, never on the GPU kernels.
+REFERENCE_SOURCES = ("src/ref", "src/gguf", "src/graph", "src/main.zig", "build.zig", "build.zig.zon")
+
+
+def _sources_digest(root: Path, entries: Iterable[str]) -> str:
+    h = hashlib.sha256()
+    for entry in entries:
+        p = root / entry
+        files = sorted(f for f in p.rglob("*") if f.is_file()) if p.is_dir() else [p]
+        for f in files:
+            h.update(str(f.relative_to(root)).encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+def cached_reference(paths: FixturePaths, kind: str, model: Path, tokens: Path, out: Path, cmd: list[str]) -> None:
+    """Runs `cmd`, which writes `out`, unless .fixtures/cache holds its
+    output: keyed by `kind` (zllm-forward or llama-dump, with flags), the
+    model file (path, size, mtime), the token ids, and what the producer is
+    built from (REFERENCE_SOURCES; llama.cpp's revision and the dump tool)."""
+    root = Path(__file__).resolve().parent.parent
+    st = model.stat()
+    h = hashlib.sha256()
+    h.update(kind.encode())
+    h.update(f"{model.resolve()}:{st.st_size}:{st.st_mtime_ns}".encode())
+    h.update(tokens.read_bytes())
+    if kind.startswith("zllm-forward"):
+        h.update(_sources_digest(root, REFERENCE_SOURCES).encode())
+    else:
+        rev = subprocess.run(["git", "-C", str(paths.root / "llama.cpp"), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
+        h.update(rev.encode())
+        h.update(_sources_digest(root, ("tools/llama-dump",)).encode())
+    cache = paths.root / "cache" / f"{h.hexdigest()}.bin"
+    if cache.is_file():
+        shutil.copyfile(cache, out)
+        return
+    subprocess.run(cmd, check=True, capture_output=kind.startswith("llama-dump"))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".tmp")
+    shutil.copyfile(out, tmp)
+    tmp.replace(cache)
 
 
 def gguf_metadata(path: Path) -> dict:

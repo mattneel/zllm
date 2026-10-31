@@ -41,15 +41,37 @@ zig build check-quant        # the quantized 27B: GPU vs reference vs llama.cpp
 zig build check-gyro -Dgyro-model=<gguf>   # the Gyro-Coder: GPU vs reference vs its runtime
 ```
 
-Add `-Dgpu-host=d3d12` to any GPU check (`gpu-check`, `check-gpu`,
-`check-quant`, `check-gyro`) to run it on the Windows D3D12 host from WSL;
-see [GPU backend](gpu.md). The host is the checks' one parameter: a new
-backend adds a value, and every gate runs on it unchanged.
+Add `-Dgpu-host=d3d12` (WebGPU on Dawn's D3D12) or `-Dgpu-host=velocity` to
+any GPU check (`gpu-check`, `check-gpu`, `check-quant`, `check-gyro`) to run
+it on the Windows GPU from WSL; see [GPU backend](gpu.md). The host is the
+checks' one parameter: a new backend adds a value, and every gate runs on it
+unchanged.
 
 The checks need [uv](https://docs.astral.sh/uv/). It runs the harness in
 `tools/` from its lockfile. `-Dfixtures=<dir>` points the checks at another
 fixture directory. The reference forward pass uses one thread per physical
 core; set `ZLLM_THREADS` to override that.
+
+Two things keep the checks fast. Neither changes what they compare.
+
+- **Cached references:** the CPU reference runs (`zllm forward`) and
+  llama.cpp's dumps depend only on the model, the token ids and the code
+  that produces them, never on the GPU kernels. They are cached in
+  `.fixtures/cache`, keyed by:
+  - the model file (path, size, modification time);
+  - the token ids;
+  - for the reference, a hash of `src/ref`, `src/gguf`, `src/graph`,
+    `src/main.zig` and the build files;
+  - for llama.cpp, its revision and the dump tool.
+- **One load per model:** `zllm gpu-forward <model> --runs <file>` loads the
+  model once for every run a check makes: chunk sizes, kernel paths, KV
+  formats, fusion. Each run builds its own step program and frees it
+  afterwards. On the Windows hosts the runs write their records (whole
+  logits rows, hundreds of MB a run) next to the Windows stage, because a
+  Windows process writes WSL's filesystem slowly.
+
+With both, `check-gpu` on the RTX 5090 (D3D12) went from 28 minutes to 2.5
+once the references are cached.
 
 ## GGUF reader
 

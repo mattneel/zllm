@@ -51,6 +51,7 @@ Per-layer statistics are written to <fixtures>/reports/<model>.json.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 import sys
@@ -60,8 +61,8 @@ from pathlib import Path
 import numpy as np
 
 from check_forward import read_records, row_stats
-from check_gpu import HOSTS, run_gpu
-from common import GGUF27_FILE, Failures, fixture_paths, parse_args
+from check_gpu import HOSTS, GpuRuns
+from common import GGUF27_FILE, Failures, cached_reference, fixture_paths, parse_args
 
 EVAL = Path(__file__).parent / "corpus" / "eval.jsonl"
 
@@ -144,20 +145,29 @@ def main() -> int:
         cos, rel, _ = row_stats(g["result_output"][:rows], r["result_output"][:rows])
         print(f"  GPU vs reference, {path} kernels: top-1 {top}/{rows}; logits min cosine {cos.min():.7f}, max rel L2 {rel.max():.2e}")
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+        # The references (cached), then every sequence's GPU runs in one
+        # gpu-forward process: the model loads once.
+        batch = stack.enter_context(GpuRuns(args, paths, model, Path(tmp)))
+        outs = []
         for ev, ids in zip(evals, token_ids, strict=True):
-            n = len(ids)
             tok = Path(tmp) / f"{ev['name']}.i32"
             tok.write_bytes(np.asarray(ids, dtype="<i4").tobytes())
-            out = {k: Path(tmp) / f"{k}.bin" for k in ("L", "R", "RL", "G", "G1")}
-            subprocess.run([str(dump), str(model), str(tok), str(out["L"])], check=True, capture_output=True)
-            subprocess.run([args.zllm, "forward", str(model), str(tok), str(out["R"])], check=True)
-            subprocess.run([args.zllm, "forward", str(model), str(tok), str(out["RL"]), "--llama-activations"], check=True)
-            print(f"\n{ev['name']}: {n} tokens")
-            print(f"  [{run_gpu(args, paths, model, tok, out['G'], '--chunk', str(PREFILL_STEP))}]")
+            out = {k: Path(tmp) / f"{ev['name']}-{k}.bin" for k in ("L", "R", "RL")}
+            cached_reference(paths, "llama-dump", model, tok, out["L"], [str(dump), str(model), str(tok), str(out["L"])])
+            cached_reference(paths, "zllm-forward", model, tok, out["R"], [args.zllm, "forward", str(model), str(tok), str(out["R"])])
+            cached_reference(paths, "zllm-forward --llama-activations", model, tok, out["RL"], [args.zllm, "forward", str(model), str(tok), str(out["RL"]), "--llama-activations"])
+            out["G"] = batch.add(tok, f"{ev['name']}-G.bin", "--chunk", str(PREFILL_STEP))
             part = Path(tmp) / f"{ev['name']}.part.i32"
             part.write_bytes(np.asarray(ids[:DECODE_TOKENS], dtype="<i4").tobytes())
-            print(f"  [{run_gpu(args, paths, model, part, out['G1'], '--chunk', '1')}]")
+            out["G1"] = batch.add(part, f"{ev['name']}-G1.bin", "--chunk", "1")
+            outs.append(out)
+        timing = batch.run()
+        for ev, ids, out in zip(evals, token_ids, outs, strict=True):
+            n = len(ids)
+            print(f"\n{ev['name']}: {n} tokens")
+            print(f"  [{timing[out['G']]}]")
+            print(f"  [{timing[out['G1']]}]")
             rec = {k: read_records(p) for k, p in out.items()}
             r, rl, ll = rec["R"], rec["RL"], rec["L"]
 

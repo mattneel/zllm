@@ -25,7 +25,6 @@ Velocity).
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -34,8 +33,8 @@ import numpy as np
 from tokenizers import Tokenizer
 
 from check_forward import read_records
-from check_gpu import HOSTS, run_gpu, zllm_on_host
-from common import Failures, fixture_paths, parse_args
+from check_gpu import HOSTS, GpuRuns, zllm_on_host
+from common import Failures, cached_reference, fixture_paths, parse_args
 
 CORPUS = Path(__file__).parent / "corpus"
 
@@ -74,14 +73,16 @@ def main() -> int:
         tok = work / "ref1.i32"
         tokens.tofile(tok)
         cpu_path = work / "cpu.bin"
-        subprocess.run([args.zllm, "forward", str(args.model), str(tok), str(cpu_path)], check=True)
+        cached_reference(paths, "zllm-forward", args.model, tok, cpu_path, [args.zllm, "forward", str(args.model), str(tok), str(cpu_path)])
         cpu = read_records(cpu_path)
-        runs = {}
-        for name, opts in (("4", ("--chunk", "4")), ("1", ("--chunk", "1")), ("unfused", ("--chunk", "4", "--no-fuse"))):
-            out = work / f"gpu{name}.bin"
-            timing = run_gpu(args, paths, args.model, tok, out, *opts, "--kv", "f16")
-            print(f"  [{timing}]")
-            runs[name] = read_records(out)
+        # The three runs in one gpu-forward process: the model loads once.
+        with GpuRuns(args, paths, args.model, work) as batch:
+            outs = {name: batch.add(tok, f"gpu{name}.bin", *opts, "--kv", "f16") for name, opts in (("4", ("--chunk", "4")), ("1", ("--chunk", "1")), ("unfused", ("--chunk", "4", "--no-fuse")))}
+            timing = batch.run()
+            runs = {}
+            for name, out in outs.items():
+                print(f"  [{timing[out]}]")
+                runs[name] = read_records(out)
         gpu = runs["4"]
 
         n = len(tokens)
