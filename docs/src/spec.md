@@ -3,7 +3,16 @@
 ## 1. Scope
 **Goal:** single-user LLM inference on WebGPU from one Zig codebase. The same core runs in the browser (wasm32-freestanding with a thin JS shim) and natively on Dawn for tests. It takes GGUF models, generates WGSL kernels from templates, autotunes and fuses them per GPU and model, and streams tokens out through an OpenAI-style interface.
 
-**Not in v1:** training, more than one sequence at a time, multiple GPUs, vision or audio, grammar-constrained decoding, a CPU inference path (the CPU path is a test reference only).
+**Not in v1:** training, more than one sequence at a time, multiple GPUs, vision or audio input, grammar-constrained decoding, a CPU inference path (the CPU path is a test reference only).
+
+**After the LLMs (v2): image generation.** The same core, backends and kernels also run text-to-image diffusion from GGUF. The first target is Z-Image:
+- **Text encoder:** zllm's own Qwen3, whose hidden states condition the image.
+- **Denoiser:** a single-stream diffusion transformer.
+- **Decoder:** a VAE.
+- **Scheduler:** flow-matching Euler, with classifier-free guidance.
+- **API:** an OpenAI-style image endpoint.
+
+Every kernel it adds is hand-written per backend and checked against a CPU reference, as the LLM's are.
 
 | Target | v1 bar |
 |---|---|
