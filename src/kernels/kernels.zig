@@ -88,6 +88,7 @@ pub const Kernel = enum {
     embed_q4_k,
     embed_q5_k,
     embed_q6_k,
+    embed_iq4_xs,
 
     /// The kernel's WGSL, or for a template (`isTemplate`) its source.
     pub fn source(k: Kernel) []const u8 {
@@ -118,6 +119,7 @@ pub const Kernel = enum {
     pub fn quant(comptime op: QuantOp, t: gguf.TensorType) ?Kernel {
         return switch (t) {
             inline .q8_0, .q3_k, .q4_k, .q5_k, .q6_k => |q| @field(Kernel, @tagName(op) ++ "_" ++ @tagName(q)),
+            .iq4_xs => if (op == .embed) .embed_iq4_xs else null,
             else => null,
         };
     }
@@ -143,6 +145,7 @@ pub fn blockStride(t: gguf.TensorType) u32 {
     return switch (t) {
         .q3_k => 128,
         .q6_k => 224,
+        .iq4_xs => 144,
         else => t.layout().?.block_bytes,
     };
 }
@@ -211,9 +214,21 @@ test "kernel contracts come from the WGSL's binding declarations" {
     try std.testing.expectEqual(Contract{ .count = 5, .writes = 0b01100 }, Kernel.moe_group.contract());
     try std.testing.expectEqual(Contract{ .count = 8, .writes = 0b0001_0000 }, Kernel.gyro_matmul.contract());
     try std.testing.expectEqual(Contract{ .count = 4, .writes = 0b1000 }, Kernel.matmul_q8_0_float.contract());
+    try std.testing.expectEqual(Contract{ .count = 4, .writes = 0b1000 }, Kernel.embed_iq4_xs.contract());
     try std.testing.expect(Kernel.matvec_q8_0.contract().reads(1));
     try std.testing.expect(!Kernel.matvec_q8_0.contract().reads(3));
     for (std.enums.values(Kernel)) |kernel| try std.testing.expect(kernel.contract().writes != 0);
+}
+
+test "IQ4_XS embedding routing and padded block layout" {
+    try std.testing.expectEqual(Kernel.embed_iq4_xs, Kernel.quant(.embed, .iq4_xs).?);
+    try std.testing.expectEqual(Kernel.embed_iq4_xs, Kernel.weight(.embed, .iq4_xs).?);
+    try std.testing.expect(Kernel.quant(.matvec, .iq4_xs) == null);
+    try std.testing.expect(Kernel.quant(.matmul, .iq4_xs) == null);
+    try std.testing.expect(!Kernel.embed_iq4_xs.isTemplate());
+    try std.testing.expect(needsLayout(.iq4_xs));
+    try std.testing.expectEqual(@as(u32, 144), blockStride(.iq4_xs));
+    try std.testing.expectEqual(@as(u64, 432), rowBytes(.iq4_xs, 768));
 }
 
 fn composed(comptime name: []const u8) []const u8 {
@@ -230,8 +245,8 @@ fn composed(comptime name: []const u8) []const u8 {
         }
     }
     for (std.enums.values(QuantOp)) |op| {
-        const prefix = @tagName(op) ++ "_q";
-        if (std.mem.startsWith(u8, name, prefix)) {
+        const prefix = @tagName(op) ++ "_";
+        if (std.mem.startsWith(u8, name, prefix ++ "q") or std.mem.startsWith(u8, name, prefix ++ "iq")) {
             const t = name[@tagName(op).len + 1 ..];
             // The decode multiply also takes the type's block-major decoder.
             const dot = if (op == .matvec) @embedFile("quant/" ++ t ++ "_dot.wgsl") else "";

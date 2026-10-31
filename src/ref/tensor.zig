@@ -9,7 +9,7 @@ pub const Error = error{ UnsupportedTensorType, MissingTensor, BadShape } || All
 /// Whether `dequantize` handles `t`.
 pub fn supported(t: gguf.TensorType) bool {
     return switch (t) {
-        .f32, .f16, .bf16, .q8_0, .q3_k, .q4_k, .q5_k, .q6_k => true,
+        .f32, .f16, .bf16, .q8_0, .q3_k, .q4_k, .q5_k, .q6_k, .iq4_xs => true,
         else => false,
     };
 }
@@ -25,6 +25,7 @@ pub fn dequantize(t: gguf.TensorType, bytes: []const u8, out: []f32) error{Unsup
         .q4_k => for (0..out.len / 256) |i| q4K(bytes[i * 144 ..][0..144], out[i * 256 ..][0..256]),
         .q5_k => for (0..out.len / 256) |i| q5K(bytes[i * 176 ..][0..176], out[i * 256 ..][0..256]),
         .q6_k => for (0..out.len / 256) |i| q6K(bytes[i * 210 ..][0..210], out[i * 256 ..][0..256]),
+        .iq4_xs => for (0..out.len / 256) |i| iq4Xs(bytes[i * 136 ..][0..136], out[i * 256 ..][0..256]),
         .f32 => for (out, 0..) |*o, i| {
             o.* = @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
         },
@@ -158,6 +159,26 @@ fn q6K(b: *const [210]u8, y: *[256]f32) void {
     }
 }
 
+/// block_iq4_xs: d (f16), scales_h (u16), scales_l[4], qs[128].
+/// Each 32-element group has a signed six-bit scale, biased by 32,
+/// and nonlinear four-bit quants (low nibbles precede high nibbles).
+fn iq4Xs(b: *const [136]u8, y: *[256]f32) void {
+    const values = [_]i8{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+    const d = half(b[0..2]);
+    const scales_h = std.mem.readInt(u16, b[2..4], .little);
+    for (0..8) |group| {
+        const low = (b[4 + group / 2] >> @as(u3, @intCast(4 * (group % 2)))) & 15;
+        const high = (scales_h >> @as(u4, @intCast(2 * group))) & 3;
+        const scale = @as(i32, low | (high << 4)) - 32;
+        const dl = d * @as(f32, @floatFromInt(scale));
+        const qs = b[8 + 16 * group ..][0..16];
+        for (qs, 0..) |q, j| {
+            y[32 * group + j] = dl * @as(f32, @floatFromInt(values[q & 15]));
+            y[32 * group + 16 + j] = dl * @as(f32, @floatFromInt(values[q >> 4]));
+        }
+    }
+}
+
 /// Loads tensor `name` as f32 after checking its GGML shape. Caller owns the result.
 pub fn load(gpa: Allocator, file: gguf.File, file_bytes: []const u8, name: []const u8, shape: []const u64) Error![]f32 {
     const info = file.tensor(name) orelse return error.MissingTensor;
@@ -185,4 +206,68 @@ test "dequantize f32, f16 and bf16" {
     try std.testing.expectEqualSlices(f32, &.{ 1.5, -2 }, &out);
 
     try std.testing.expectError(error.UnsupportedTensorType, dequantize(.q2_k, &bf16_bytes, &out));
+}
+
+test "IQ4_XS covers every nonlinear code, signed scale and block boundary" {
+    try std.testing.expect(supported(.iq4_xs));
+    const layout = gguf.TensorType.iq4_xs.layout().?;
+    try std.testing.expectEqual(@as(u32, 256), layout.block_elems);
+    try std.testing.expectEqual(@as(u32, 136), layout.block_bytes);
+    const want_values = [_]f32{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+    var bytes: [2 * 136]u8 = undefined;
+    var out: [2 * 256]f32 = undefined;
+    const ds = [_]f16{ 1.5, -0.25 };
+    for (0..64) |code| {
+        @memset(&bytes, 0);
+        for (ds, 0..) |d, block| {
+            const b = bytes[136 * block ..][0..136];
+            std.mem.writeInt(u16, b[0..2], @bitCast(d), .little);
+            var scales_h: u16 = 0;
+            for (0..8) |group| {
+                const s: u8 = @intCast((code + 7 * group) % 64);
+                b[4 + group / 2] |= (s & 15) << @as(u3, @intCast(4 * (group % 2)));
+                scales_h |= @as(u16, s >> 4) << @as(u4, @intCast(2 * group));
+                for (0..16) |j| b[8 + 16 * group + j] = @as(u8, @intCast(j)) | (@as(u8, @intCast(15 - j)) << 4);
+            }
+            std.mem.writeInt(u16, b[2..4], scales_h, .little);
+        }
+        try dequantize(.iq4_xs, &bytes, &out);
+        for (ds, 0..) |d, block| for (0..8) |group| {
+            const scale: i32 = @as(i32, @intCast((code + 7 * group) % 64)) - 32;
+            const dl = @as(f32, d) * @as(f32, @floatFromInt(scale));
+            for (0..32) |j| {
+                const value = want_values[if (j < 16) j else 31 - j];
+                const want: f32 = dl * value;
+                try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(out[256 * block + 32 * group + j])));
+            }
+        };
+    }
+}
+
+test "IQ4_XS individual packed-bit mutations affect only their group or lane" {
+    // d = 0.5; all scale codes = 33 (signed +1); all quants = 8 (value +1).
+    var base: [136]u8 = @splat(0x88);
+    base[0..8].* = .{ 0, 0x38, 0xaa, 0xaa, 0x11, 0x11, 0x11, 0x11 };
+    var out: [256]f32 = undefined;
+    try dequantize(.iq4_xs, &base, &out);
+    for (out) |value| try std.testing.expectEqual(@as(f32, 0.5), value);
+    for (2..136) |byte| for (0..8) |bit| {
+        var mutated = base;
+        mutated[byte] ^= @as(u8, 1) << @as(u3, @intCast(bit));
+        try dequantize(.iq4_xs, &mutated, &out);
+        const group = if (byte < 4)
+            ((byte - 2) * 8 + bit) / 2
+        else if (byte < 8)
+            (byte - 4) * 2 + bit / 4
+        else
+            (byte - 8) / 16;
+        const lane = (byte -| 8) % 16 + (bit / 4) * 16;
+        var changed: usize = 0;
+        for (out, 0..) |value, i| {
+            const affected = i / 32 == group and (byte < 8 or i % 32 == lane);
+            try std.testing.expectEqual(affected, value != 0.5);
+            changed += @intFromBool(value != 0.5);
+        }
+        try std.testing.expectEqual(@as(usize, if (byte < 8) 32 else 1), changed);
+    };
 }

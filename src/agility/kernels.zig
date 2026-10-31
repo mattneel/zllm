@@ -67,6 +67,7 @@ const implemented = [_]Kernel{
     .embed_q4_k,
     .embed_q5_k,
     .embed_q6_k,
+    .embed_iq4_xs,
     .quantize_q8,
     .repack_q3_k,
     .repack_q8_0,
@@ -287,7 +288,7 @@ test "half-weight prefill specializes real single and compensated products" {
 
 /// A kernel's parts, as kernels.zig's `composed` for the WGSL:
 ///   <op>_bf16, <op>_f16   half/<h>.hlsli, <op>_half.hlsl
-///   <op>_q<type>          quant/common.hlsli, quant/<type>.hlsli, for
+///   <op>_[i]q<type>       quant/common.hlsli, quant/<type>.hlsli, for
 ///                         matvec quant/<type>_dot.hlsli and the template
 ///                         matvec_quant.hlsl.hbs, else <op>_quant.hlsl
 ///   attn_split[_wide]     #define MAX_GROUP, fp8.hlsli, attn_dense.hlsli,
@@ -311,8 +312,8 @@ fn composed(comptime name: []const u8) []const u8 {
         }
     }
     for (std.enums.values(kernels.QuantOp)) |op| {
-        const prefix = @tagName(op) ++ "_q";
-        if (std.mem.startsWith(u8, name, prefix)) {
+        const prefix = @tagName(op) ++ "_";
+        if (std.mem.startsWith(u8, name, prefix ++ "q") or std.mem.startsWith(u8, name, prefix ++ "iq")) {
             const t = name[@tagName(op).len + 1 ..];
             const dot = if (op == .matvec) @embedFile("kernels/quant/" ++ t ++ "_dot.hlsli") else "";
             const body = if (op == .matvec) "matvec_quant.hlsl.hbs" else @tagName(op) ++ "_quant.hlsl";
@@ -380,4 +381,8 @@ test "grouped Gyro HLSL writes exactly its WGSL write set" {
     inline for (.{ Kernel.moe_group, Kernel.gyro_matmul }) |k| {
         try std.testing.expectEqual(k.contract().writes, hlslWrites(source(k).?[common.len..]));
     }
+}
+
+test "IQ4_XS embedding keeps the WGSL write contract" {
+    try std.testing.expectEqual(Kernel.embed_iq4_xs.contract().writes, hlslWrites(source(.embed_iq4_xs).?[common.len..]));
 }

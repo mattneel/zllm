@@ -97,8 +97,8 @@ pub const Upload = struct {
         return u.file.tensor(std.fmt.bufPrint(&buf, fmt, .{layer}) catch unreachable) != null;
     }
 
-    /// A matrix weight: BF16, F16, or a type the quantized kernels decode.
-    pub fn weightInfo(u: *Upload, comptime fmt: []const u8, layer: ?usize, shape: []const u64) !*const gguf.TensorInfo {
+    /// A weight whose format supports the operation it will actually serve.
+    pub fn weightInfo(u: *Upload, comptime op: kernels.QuantOp, comptime fmt: []const u8, layer: ?usize, shape: []const u64) !*const gguf.TensorInfo {
         var buf: [96]u8 = undefined;
         const name = if (comptime std.mem.indexOf(u8, fmt, "{d}") != null)
             std.fmt.bufPrint(&buf, fmt, .{layer.?}) catch unreachable
@@ -106,7 +106,7 @@ pub const Upload = struct {
             fmt;
         const ti = u.file.tensor(name) orelse return error.MissingTensor;
         if (!std.mem.eql(u64, ti.shape(), shape)) return error.BadShape;
-        if (kernels.Kernel.weight(.matvec, ti.type) == null) return error.UnsupportedTensorType;
+        if (kernels.Kernel.weight(op, ti.type) == null) return error.UnsupportedTensorType;
         return ti;
     }
 
@@ -160,6 +160,18 @@ pub const Upload = struct {
         return u.stacked(layer, k, &.{.{ fmt, n }});
     }
 
+    /// An untied embedding table: its format need not support projection.
+    /// Tied tables use `matrix` so unsupported output formats fail at upload.
+    pub fn embedding(u: *Upload, k: u64, n: u64) !Matrix {
+        const ti = try u.weightInfo(.embed, "token_embd.weight", null, &.{ k, n });
+        const spans = [_]struct { offset: u64, rows: u64 }{
+            .{ .offset = u.fileOffset(ti), .rows = n },
+        };
+        var chunks: std.ArrayList(Matrix.Chunk) = .empty;
+        try u.chunkRun(&chunks, k, ti.type, &spans, 0, n);
+        return .{ .n = @intCast(n), .k = @intCast(k), .chunks = chunks.items };
+    }
+
     /// GGML {k, n_i} weights sharing an input, stacked by rows into one
     /// matrix (part i's rows follow part i − 1's) and split into chunks of
     /// whole rows. Consecutive parts of one weight type share chunks, each
@@ -170,7 +182,7 @@ pub const Upload = struct {
         var spans: [parts.len]Span = undefined;
         var n: u64 = 0;
         inline for (parts, &spans) |part, *span| {
-            const ti = try u.weightInfo(part[0], layer, &.{ k, part[1] });
+            const ti = try u.weightInfo(.matvec, part[0], layer, &.{ k, part[1] });
             span.* = .{ .offset = u.fileOffset(ti), .rows = part[1], .type = ti.type };
             n += part[1];
         }
@@ -518,4 +530,27 @@ pub fn weightKernel(comptime op: kernels.QuantOp, t: gguf.TensorType) kernels.Ke
 
 pub fn concat(arena: Allocator, parts: []const []const kernels.Launch) Allocator.Error![]const kernels.Launch {
     return std.mem.concat(arena, kernels.Launch, parts);
+}
+
+test "untied IQ4_XS embeddings do not advertise projection support" {
+    var tensors = [_]gguf.TensorInfo{.{
+        .name = "token_embd.weight",
+        .dims = .{ 7168, 166912, 0, 0 },
+        .n_dims = 2,
+        .type = .iq4_xs,
+        .offset = 0,
+    }};
+    var recorder: cmd.Recorder = .{};
+    var upload: Upload = .{
+        .arena = std.testing.allocator,
+        .gpa = std.testing.allocator,
+        .rec = &recorder,
+        .set = undefined,
+        .file = .{ .version = 3, .alignment = 32, .metadata = &.{}, .tensors = &tensors, .data_offset = 0 },
+        .limits = .{ .max_binding = 128 * 1024 * 1024, .offset_align = 256 },
+    };
+    const info = try upload.weightInfo(.embed, "token_embd.weight", null, &.{ 7168, 166912 });
+    try std.testing.expectEqual(gguf.TensorType.iq4_xs, info.type);
+    try std.testing.expectError(error.UnsupportedTensorType, upload.matrix("token_embd.weight", null, 7168, 166912));
+    try std.testing.expectEqual(@as(usize, 0), recorder.batch().len);
 }

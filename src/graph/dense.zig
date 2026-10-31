@@ -150,3 +150,42 @@ fn getString(f: gguf.File, k: []const u8) ?[]const u8 {
     const v = f.get(k) orelse return null;
     return if (v == .string) v.string else null;
 }
+
+test "Nanbeige metadata uses the existing llama GQA and normal RoPE path" {
+    var metadata = [_]gguf.KeyValue{
+        .{ .key = "general.architecture", .value = .{ .string = "llama" } },
+        .{ .key = "llama.embedding_length", .value = .{ .u32 = 7168 } },
+        .{ .key = "llama.feed_forward_length", .value = .{ .u32 = 22016 } },
+        .{ .key = "llama.block_count", .value = .{ .u32 = 52 } },
+        .{ .key = "llama.attention.head_count", .value = .{ .u32 = 56 } },
+        .{ .key = "llama.attention.head_count_kv", .value = .{ .u32 = 8 } },
+        .{ .key = "llama.attention.key_length", .value = .{ .u32 = 128 } },
+        .{ .key = "llama.attention.value_length", .value = .{ .u32 = 128 } },
+        .{ .key = "llama.attention.layer_norm_rms_epsilon", .value = .{ .f32 = 1e-5 } },
+        .{ .key = "llama.rope.dimension_count", .value = .{ .u32 = 128 } },
+        .{ .key = "llama.rope.freq_base", .value = .{ .f32 = 120000000 } },
+        .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .elem_type = .string, .len = 166912, .bytes = &.{} } } },
+    };
+    const file: gguf.File = .{ .version = 3, .alignment = 32, .metadata = &metadata, .tensors = &.{}, .data_offset = 0 };
+    const hp = try Hparams.fromGguf(file);
+    try std.testing.expectEqual(Arch.llama, hp.arch);
+    try std.testing.expectEqual(@as(u32, 52), hp.n_layer);
+    try std.testing.expectEqual(@as(u32, 7168), hp.n_embd);
+    try std.testing.expectEqual(@as(u32, 22016), hp.n_ff);
+    try std.testing.expectEqual(@as(u32, 166912), hp.vocab);
+    try std.testing.expectEqual(@as(u32, 7), hp.group());
+    try std.testing.expectEqual(@as(u32, 128), hp.head_dim);
+    try std.testing.expectEqual(@as(u32, 128), hp.n_rot);
+    try std.testing.expectEqual(Rope.normal, hp.rope);
+    try std.testing.expectEqual(@as(f32, 120000000), hp.rope_base);
+    try std.testing.expect(!hp.qk_norm);
+    try std.testing.expectEqual(@as(f32, 1), hp.embd_scale);
+    try std.testing.expectEqual(@as(f32, 1), hp.residual_scale);
+    try std.testing.expectEqual(@as(f32, 1), hp.logit_mul);
+
+    metadata[5].value = .{ .u32 = 9 };
+    try std.testing.expectError(error.BadMetadata, Hparams.fromGguf(file));
+    metadata[5].value = .{ .u32 = 8 };
+    metadata[9].value = .{ .u32 = 127 };
+    try std.testing.expectError(error.BadMetadata, Hparams.fromGguf(file));
+}

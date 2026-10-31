@@ -41,6 +41,13 @@ The generic GPU embedding, decode and prefill kernels support:
 - Q8_0;
 - Q3_K, Q4_K, Q5_K and Q6_K.
 
+IQ4_XS is additionally supported for untied embedding tables, including
+Nanbeige 4.3's. Its CPU decoder follows ggml's nonlinear 16-entry lookup
+table and signed six-bit sub-block scales. GPU upload pads each 136-byte
+block to 144 bytes; both backends decode the same values. IQ4_XS GPU
+matrix-vector and matrix-matrix projections are not implemented: a tied
+IQ4_XS output table is rejected, rather than dispatched to an absent kernel.
+
 A model file can mix these types. Small norm and recurrent parameter
 tensors can remain F32 even when its large matrices are quantized. F32
 parameter-vector support does not imply generic F32 GPU matrix kernels.
@@ -50,8 +57,8 @@ the supported quantized matrices.
 GGUF parsing is broader than executable model support: the reader knows
 the block layout of other GGML types so it can index their offsets and
 sizes. The model loader and kernel dispatch still reject unsupported
-matrix types. In particular, recognizing Q2_K, IQ or MXFP4 in the GGUF
-index is not a claim that the generic GPU plan can infer with them.
+matrix types. In particular, recognizing Q2_K, other IQ formats or MXFP4
+in the GGUF index is not a claim that the generic GPU plan can infer with them.
 
 The `Q4_K_M` and `Q3_K_M` names describe file-level mixtures, not one
 uniform tensor type. The pinned 27B file mixes Q3_K, Q4_K, Q5_K, Q6_K

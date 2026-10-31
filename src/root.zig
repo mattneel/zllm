@@ -30,6 +30,8 @@ test {
     _ = @import("tokenizer/sentencepiece.zig");
     _ = @import("sampler/defaults.zig");
     _ = @import("plan/cache.zig");
+    _ = @import("plan/common.zig");
+    _ = @import("graph/dense.zig");
     _ = @import("precision.zig");
     _ = ref.ops;
     _ = ref.tensor;

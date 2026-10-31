@@ -31,7 +31,7 @@ const usage =
     \\                                       also writes mtp_logits: the MTP block's draft of
     \\                                       token i + 2 at each position
     \\  dequant <type> <in.bin> <out.f32>  decode raw blocks of a GGML type (q8_0, q3_k, q4_k,
-    \\                                       q5_k, q6_k, f16, bf16) to little-endian f32
+    \\                                       q5_k, q6_k, iq4_xs, f16, bf16) to little-endian f32
     \\  chat-render <cases.jsonl> [<model.gguf> --now <unix seconds>]
     \\                                       for each {"name", "messages", "options"} line, print
     \\                                       {"name": ..., "text": ...}: the prompt in the fixed Qwen

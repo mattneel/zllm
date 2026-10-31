@@ -27,10 +27,11 @@ templates, CUDA Graphs, and NVFP4/FP8 tensor-core paths. There is no CUDA
 backend or validated CUDA implementation in this repository today. These
 mechanisms are roadmap intent, not a description of existing code.
 
-Gemma 4 and Nanbeige 4.3 are requested next model targets. They have no
-implemented graph or model gates in the repository today. They must meet
-the same tokenizer, CPU reference, kernel and model validation requirements
-as the existing families. There are no measured results for them here.
+Gemma 4 is a requested next model target. Its tokenizer and chat template
+are supported, but its forward graph and model gates are not implemented.
+Nanbeige 4.3 uses the existing dense `llama` graph with IQ4_XS embeddings;
+see [Dense transformers](dense.md#nanbeige-43-33b) for the pinned file and
+model-specific limits.
 
 ## Image generation after the LLMs
 

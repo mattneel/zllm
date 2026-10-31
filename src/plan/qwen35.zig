@@ -195,7 +195,7 @@ pub const Model = struct {
         return .{
             .hp = hp,
             .mtp = mtp,
-            .tok_embd = try u.matrix("token_embd.weight", null, e, hp.vocab),
+            .tok_embd = if (file.tensor("output.weight") != null) try u.embedding(e, hp.vocab) else try u.matrix("token_embd.weight", null, e, hp.vocab),
             .output = if (file.tensor("output.weight") != null) try u.matrix("output.weight", null, e, hp.vocab) else null,
             .output_norm = try u.vector("output_norm.weight", null, e),
             .layers = layers,
@@ -272,7 +272,7 @@ pub const Model = struct {
             .attn = .{ .gated = false, .qk_norm = d.qk_norm, .normal_rope = d.rope == .normal, .scale = d.attn_scale },
             .rope_freqs = if (file.tensor("rope_freqs.weight") != null) try u.hostVector("rope_freqs.weight", null, hp.n_rot / 2) else null,
             .mtp = null,
-            .tok_embd = try u.matrix("token_embd.weight", null, e, hp.vocab),
+            .tok_embd = if (file.tensor("output.weight") != null) try u.embedding(e, hp.vocab) else try u.matrix("token_embd.weight", null, e, hp.vocab),
             .output = if (file.tensor("output.weight") != null) try u.matrix("output.weight", null, e, hp.vocab) else null,
             .output_norm = try u.vector("output_norm.weight", null, e),
             .layers = layers,

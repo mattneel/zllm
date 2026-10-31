@@ -10,6 +10,7 @@ must agree on the model's semantics.
 | Qwen 3.5/3.6/3.8 hybrid | Gated DeltaNet interleaved with full attention; optional MTP block | [Qwen GGUF semantics](qwen35.md) |
 | Qwen 3 | Dense attention and SwiGLU, with Q/K normalization | [Dense transformers](dense.md) |
 | Llama 3 | Dense attention and SwiGLU with Llama tokenizer and RoPE semantics | [Dense transformers](dense.md) |
+| Nanbeige 4.3 33B | Existing `llama` graph, SentencePiece and IQ4_XS embeddings; native/browser chat exercised, first-layer model gate still fails | [Dense transformers](dense.md#nanbeige-43-33b) |
 | Granite 4 | Dense attention with Granite scaling and tokenizer conventions | [Dense transformers](dense.md) |
 | Qwen3.8-Flash-Next Gyro-Coder | Mixture of experts, hyper-connections, sparse attention and per-layer embeddings in Gyro formats | [Gyro-Coder](gyro.md) |
 
@@ -31,5 +32,5 @@ interpreter. Tokenization and rendering stay in the shared core rather
 than being reimplemented by each host. See
 [Chat format](generation.md#chat-format).
 
-Gemma 4 and Nanbeige 4.3 are requested roadmap targets, not supported model
-families. Image and video models are future scope. See [Roadmap](roadmap.md).
+Gemma 4 remains a requested roadmap target, not a supported model family.
+Image and video models are future scope. See [Roadmap](roadmap.md).

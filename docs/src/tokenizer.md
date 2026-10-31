@@ -164,9 +164,10 @@ The pinned llama.cpp loader checks tensor file bounds even with
 `vocab_only`; the original range-read headers are unavailable to that
 loader. Neither benchmark includes model loading time.
 
-The Nanbeige/Gemma4 fixtures deliberately contain no weights. To measure
-llama.cpp's vocabulary tokenizer without fetching them, opt in to an
-explicit derived input:
+The Nanbeige/Gemma4 `vocab` fixtures deliberately contain no weights
+(Nanbeige's separate full-model target is `scripts/fixtures.sh nanbeige`).
+To measure llama.cpp's vocabulary tokenizer without fetching weights,
+opt in to an explicit derived input:
 
 ```sh
 scripts/fixtures.sh vocab

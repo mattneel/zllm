@@ -1,0 +1,459 @@
+{
+  "date": "2026-10-31",
+  "fixture": {
+    "repo": "AtomicChat/Nanbeige4.3-33B-GGUF",
+    "revision": "560e151e11dfdd4b008d394f6e16bf196a952bd0",
+    "file": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+    "bytes": 21161159680,
+    "sha256": "409c92c4355c81928f0f2de5d49481fe7e4d0fa4d381aa28eddee0dc4b358c49"
+  },
+  "native": {
+    "default_context8192": {
+      "webgpu": {
+        "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (d3d12)",
+        "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+        "model_bytes": 21161159680,
+        "load_ms": {
+          "total": 144626,
+          "pipelines": 1262,
+          "weights": 133343,
+          "quality": 1408,
+          "program": 483,
+          "calibration": 3155
+        },
+        "precision": {
+          "kv": "f32",
+          "prefill": "scalar_f32",
+          "weights": "stored"
+        },
+        "prefill": {
+          "tokens": 1024,
+          "steps": 95,
+          "ms": 27842.8798,
+          "tok_s": 36.777804859108
+        },
+        "decode": {
+          "tokens": 128,
+          "ms": 13163.0786,
+          "tok_s": 9.724168934158001,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "decode_plain": {
+          "tokens": 128,
+          "ms": 14049.7211,
+          "tok_s": 9.110501133008256,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "memory_observation": {
+          "unit": "MiB",
+          "scope": "nvidia-smi device total (includes desktop and other processes)",
+          "baseline": 970,
+          "peak": 23667,
+          "interval_ms": 200
+        },
+        "context": 8192
+      },
+      "agility": {
+        "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (agility)",
+        "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+        "model_bytes": 21161159680,
+        "load_ms": {
+          "total": 145093,
+          "pipelines": 1349,
+          "weights": 135715,
+          "quality": 2714,
+          "program": 255,
+          "calibration": 137
+        },
+        "precision": {
+          "kv": "f32",
+          "prefill": "fp16_single",
+          "weights": "stored"
+        },
+        "prefill": {
+          "tokens": 1024,
+          "steps": 129,
+          "ms": 45151.3511,
+          "tok_s": 22.67927703275307
+        },
+        "decode": {
+          "tokens": 128,
+          "ms": 10404.4476,
+          "tok_s": 12.302431125704357,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "decode_plain": {
+          "tokens": 128,
+          "ms": 10310.1193,
+          "tok_s": 12.414987283415817,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "memory_observation": {
+          "unit": "MiB",
+          "scope": "nvidia-smi device total (includes desktop and other processes)",
+          "baseline": 1315,
+          "peak": 23865,
+          "interval_ms": 200
+        },
+        "context": 8192
+      }
+    },
+    "context4096": {
+      "webgpu": {
+        "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (d3d12)",
+        "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+        "model_bytes": 21161159680,
+        "load_ms": {
+          "total": 144380,
+          "pipelines": 1313,
+          "weights": 139626,
+          "quality": 0,
+          "program": 1513,
+          "calibration": 1471
+        },
+        "precision": {
+          "kv": "f32",
+          "prefill": "scalar_f32",
+          "weights": "stored"
+        },
+        "prefill": {
+          "tokens": 1024,
+          "steps": 33,
+          "ms": 5274.3452,
+          "tok_s": 194.14732278046574
+        },
+        "decode": {
+          "tokens": 128,
+          "ms": 5618.6359,
+          "tok_s": 22.781330251351577,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "decode_plain": {
+          "tokens": 128,
+          "ms": 5649.9277,
+          "tok_s": 22.6551571624536,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "context": 4096,
+        "memory_observation": {
+          "unit": "MiB",
+          "scope": "nvidia-smi device total (includes desktop and other processes)",
+          "baseline": 903,
+          "peak": 23447,
+          "interval_ms": 200
+        }
+      },
+      "agility": {
+        "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (agility)",
+        "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+        "model_bytes": 21161159680,
+        "load_ms": {
+          "total": 99504,
+          "pipelines": 1177,
+          "weights": 96703,
+          "quality": 0,
+          "program": 455,
+          "calibration": 142
+        },
+        "precision": {
+          "kv": "f32",
+          "prefill": "fp16_single",
+          "weights": "stored"
+        },
+        "prefill": {
+          "tokens": 1024,
+          "steps": 129,
+          "ms": 30845.8298,
+          "tok_s": 33.19735622738864
+        },
+        "decode": {
+          "tokens": 128,
+          "ms": 5983.0659,
+          "tok_s": 21.393713881707374,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "decode_plain": {
+          "tokens": 128,
+          "ms": 6043.5646,
+          "tok_s": 21.179553536997023,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "context": 4096,
+        "memory_observation": {
+          "unit": "MiB",
+          "scope": "nvidia-smi device total (includes desktop and other processes)",
+          "baseline": 1002,
+          "peak": 23561,
+          "interval_ms": 200
+        }
+      }
+    },
+    "chat": {
+      "webgpu": {
+        "prompt": "Explain grouped-query attention in four concise sentences.",
+        "context": 4096,
+        "temperature": 0,
+        "thinking": false,
+        "response_stdout": "> **Grouped-Query Attention (GQA)** is an architectural variation of attention used in Transformer models that strikes a balance between computational efficiency and model quality. \n\nHere is the explanation in four concise sentences:\n\n1. **Definition & Mechanism:** Grouped-Query Attention reduces the number of key and value (K, V) projection heads relative to the query (Q) heads, allowing multiple query heads to share the same grouped key and value heads.\n2. **Efficiency Gain:** By sharing K and V weights, GQA significantly lowers the memory footprint and computational cost of the attention mechanism during both training and inference compared to standard Multi-Head Attention (MHA).\n3. **Quality Retention:** Unlike pure Multi-Query Attention (MQA), which uses only a\n> ",
+        "stderr": "anyzig: .minimum_zig_version '0.18.0-dev.738+ae9a8acc7' pulled from '/home/autark/src/zllm/build.zig.zon'\nanyzig: appdata '/home/autark/.local/share/anyzig'\nanyzig: zig '0.18.0-dev.738+ae9a8acc7' already exists at '/home/autark/.cache/zig/p/N-V-__8AADgW3Bb5lb-jBsyiB_zzQz3M1k3M5zPf2XNm1GGX'\nError: DynamicLib.Open: d3dcompiler_47.dll Windows Error: 87\r\n    at EnsureFXC (D:\\a\\dawn\\dawn\\src\\dawn\\native\\d3d\\PlatformFunctions.cpp:119)\r\n\r\nWarning: Couldn't load Vulkan: DynamicLib.Open: vulkan-1.dll Windows Error: 87\r\n    at operator () (D:\\a\\dawn\\dawn\\src\\dawn\\native\\vulkan\\BackendVk.cpp:321)\r\n\r\n[NVIDIA GeForce RTX 5090 Laptop GPU (d3d12); loaded in 144569 ms (pipelines 1417, weights 140011, tuning 1, quality 0, program 1281, calibration 1343); context 4096, f32 KV; prefill scalar_f32; weights stored; tuning from the plan cache; precision from the plan cache]\n\n[length; prompt 45 tokens (0 reused), prefill 45 in 3 steps, 617 ms (73 tok/s); 160 generated in 6823 ms (23.3 tok/s)]\n"
+      },
+      "agility": {
+        "prompt": "Explain grouped-query attention in four concise sentences.",
+        "context": 4096,
+        "temperature": 0,
+        "thinking": false,
+        "response_stdout": "> **Grouped-Query Attention (GQA)** is an architectural variation of attention used in Transformer models that strikes a balance between computational efficiency and model quality. \n\nHere is the explanation in four concise sentences:\n\n1. **Definition & Mechanism:** Grouped-Query Attention reduces the number of key and value (K, V) projection heads relative to the query (Q) heads, allowing multiple query heads to share the same grouped key and value heads.\n2. **Efficiency Gain:** By sharing K and V weights, GQA significantly lowers the memory footprint and computational cost of the attention mechanism during both training and inference compared to standard Multi-Head Attention (MHA).\n3. **Quality Retention:** Unlike pure Multi-Query Attention (MQA), which uses only a\n> ",
+        "stderr": "anyzig: .minimum_zig_version '0.18.0-dev.738+ae9a8acc7' pulled from '/home/autark/src/zllm/build.zig.zon'\nanyzig: appdata '/home/autark/.local/share/anyzig'\nanyzig: zig '0.18.0-dev.738+ae9a8acc7' already exists at '/home/autark/.cache/zig/p/N-V-__8AADgW3Bb5lb-jBsyiB_zzQz3M1k3M5zPf2XNm1GGX'\n[NVIDIA GeForce RTX 5090 Laptop GPU (agility); loaded in 94744 ms (pipelines 1162, weights 91913, tuning 10, quality 0, program 609, calibration 76); context 4096, f32 KV; prefill fp16_single; weights stored; tuning from the plan cache; precision from the plan cache]\n\n[length; prompt 45 tokens (0 reused), prefill 45 in 5 steps, 959 ms (47 tok/s); 160 generated in 7334 ms (21.7 tok/s)]\n"
+      }
+    }
+  },
+  "browser": {
+    "user_agent": "Chrome156 Windows; relay user Chrome",
+    "source": "localhost HTTP ranges, uncached",
+    "load": {
+      "adapter": "nvidia blackwell",
+      "cache": "off",
+      "last": null,
+      "loadMs": 52503.19999998808,
+      "model": {
+        "architecture": "llama",
+        "context": 8192,
+        "kv": "f16",
+        "max_tokens": 512,
+        "n_embd": 7168,
+        "n_layer": 52,
+        "resident_tokens": 0,
+        "sampling": {
+          "instruct": {
+            "frequency_penalty": 0,
+            "logit_bias": [],
+            "min_p": 0,
+            "presence_penalty": 0,
+            "repetition_penalty": 1,
+            "seed": 0,
+            "temperature": 1,
+            "top_k": 0,
+            "top_p": 1
+          },
+          "raw": {
+            "frequency_penalty": 0,
+            "logit_bias": [],
+            "min_p": 0,
+            "presence_penalty": 0,
+            "repetition_penalty": 1,
+            "seed": 0,
+            "temperature": 1,
+            "top_k": 0,
+            "top_p": 1
+          },
+          "thinking": {
+            "frequency_penalty": 0,
+            "logit_bias": [],
+            "min_p": 0,
+            "presence_penalty": 0,
+            "repetition_penalty": 1,
+            "seed": 0,
+            "temperature": 1,
+            "top_k": 0,
+            "top_p": 1
+          }
+        },
+        "tool_format": "xml",
+        "vocab": 166912
+      },
+      "recoveries": 0,
+      "tuning": "swept"
+    },
+    "ui_chat": {
+      "prompt": "What is 2 + 2? Answer with only the number.",
+      "content": "4",
+      "finish_reason": "stop",
+      "stats": {
+        "adapter": "nvidia blackwell",
+        "cache": "off",
+        "last": {
+          "cachedTokens": 0,
+          "completionTokens": 2,
+          "decodeMs": 99.499999,
+          "prefillMs": 726.699998,
+          "prefillSteps": 4,
+          "promptTokens": 49
+        },
+        "loadMs": 52503.19999998808,
+        "model": {
+          "architecture": "llama",
+          "context": 8192,
+          "kv": "f16",
+          "max_tokens": 512,
+          "n_embd": 7168,
+          "n_layer": 52,
+          "resident_tokens": 51,
+          "sampling": {
+            "instruct": {
+              "frequency_penalty": 0,
+              "logit_bias": [],
+              "min_p": 0,
+              "presence_penalty": 0,
+              "repetition_penalty": 1,
+              "seed": 0,
+              "temperature": 1,
+              "top_k": 0,
+              "top_p": 1
+            },
+            "raw": {
+              "frequency_penalty": 0,
+              "logit_bias": [],
+              "min_p": 0,
+              "presence_penalty": 0,
+              "repetition_penalty": 1,
+              "seed": 0,
+              "temperature": 1,
+              "top_k": 0,
+              "top_p": 1
+            },
+            "thinking": {
+              "frequency_penalty": 0,
+              "logit_bias": [],
+              "min_p": 0,
+              "presence_penalty": 0,
+              "repetition_penalty": 1,
+              "seed": 0,
+              "temperature": 1,
+              "top_k": 0,
+              "top_p": 1
+            }
+          },
+          "tool_format": "xml",
+          "vocab": 166912
+        },
+        "recoveries": 0,
+        "tuning": "swept"
+      }
+    },
+    "sustained_decode": {
+      "reply": {
+        "choices": [
+          {
+            "finish_reason": "length",
+            "index": 0,
+            "message": {
+              "content": "**Grouped-Query Attention (GQA)** is an architectural variation of attention used in Transformer models that strikes a balance between computational efficiency and model quality. \n\nHere is the explanation in four concise sentences:\n\n1. **Definition & Mechanism:** Grouped-Query Attention reduces the number of key and value (K, V) projection heads relative to the query (Q) heads, allowing multiple query heads to share the same grouped key and value heads.\n2. **Efficiency Gain:** By sharing K and V weights, GQA significantly lowers the memory footprint and computational cost of the attention mechanism during both training and inference",
+              "role": "assistant"
+            }
+          }
+        ],
+        "created": 1793454806,
+        "id": "chatcmpl-24ea7e36-04f4-4682-a6a5-8d6bb43cc71a",
+        "model": "zllm",
+        "object": "chat.completion",
+        "usage": {
+          "completion_tokens": 128,
+          "prompt_tokens": 45,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 173
+        }
+      },
+      "stats": {
+        "adapter": "nvidia blackwell",
+        "cache": "off",
+        "last": {
+          "cachedTokens": 0,
+          "completionTokens": 128,
+          "decodeMs": 5610.599949,
+          "prefillMs": 814.199998,
+          "prefillSteps": 4,
+          "promptTokens": 45
+        },
+        "loadMs": 52503.19999998808,
+        "model": {
+          "architecture": "llama",
+          "context": 8192,
+          "kv": "f16",
+          "max_tokens": 512,
+          "n_embd": 7168,
+          "n_layer": 52,
+          "resident_tokens": 172,
+          "sampling": {
+            "instruct": {
+              "frequency_penalty": 0,
+              "logit_bias": [],
+              "min_p": 0,
+              "presence_penalty": 0,
+              "repetition_penalty": 1,
+              "seed": 0,
+              "temperature": 1,
+              "top_k": 0,
+              "top_p": 1
+            },
+            "raw": {
+              "frequency_penalty": 0,
+              "logit_bias": [],
+              "min_p": 0,
+              "presence_penalty": 0,
+              "repetition_penalty": 1,
+              "seed": 0,
+              "temperature": 1,
+              "top_k": 0,
+              "top_p": 1
+            },
+            "thinking": {
+              "frequency_penalty": 0,
+              "logit_bias": [],
+              "min_p": 0,
+              "presence_penalty": 0,
+              "repetition_penalty": 1,
+              "seed": 0,
+              "temperature": 1,
+              "top_k": 0,
+              "top_p": 1
+            }
+          },
+          "tool_format": "xml",
+          "vocab": 166912
+        },
+        "recoveries": 0,
+        "tuning": "swept"
+      }
+    },
+    "decode_tok_s": 22.6357254401351,
+    "memory": {
+      "unit": "MiB",
+      "scope": "nvidia-smi device total including desktop and other processes",
+      "baseline": 986,
+      "peak": 23618,
+      "interval_ms": 200,
+      "samples": 830
+    },
+    "cleanup": "engine unloaded, owned tab closed, demo server and memory sampler stopped"
+  },
+  "model_quality_gate": {
+    "pass": false,
+    "hosts": [
+      "d3d12",
+      "agility"
+    ],
+    "failed_assertions_per_host": 10,
+    "strict_decode_top1": [
+      200,
+      200
+    ],
+    "first_layer_gpu_vs_rounded": 0.004112237921609885,
+    "first_layer_rounded_vs_llama": 0.001672560438730909,
+    "unchanged_first_layer_bound": 0.0001,
+    "all_layer_decode_max_relative_l2": 4.5196102355626354e-05,
+    "reference_top1_vs_llama": [
+      877,
+      901
+    ]
+  }
+}

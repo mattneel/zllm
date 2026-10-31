@@ -13,9 +13,9 @@ as accurately as the hardware allows, on every supported platform.
 - **Platform backends:** WebGPU through Dawn natively and wasm in the
   browser; Agility for native D3D12 with Agility SDK and DirectStorage
   integration. CUDA is planned, not implemented.
-- **Models:** Qwen 3.5/3.6/3.8 hybrid; Qwen 3, Llama 3 and Granite 4 dense;
-  Qwen3.8-Flash-Next Gyro-Coder with MoE, hyper-connections, sparse attention
-  and per-layer embeddings.
+- **Models:** Qwen 3.5/3.6/3.8 hybrid; Qwen 3, Llama 3, Nanbeige 4.3
+  and Granite 4 dense; Qwen3.8-Flash-Next Gyro-Coder with MoE,
+  hyper-connections, sparse attention and per-layer embeddings.
 - **Accuracy gates:** GPU kernels are checked against CPU references;
   model gates compare with the reference and pinned upstream runtimes.
   Available lower-precision formats are not a blanket quality guarantee.
@@ -29,6 +29,11 @@ See the [status](https://mattneel.github.io/zllm/introduction.html#status),
 [dated performance results](https://mattneel.github.io/zllm/performance.html).
 Coverage is fixture- and device-specific; the documentation distinguishes
 implemented paths, validated configurations and roadmap goals.
+
+Nanbeige 4.3 loads and chats on both native backends and in Chrome, but its
+unchanged first-layer model-parity gate still fails. See the
+[recorded limitation](https://mattneel.github.io/zllm/dense.html#nanbeige-43-33b);
+it is not a fully quality-gated configuration.
 
 ## Quick start
 

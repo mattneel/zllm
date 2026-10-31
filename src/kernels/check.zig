@@ -42,22 +42,22 @@ pub fn run(gpa: Allocator, device: platform.Device, host: *Host, out: *std.Io.Wr
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,         checkMatmul,                  checkMatmulChunked,           checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair,  checkMatmulF16,               checkMatvecNormF16,           checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,         checkEmbed,                   checkRopeAppendF32,           checkRopeAppendF16,     checkRopeAppendRounding,
-        checkRopeAppendDense, checkRopeAppendQwen3,         checkRopeAppendFp8Values,     checkRopeAppendFp8,     checkAttentionF32,
-        checkAttentionF16,    checkAttentionFp8,            checkAttentionWide,           checkAttentionUngated,  checkAttnDecode,
-        checkAttnDecodeWide,  checkAttnDecodeUngated,       checkAttnSparse,              checkQsaIndexer,        checkDeltaPrep,
-        checkDeltaKeep,       checkDeltaRule,               checkGatedNormSigmoid,        checkDraft,             checkGyroMatvec,
-        checkMoeRoute,        checkRotate128,               checkMoeCombine,              checkHc,                checkPle,
-        checkSampleGreedy,    checkSampleTopKTopP,          checkSampleMinP,              checkSampleTopP,        checkSamplePlain,
-        checkSampleTopK1,     checkSampleLargeTopK,         checkSampleTopKSkipped,       checkSampleVocab,       Quant(.q8_0).matvec,
-        Quant(.q8_0).matmul,  Quant(.q8_0).embed,           checkEmbedStride,             Quant(.q3_k).matvec,    Quant(.q3_k).matmul,
-        Quant(.q3_k).embed,   Quant(.q4_k).matvec,          Quant(.q4_k).matmul,          Quant(.q4_k).embed,     Quant(.q5_k).matvec,
-        Quant(.q5_k).matmul,  Quant(.q5_k).embed,           Quant(.q6_k).matvec,          Quant(.q6_k).matmul,    Quant(.q6_k).embed,
-        checkQuantTiles,      checkQuantSiluPair,           checkQuantAct,                checkQuantizeQ8K,       checkQuantizeQ80,
-        checkQuantizeNorm,    checkQuantizeSilu,            checkGyroMatmul,              checkMatmulQ80Float,    checkQuantQ80Tiles,
-        checkRmsNormDiscrete, checkQuantizeNormQ8KDiscrete, checkQuantizeNormQ80Discrete,
+        checkRmsNorm,         checkMatmul,            checkMatmulChunked,       checkMatvec,                  checkMatvecNorm,
+        checkMatvecSiluPair,  checkMatmulF16,         checkMatvecNormF16,       checkMatvecSiluPairF16,       checkEmbedF16,
+        checkSiluMul,         checkEmbed,             checkRopeAppendF32,       checkRopeAppendF16,           checkRopeAppendRounding,
+        checkRopeAppendDense, checkRopeAppendQwen3,   checkRopeAppendFp8Values, checkRopeAppendFp8,           checkAttentionF32,
+        checkAttentionF16,    checkAttentionFp8,      checkAttentionWide,       checkAttentionUngated,        checkAttnDecode,
+        checkAttnDecodeWide,  checkAttnDecodeUngated, checkAttnSparse,          checkQsaIndexer,              checkDeltaPrep,
+        checkDeltaKeep,       checkDeltaRule,         checkGatedNormSigmoid,    checkDraft,                   checkGyroMatvec,
+        checkMoeRoute,        checkRotate128,         checkMoeCombine,          checkHc,                      checkPle,
+        checkSampleGreedy,    checkSampleTopKTopP,    checkSampleMinP,          checkSampleTopP,              checkSamplePlain,
+        checkSampleTopK1,     checkSampleLargeTopK,   checkSampleTopKSkipped,   checkSampleVocab,             Quant(.q8_0).matvec,
+        Quant(.q8_0).matmul,  Quant(.q8_0).embed,     checkEmbedStride,         Quant(.q3_k).matvec,          Quant(.q3_k).matmul,
+        Quant(.q3_k).embed,   Quant(.q4_k).matvec,    Quant(.q4_k).matmul,      Quant(.q4_k).embed,           Quant(.q5_k).matvec,
+        Quant(.q5_k).matmul,  Quant(.q5_k).embed,     Quant(.q6_k).matvec,      Quant(.q6_k).matmul,          Quant(.q6_k).embed,
+        Quant(.iq4_xs).embed, checkEmbedIq4Xs,        checkQuantTiles,          checkQuantSiluPair,           checkQuantAct,
+        checkQuantizeQ8K,     checkQuantizeQ80,       checkQuantizeNorm,        checkQuantizeSilu,            checkGyroMatmul,
+        checkMatmulQ80Float,  checkQuantQ80Tiles,     checkRmsNormDiscrete,     checkQuantizeNormQ8KDiscrete, checkQuantizeNormQ80Discrete,
     }) |f| {
         ok = try report(&ctx, f, out) and ok;
         _ = arena_state.reset(.retain_capacity);
@@ -467,7 +467,7 @@ fn quantRows(c: *Ctx, t: gguf.TensorType, rows: usize, k: usize) !struct { bytes
     const bytes = try c.arena.alloc(u8, n_blocks * l.block_bytes);
     c.rand.bytes(bytes);
     const scales: []const usize = switch (t) {
-        .q8_0 => &.{0},
+        .q8_0, .iq4_xs => &.{0},
         .q3_k => &.{108},
         .q4_k, .q5_k => &.{ 0, 2 },
         .q6_k => &.{208},
@@ -914,6 +914,75 @@ fn checkEmbedStride(c: *Ctx) !Result {
         want[i * dim + e] = table.values[tok * dim + e];
     };
     return .{ .name = "embed q8_0, rows 172 bytes apart", .err = relErr(got, want), .tolerance = 1e-6 };
+}
+
+/// Nonlinear indices, all 64 biased scales (including zero), signed block
+/// scales and unequal subblocks expose nibble swaps, missing scale high
+/// bits and linear-nibble decoders. More than 256 units also exercises the
+/// embedding workgroup's second loop iteration. Check both the repadded
+/// model layout and raw, explicitly strided GGUF rows in two table chunks;
+/// skipped tokens must retain their sentinel after each dispatch.
+fn checkEmbedIq4Xs(c: *Ctx) !Result {
+    const vocab = 8;
+    const dim = 8448;
+    const split = 3;
+    const block_bytes = 136;
+    const blocks_per_row = dim / 256;
+    const row_bytes = blocks_per_row * block_bytes;
+    const raw = try c.arena.alloc(u8, vocab * row_bytes);
+    for (0..vocab * blocks_per_row) |b| {
+        const block = raw[b * block_bytes ..][0..block_bytes];
+        @memset(block, 0);
+        const ds = [_]f16{ 0.0078125, -0.01171875, 0.009765625, 0, -0.00390625 };
+        std.mem.writeInt(u16, block[0..2], @bitCast(ds[b % ds.len]), .little);
+        var high: u16 = 0;
+        for (0..8) |s| {
+            const scale: u8 = @intCast((b * 8 + s) % 64);
+            block[4 + s / 2] |= (scale & 15) << @intCast(4 * (s % 2));
+            high |= @as(u16, scale >> 4) << @intCast(2 * s);
+            for (0..16) |i| {
+                const lo: u8 = @intCast((i + 3 * s + b) % 16);
+                const hi: u8 = @intCast((15 - i + 5 * s + 3 * b) % 16);
+                block[8 + 16 * s + i] = lo | (hi << 4);
+            }
+        }
+        std.mem.writeInt(u16, block[2..4], high, .little);
+    }
+    const values = try c.arena.alloc(f32, vocab * dim);
+    try ref_tensor.dequantize(.iq4_xs, raw, values);
+    const tokens = [_]u32{ 7, 0, 2, 3, 4, 7, 1, 8 };
+    const ta = try c.upload(&tokens);
+    const init = try c.arena.alloc(f32, tokens.len * dim);
+    @memset(init, -9999);
+    var err: f64 = 0;
+    for ([_]bool{ false, true }) |strided| {
+        const out = try c.upload(init);
+        const want = try c.arena.alloc(f64, init.len);
+        for (want) |*v| v.* = -9999;
+        for ([_][2]u32{ .{ 0, split }, .{ split, vocab - split } }) |chunk| {
+            const bytes = raw[chunk[0] * row_bytes ..][0 .. chunk[1] * row_bytes];
+            const stride = row_bytes + 4;
+            const wa = if (strided) blk: {
+                const spaced = try c.arena.alloc(u8, std.mem.alignForward(usize, chunk[1] * stride, 16));
+                @memset(spaced, 0xa5);
+                for (0..chunk[1]) |r| @memcpy(spaced[r * stride ..][0..row_bytes], bytes[r * row_bytes ..][0..row_bytes]);
+                break :blk try c.upload(spaced);
+            } else try gpuWeights(c, .iq4_xs, bytes, dim);
+            try c.launcher().launch(.embed_iq4_xs, P.EmbedBf16{
+                .dim = dim,
+                .row0 = chunk[0],
+                .chunk_rows = chunk[1],
+                .stride = if (strided) stride else 0,
+            }, &.{ ta, wa, out }, .{ tokens.len, 1, 1 });
+            for (tokens, 0..) |tok, t| {
+                if (tok < chunk[0] or tok >= chunk[0] + chunk[1]) continue;
+                for (0..dim) |i| want[t * dim + i] = values[tok * dim + i];
+            }
+            err = @max(err, relErr(try c.read(out), want));
+        }
+    }
+    // Power-of-two d values make every decoded f32 exactly representable.
+    return .{ .name = "embed iq4_xs (codes, scales, stride)", .err = err, .tolerance = 0 };
 }
 
 /// The decode multiply on quantized weights: 3 tokens, 100 outputs (a

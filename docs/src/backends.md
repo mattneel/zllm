@@ -24,6 +24,7 @@ available backend, option or performance claim.
 | Kernel artifacts | Hand-written WGSL and rendered WGSL templates | Same WGSL catalog as the browser | Hand-written HLSL and templates, compiled by DXC to DXIL | No CUDA/PTX artifacts |
 | Current kernel coverage | Full `kernels.Kernel` catalog | Full `kernels.Kernel` catalog | Full catalog in `src/agility/kernels.zig` | None |
 | Supported model plans | Shared Qwen 3.5, dense and Qwen3.8-Flash-Next programs | Same programs | Same programs | Not available |
+| Nanbeige 4.3 AD-Q4_K_M | 21 GB load and chat exercised in Chrome; IQ4_XS embeddings; first-layer model gate not passed | Native load/chat exercised; same quality limitation | Native load/chat exercised; matching HLSL decoder; same quality limitation | Not available |
 | Plan-built fusions | Implemented: stacked projections, norm/activation prologues, residual adds and model-specific combined kernels | Same shared plan construction | Same contracts with HLSL implementations | Not available |
 | Fusion pass | Implemented: `hc_act` into quantized decode matvec, under single-reader and layout rules | Same pass | Same pass and HLSL prologue | Not available |
 | Load-time tuning | Implemented: quantized decode matvec variants, correctness check before timing | Same sweep | Same sweep over HLSL variants | No catalog or sweep path |

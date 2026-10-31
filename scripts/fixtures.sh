@@ -5,6 +5,7 @@
 #   scripts/fixtures.sh vocab    tokenizer-only GGUF headers + Hugging Face tokenizer files
 #   scripts/fixtures.sh model    the full 0.8B BF16 GGUF (1.5 GB)
 #   scripts/fixtures.sh dense    the dense models' full GGUFs (Qwen 3, Llama 3.2, Granite 4.2; 11 GB)
+#   scripts/fixtures.sh nanbeige Nanbeige4.3-33B AD-Q4_K_M (21.16 GB; opt-in)
 #   scripts/fixtures.sh llama    llama.cpp at the pinned commit, built for CPU
 #   scripts/fixtures.sh dawn     Dawn (webgpu.h) as libwebgpu_dawn.so; under WSL with
 #                                Visual Studio, also webgpu_dawn.dll staged with DXC
@@ -30,6 +31,13 @@ gguf27_repo="0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF"
 gguf27_rev="ab8d7bd81d03117501e4da60cccdff4c80f0eea0"
 gguf27_file="RVN-Q3_K_M-mtp.gguf"
 gguf27_sha256="249b354e8e0a6984c903d5c099b9e9d054c1d5580b32e8dd818273dbacdb9a2c"
+
+# Nanbeige uses the existing dense llama graph, with IQ4_XS embeddings.
+# Opt-in rather than part of `all`, like the other large-model fixture.
+nanbeige_repo="AtomicChat/Nanbeige4.3-33B-GGUF"
+nanbeige_rev="560e151e11dfdd4b008d394f6e16bf196a952bd0"
+nanbeige_file="Nanbeige4.3-33B-AD-Q4_K_M.gguf"
+nanbeige_sha256="409c92c4355c81928f0f2de5d49481fe7e4d0fa4d381aa28eddee0dc4b358c49"
 
 hf_repo="Qwen/Qwen3.5-0.8B"
 hf_rev="2fc06364715b967f1860aea9cf38778875588b17"
@@ -167,6 +175,11 @@ dense() {
 model27b() {
 	fetch "https://huggingface.co/$gguf27_repo/resolve/$gguf27_rev/$gguf27_file" \
 		"$dir/models/$gguf27_file" "$gguf27_sha256"
+}
+
+nanbeige() {
+	fetch "https://huggingface.co/$nanbeige_repo/resolve/$nanbeige_rev/$nanbeige_file" \
+		"$dir/models/$nanbeige_file" "$nanbeige_sha256"
 }
 
 llama() {
@@ -314,6 +327,7 @@ vocab) vocab ;;
 model) model ;;
 dense) dense ;;
 model27b) model27b ;;
+nanbeige) nanbeige ;;
 llama) llama ;;
 dawn) dawn ;;
 agility) agility ;;
@@ -326,7 +340,7 @@ all)
 	agility
 	;;
 *)
-	log "usage: $0 [all|vocab|model|dense|model27b|llama|dawn|agility]"
+	log "usage: $0 [all|vocab|model|dense|model27b|nanbeige|llama|dawn|agility]"
 	exit 2
 	;;
 esac

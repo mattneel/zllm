@@ -84,6 +84,7 @@
         <option value="https://huggingface.co/ibm-granite/granite-4.2-3b-GGUF/resolve/c40945d71cd90f249a56985e8155551a9188dc30/granite-4.2-3b-bf16.gguf">Granite 4.2 3B BF16 (6.8 GB)</option>
         <option value="https://huggingface.co/ibm-granite/granite-4.2-30b-GGUF/resolve/27b350a791e81d9a4d1ddca1c49282e9ec533768/granite-4.2-30b-Q4_K_M.gguf">Granite 4.2 30B Q4_K_M (17.7 GB)</option>
         <option value="https://huggingface.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF/resolve/ab8d7bd81d03117501e4da60cccdff4c80f0eea0/RVN-Q3_K_M-mtp.gguf">Qwen3.8 27B Q3_K_M with MTP (13.8 GB)</option>
+        <option value="https://huggingface.co/AtomicChat/Nanbeige4.3-33B-GGUF/resolve/560e151e11dfdd4b008d394f6e16bf196a952bd0/Nanbeige4.3-33B-AD-Q4_K_M.gguf">Nanbeige 4.3 33B AD-Q4_K_M (21.2 GB; parity gate fails)</option>
       </select>
       <input id="model-url" value="https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/807dfd9a6fadbf703207aac3bfb0b2b3040d077c/Qwen3.5-0.8B-BF16.gguf" aria-label="Model URL" />
       <button id="load-url">Load URL</button>
@@ -91,6 +92,7 @@
       <button id="clear-cache" type="button">Clear cache</button>
     </fieldset>
     <p id="status">WebGPU, GGUF in, tokens out. Pick a model, paste a GGUF URL, or open a file.</p>
+    <p>Nanbeige loads and chats, but its first-layer model-parity gate still fails; see the <a href="https://mattneel.github.io/zllm/dense.html#nanbeige-43-33b">recorded limitation</a>.</p>
     <progress id="progress" value="0" max="1" hidden></progress>
     <div id="log"></div>
     <form id="chat" hidden>

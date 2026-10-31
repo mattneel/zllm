@@ -217,7 +217,7 @@ pub const Model = struct {
         const table = try PleTable.find(file, hp);
         return .{
             .hp = hp,
-            .tok_embd = try u.matrix("token_embd.weight", null, e, hp.vocab),
+            .tok_embd = try u.embedding(e, hp.vocab),
             .output = try u.matrix("output.weight", null, e, hp.vocab),
             .hc_head = .{
                 .norm = try u.vector("output_hc_norm.weight", null, hd),

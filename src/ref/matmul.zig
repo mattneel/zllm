@@ -150,7 +150,7 @@ pub const Activations = enum {
     f32,
     /// Rounded as llama.cpp's CPU backend rounds them for each weight type's
     /// dot product (`vec_dot_type`): to bf16 for bf16 weights, to Q8_0 blocks
-    /// for Q8_0 and to Q8_K blocks for the K-quants. A diagnostic: it shows
+    /// for Q8_0 and to Q8_K blocks for the K-quants and IQ4_XS. A diagnostic: it shows
     /// how much of a difference from llama.cpp that rounding explains.
     llama_cpp,
 };
@@ -221,7 +221,7 @@ pub fn roundLikeLlama(t: gguf.TensorType, x: []f32) void {
                 }
             }
         },
-        .q3_k, .q4_k, .q5_k, .q6_k => {
+        .q3_k, .q4_k, .q5_k, .q6_k, .iq4_xs => {
             var b: usize = 0;
             while (b < x.len) : (b += 256) {
                 const blk = x[b..][0..256];
@@ -336,40 +336,59 @@ test "matmul matches the naive product for every remainder and pool size" {
 test "quantized matrices decode panels on the fly" {
     const gpa = std.testing.allocator;
     const n = 70; // two full panels and a partial one
-    const k = 64;
+    const k = 512; // multiple decode chunks, including IQ4_XS block boundaries
     const rows = 9;
     var prng: std.Random.DefaultPrng = .init(2);
     const r = prng.random();
-    // Q8_0 blocks: f16 scale, then 32 random int8 quants.
-    const bytes = try gpa.alloc(u8, n * k / 32 * 34);
-    defer gpa.free(bytes);
-    r.bytes(bytes);
-    for (0..n * k / 32) |b| std.mem.writeInt(u16, bytes[b * 34 ..][0..2], @bitCast(@as(f16, @floatCast(r.float(f32) - 0.5))), .little);
-    const w = try gpa.alloc(f32, n * k);
-    defer gpa.free(w);
-    try tensor.dequantize(.q8_0, bytes, w);
-    const x = try gpa.alloc(f32, rows * k);
-    defer gpa.free(x);
-    for (x) |*v| v.* = r.float(f32) - 0.5;
-    const out = try gpa.alloc(f32, rows * n);
-    defer gpa.free(out);
-
     const pool = try Pool.init(gpa, std.testing.io, 3);
     defer pool.deinit();
-    var m = try Matrix.init(gpa, pool, .q8_0, bytes, n, k);
-    defer m.deinit(gpa);
-    try std.testing.expect(m.quant != null);
+    for ([_]gguf.TensorType{ .q8_0, .iq4_xs }) |t| {
+        const layout = t.layout().?;
+        const blocks = n * k / layout.block_elems;
+        const bytes = try gpa.alloc(u8, blocks * layout.block_bytes);
+        defer gpa.free(bytes);
+        r.bytes(bytes);
+        // Small dyadic scales and activations keep the expected dot exact.
+        for (0..blocks) |b| std.mem.writeInt(u16, bytes[b * layout.block_bytes ..][0..2], @bitCast(@as(f16, if (b % 2 == 0) 0.0009765625 else -0.0009765625)), .little);
+        const w = try gpa.alloc(f32, n * k);
+        defer gpa.free(w);
+        try tensor.dequantize(t, bytes, w);
+        const x = try gpa.alloc(f32, rows * k);
+        defer gpa.free(x);
+        for (x) |*v| v.* = @as(f32, @floatFromInt(r.intRangeAtMost(i32, -4, 4))) / 8;
+        const out = try gpa.alloc(f32, rows * n);
+        defer gpa.free(out);
 
-    var got_row: [k]f32 = undefined;
-    m.row(n - 1, &got_row);
-    try std.testing.expectEqualSlices(f32, w[(n - 1) * k ..][0..k], &got_row);
+        var m = try Matrix.init(gpa, pool, t, bytes, n, k);
+        defer m.deinit(gpa);
+        try std.testing.expect(m.quant != null);
+        try std.testing.expectEqual(t, m.type);
 
-    matmul(pool, out, x, &m, rows, .f32);
-    for (0..rows) |t| for (0..n) |j| {
-        var want: f32 = 0;
-        for (0..k) |i| want += x[t * k + i] * w[j * k + i];
-        try std.testing.expectApproxEqAbs(want, out[t * n + j], 1e-4);
-    };
+        var got_row: [k]f32 = undefined;
+        for ([_]usize{ 0, panel, n - 1 }) |j| {
+            m.row(j, &got_row);
+            try std.testing.expectEqualSlices(f32, w[j * k ..][0..k], &got_row);
+        }
+
+        matmul(pool, out, x, &m, rows, .f32);
+        for (0..rows) |token| for (0..n) |j| {
+            var want: f32 = 0;
+            for (0..k) |i| want += x[token * k + i] * w[j * k + i];
+            try std.testing.expectApproxEqAbs(want, out[token * n + j], 1e-4);
+        };
+    }
+}
+
+test "IQ4_XS llama.cpp activations use Q8_K rounding" {
+    var x: [512]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 41)) - 20)) / 23;
+    x[0] = 2.75;
+    x[256] = -3.25;
+    var want = x;
+    roundLikeLlama(.q6_k, &want);
+    try std.testing.expect(!std.mem.eql(f32, &x, &want));
+    roundLikeLlama(.iq4_xs, &x);
+    try std.testing.expectEqualSlices(f32, &want, &x);
 }
 
 test "Q8_K and actual x86 Q8_0 round halfway values to even" {
