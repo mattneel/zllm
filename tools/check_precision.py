@@ -10,9 +10,9 @@ Runs the Qwen3.5-0.8B fixture and, with --gyro-model, the supplied Gyro-Coder.
 GPU hosts and Windows path mapping are shared with check_gpu.py. All model
 and CPU/GPU jobs run sequentially; this harness never launches parallel work.
 
-Both CPU oracles use f32 attention KV. Gyro explicitly requests `forward
---kv f32`; its ordinary reference default and sparse indexer keys remain f16.
-The report labels reference_kv=f32 without changing any quality threshold.
+Both CPU oracles explicitly use f16 attention KV, the automatic ladder's
+reference and ceiling. Explicit f32 KV remains supported but is never an
+automatic candidate. No quality threshold changes with the reference format.
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ def valid_selection(selection) -> bool:
     return (
         isinstance(selection, dict)
         and set(selection) == {"kv", "prefill", "weights"}
-        and selection["kv"] in ("fp8", "f16", "f32")
+        and selection["kv"] in ("fp8", "f16")
         and selection["prefill"] in ("fp16_single", "fp16_compensated", "scalar_f32")
         and selection["weights"] == "stored"
     )
@@ -103,7 +103,7 @@ def validate_report(fail: Failures, label: str, report: dict, positions: int) ->
     except ValueError:
         fail.expect(f"{label}: finite report", False, "nonfinite precision-check report")
         return False
-    valid = valid_selection(report["selection"]) and report["gate"] == GATE
+    valid = valid_selection(report["selection"]) and report["gate"] == GATE and report.get("reference_kv") == "f16"
     fail.expect(f"{label}: selection and policy", valid, repr((report["selection"], report["gate"])))
     if not valid:
         return False
@@ -141,9 +141,9 @@ def main() -> int:
         ),
     )
     paths = fixture_paths(args.fixtures)
-    models = [(paths.gguf, ())]
+    models = [(paths.gguf, ("--kv", "f16"))]
     if args.gyro_model is not None:
-        models.append((args.gyro_model.resolve(), ("--kv", "f32")))
+        models.append((args.gyro_model.resolve(), ("--kv", "f16")))
     for model, _ in models:
         if not model.is_file():
             raise SystemExit(f"model not found at {model}")
@@ -175,14 +175,14 @@ def main() -> int:
                 continue
             cpu_path = work / f"{index}-cpu.bin"
             print(f"[{label}: CPU reference for {n} calibration positions]", flush=True)
-            cached_reference(paths, "zllm-forward precision --kv f32", model, tokens, cpu_path, [args.zllm, "forward", str(model), str(tokens), str(cpu_path), *cpu_options])
+            cached_reference(paths, "zllm-forward precision --kv f16", model, tokens, cpu_path, [args.zllm, "forward", str(model), str(tokens), str(cpu_path), *cpu_options])
             cpu = read_records(cpu_path)
             if "result_output" not in cpu:
                 fail.expect(f"{label}: CPU logits", False, "missing result_output")
                 continue
             chosen = chosen.reshape(n, -1)
             metrics = compare_reference(fail, label, chosen, cpu["result_output"], report["gate"])
-            reports.append({"model": str(model), "host": args.host, **report, "reference_kv": "f32", "cpu_metrics": metrics})
+            reports.append({"model": str(model), "host": args.host, **report, "reference_kv": "f16", "cpu_metrics": metrics})
             if metrics is not None:
                 print(f"  {report['selection']}: CPU top-1 {metrics['top1_matches']}/{n}, mean KL {metrics['mean_kl']:.6g}, max rel L2 {metrics['max_rel_l2']:.6g}")
     report_path = paths.root / "reports" / "precision.json"

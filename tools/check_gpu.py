@@ -297,7 +297,7 @@ def main() -> int:
         fail.expect("top-1 agreement", agree == total, f"{agree}/{total}")
         fail.expect("decode top-1 agreement", decode_agree == decode_total, f"{decode_agree}/{decode_total}")
         return fail.report()
-    proc = zllm_on_host(args, paths, "engine-check", paths.gguf, "--precision", "exact")
+    proc = zllm_on_host(args, paths, "engine-check", paths.gguf, "--precision", "exact", "--kv", "f32")
     print(f"\n{args.host}, engine-check:")
     sys.stdout.write("".join(line + "\n" for line in proc.stdout.replace("\r", "").splitlines() if line.startswith(("PASS", "FAIL"))))
     if proc.returncode != 0:

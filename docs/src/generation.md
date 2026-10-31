@@ -20,7 +20,7 @@ Use `chat` for a conversation rendered with the model's chat template, and
 | `--max-tokens N` | Limit the generated tokens per turn; default 4096 |
 | `--ctx N` | Allocate context capacity; default 8192 tokens |
 | `--kv f16\|f32\|fp8` | Force the attention cache format instead of its default quality ladder |
-| `--precision exact` | Force f32 KV and scalar-f32 prefill operands; overrides `--kv` |
+| `--precision exact` | Force scalar-f32 prefill operands and f16 KV, unless `--kv` explicitly selects another format |
 | `--temperature`, `--top-k`, `--top-p`, `--min-p` | Override the model's sampling defaults |
 | `--repetition-penalty`, `--presence-penalty`, `--frequency-penalty` | Control repetition |
 | `--seed N` | Set the sampler's random seed |
@@ -33,8 +33,10 @@ Context capacity includes both the prompt and the generated reply. A request
 finishes with `length` when either its output limit or context capacity is
 reached. By default native loading walks each supported precision ladder
 against a fixed model-quality probe and prints the chosen KV, prefill
-operand and stored-weight rungs. `--kv` opts only that class out;
-`--precision exact` opts all selectable classes out. `ZLLM_KV` and
+operand and stored-weight rungs. The automatic KV ladder is FP8 → f16;
+f32 KV is available on explicit request (`--kv f32`). `--kv` opts only that
+class out. `--precision exact` opts selectable operands out and defaults KV to f16;
+an explicit `--kv` still wins. `ZLLM_KV` and
 `ZLLM_PRECISION=auto|exact` supply environment defaults, overridden by flags.
 A valid plan-cache hit restores the quality choice and skips calibration;
 `--no-tune` disables only decode tuning, not this gate.
@@ -213,8 +215,9 @@ recorded hardware results and a software-renderer exception are in
 
 KV is one contiguous cache per attention layer, sized for the context
 (8192 tokens by default). An f16 cache uses 12 KiB per token for the 0.8B
-model; the native ladder may choose FP8 or f32 instead. The spec's 256-token
-pages describe a shared sequence pool, not this single-sequence allocation.
+model; the native ladder may choose FP8 instead. f32 is available only by
+explicit request. The spec's 256-token pages describe a shared sequence
+pool, not this single-sequence allocation.
 
 ### Device recovery
 

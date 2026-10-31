@@ -4,6 +4,8 @@
 //! Teacher-forced like the Qwen 3.5 reference: one call runs a whole token
 //! sequence from an empty state and reports each layer's output, the final
 //! normed hidden state and the logits under llama.cpp's tensor names.
+//! Full-attention K/V can round through binary16 after RoPE/projection;
+//! selecting no format preserves the existing f32 reference bitwise.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,6 +21,7 @@ const qwen35 = @import("qwen35.zig");
 
 pub const Hparams = graph.Hparams;
 pub const Observer = qwen35.Model.Observer;
+pub const KvFormat = qwen35.KvFormat;
 
 const Layer = struct {
     attn_norm: []f32,
@@ -37,6 +40,8 @@ const Layer = struct {
 
 pub const Model = struct {
     hp: Hparams,
+    /// Select before forward; model loading and existing callers default to f32.
+    kv_format: KvFormat = .f32,
     /// Embeddings (row j = token j), also the LM head when tied.
     tok_embd: Matrix,
     /// Separate LM head, or null when tied to `tok_embd`.
@@ -209,7 +214,7 @@ fn attention(gpa: Allocator, m: *const Model, w: *const Layer, h: []const f32, o
         w: *const Layer,
         q: []f32,
         k: []f32,
-        v: []const f32,
+        v: []f32,
         attn: []f32,
         n: usize,
 
@@ -233,7 +238,12 @@ fn attention(gpa: Allocator, m: *const Model, w: *const Layer, h: []const f32, o
             for (first..last) |t| {
                 const pos: u32 = @intCast(t);
                 for (0..p.n_head) |hh| c.normRopeOne(c.head(c.q, t, p.n_head, hh), c.w.q_norm, pos);
-                for (0..p.n_head_kv) |kvh| c.normRopeOne(c.head(c.k, t, p.n_head_kv, kvh), c.w.k_norm, pos);
+                for (0..p.n_head_kv) |kvh| {
+                    const kh = c.head(c.k, t, p.n_head_kv, kvh);
+                    c.normRopeOne(kh, c.w.k_norm, pos);
+                    c.m.kv_format.round(kh);
+                    c.m.kv_format.round(c.head(c.v, t, p.n_head_kv, kvh));
+                }
             }
         }
 
@@ -267,4 +277,106 @@ fn attention(gpa: Allocator, m: *const Model, w: *const Layer, h: []const f32, o
     pool.parallelFor(n, 1, 1, &ctx, Ctx.normRope);
     pool.parallelFor(hp.n_head * n, 1, 1, &ctx, Ctx.attend);
     mm.matmul(pool, out, attn, &w.wo, n, act);
+}
+
+test "dense attention f16 KV rounds post-RoPE keys and projected values" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const pool = try Pool.init(std.testing.allocator, std.testing.io, 1);
+    defer pool.deinit();
+    var hp = std.mem.zeroes(Hparams);
+    hp.n_embd = 2;
+    hp.n_head = 1;
+    hp.n_head_kv = 1;
+    hp.head_dim = 2;
+    hp.n_rot = 2;
+    hp.rope_base = 10000;
+    hp.rms_eps = 1e-5;
+    hp.attn_scale = 1 / @sqrt(@as(f32, 2));
+    const input = [_]f32{ 1, 0, 0, 1 };
+    const query_weights = [_]f32{ 0.234567, 0.7654321, -0.987654, 1.234567 };
+    const key_weights = [_]f32{ 0.3456789, -1.234567, 1.234567, 0.456789 };
+    const value_weights = [_]f32{ 1.00048828125, -0.33333334, 2.00146484375, 0.1234567 };
+    const identity = [_]f32{ 1, 0, 0, 1 };
+    const query_matrix = try Matrix.init(scratch, pool, .f32, std.mem.sliceAsBytes(&query_weights), 2, 2);
+    const key_matrix = try Matrix.init(scratch, pool, .f32, std.mem.sliceAsBytes(&key_weights), 2, 2);
+    const value_matrix = try Matrix.init(scratch, pool, .f32, std.mem.sliceAsBytes(&value_weights), 2, 2);
+    const output_matrix = try Matrix.init(scratch, pool, .f32, std.mem.sliceAsBytes(&identity), 2, 2);
+    var norm = [_]f32{ 1, 1 };
+    // Exercise both Qwen's normalized NeoX and Llama/Granite's normal RoPE.
+    for ([_]graph.Rope{ .neox, .normal }) |rope_style| {
+        hp.rope = rope_style;
+        hp.qk_norm = rope_style == .neox;
+        const layer: Layer = .{
+            .attn_norm = &norm,
+            .wq = query_matrix,
+            .wk = key_matrix,
+            .wv = value_matrix,
+            .wo = output_matrix,
+            .q_norm = if (hp.qk_norm) &norm else null,
+            .k_norm = if (hp.qk_norm) &norm else null,
+            .ffn_norm = &norm,
+            .ffn_gate = output_matrix,
+            .ffn_up = output_matrix,
+            .ffn_down = output_matrix,
+        };
+        var model: Model = .{
+            .hp = hp,
+            .tok_embd = output_matrix,
+            .output = null,
+            .output_norm = &norm,
+            .rope_freqs = null,
+            .layers = &.{},
+            .arena = .init(scratch),
+        };
+        defer model.arena.deinit();
+        try std.testing.expectEqual(KvFormat.f32, model.kv_format);
+        var default_output: [4]f32 = undefined;
+        var full_output: [4]f32 = undefined;
+        var half_output: [4]f32 = undefined;
+        try attention(scratch, &model, &layer, &input, &default_output, 2, pool, .f32);
+        model.kv_format = .f32;
+        try attention(scratch, &model, &layer, &input, &full_output, 2, pool, .f32);
+        for (default_output, full_output) |actual, expected| {
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
+        }
+        model.kv_format = .f16;
+        try attention(scratch, &model, &layer, &input, &half_output, 2, pool, .f32);
+        try std.testing.expect(!std.mem.eql(f32, &full_output, &half_output));
+
+        var keys = [2][2]f32{ .{ key_weights[0], key_weights[2] }, .{ key_weights[1], key_weights[3] } };
+        var queries = [2][2]f32{ .{ query_weights[0], query_weights[2] }, .{ query_weights[1], query_weights[3] } };
+        var values = [2][2]f32{ .{ value_weights[0], value_weights[2] }, .{ value_weights[1], value_weights[3] } };
+        for (&keys, &queries, &values, 0..) |*key_row, *query_row, *value_row, row| {
+            if (hp.qk_norm) {
+                ops.rmsNorm(key_row, &norm, hp.rms_eps);
+                ops.rmsNorm(query_row, &norm, hp.rms_eps);
+            }
+            switch (rope_style) {
+                .neox => {
+                    ops.rope(key_row, @intCast(row), 2, hp.rope_base);
+                    ops.rope(query_row, @intCast(row), 2, hp.rope_base);
+                },
+                .normal => {
+                    ops.ropeNormal(key_row, @intCast(row), 2, hp.rope_base, null);
+                    ops.ropeNormal(query_row, @intCast(row), 2, hp.rope_base, null);
+                },
+            }
+            for (key_row, value_row) |*key_value, *value_value| {
+                key_value.* = @as(f16, @floatCast(key_value.*));
+                value_value.* = @as(f16, @floatCast(value_value.*));
+            }
+        }
+        for (0..2) |dim| try std.testing.expectApproxEqAbs(values[0][dim], half_output[dim], 1e-6);
+        const first_score = ops.dot(&queries[1], &keys[0]) * hp.attn_scale;
+        const second_score = ops.dot(&queries[1], &keys[1]) * hp.attn_scale;
+        const max_score = @max(first_score, second_score);
+        const first_prob = @exp(first_score - max_score);
+        const second_prob = @exp(second_score - max_score);
+        for (0..2) |dim| {
+            const expected = (first_prob * values[0][dim] + second_prob * values[1][dim]) / (first_prob + second_prob);
+            try std.testing.expectApproxEqAbs(expected, half_output[2 + dim], 1e-6);
+        }
+    }
 }

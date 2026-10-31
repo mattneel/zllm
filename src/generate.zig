@@ -22,7 +22,7 @@ pub const usage =
     \\  --max-tokens N        tokens to generate per turn (default 4096)
     \\  --ctx N               context capacity in tokens (default 8192)
     \\  --kv f16|f32|fp8      force the KV format instead of its quality-gated ladder
-    \\  --precision exact    f32 KV and scalar-f32 prefill operands (default: ladder)
+    \\  --precision exact    f16 KV and scalar-f32 prefill (explicit --kv overrides KV)
     \\  --temperature F --top-k N --top-p F --min-p F
     \\  --repetition-penalty F --presence-penalty F --frequency-penalty F
     \\                        sampling, as in vLLM; unset, the model's defaults: the
@@ -320,7 +320,7 @@ pub const Runtime = struct {
         rt.precision_memory.weight_bytes = try zllm.gpu.cmd.bufferBytes(gpa, rec.batch(), 64 * 1024);
         try rt.executeTimed(&rec, &t, &rt.load.weights);
         const mtp = rt.model.canSpeculate(limits);
-        for (precision.kv_rungs, 0..) |format, index| {
+        for ([_]plan_common.KvFormat{ .fp8, .f16, .f32 }, 0..) |format, index| {
             rt.precision_memory.program_bytes[index] = try plan.Program.memoryBytes(gpa, &rt.set, &rt.model, .{
                 .context = o.context,
                 .kv = format,
@@ -519,9 +519,9 @@ pub const Runtime = struct {
         defer scratch.deinit();
         const arena = scratch.allocator();
         const prompt = try rt.qualityPrompt(arena);
-        // The oracle uses only the short probe context, even when f32 cannot
-        // fit at the requested serving context. Forced KV retains its oracle.
-        const reference: precision.Selection = .{ .kv = policy.kv orelse .f32 };
+        // The f16 ceiling is the automatic ladder's oracle. Explicit KV
+        // requests compare prefill operands against that requested format.
+        const reference: precision.Selection = .{ .kv = policy.kv orelse .f16 };
         const exact = try rt.qualityLogits(arena, reference, prompt);
         for (exact) |value| if (!std.math.isFinite(value)) return error.NonFinitePrecisionReference;
         const gate = rt.qualityGate();
@@ -536,7 +536,7 @@ pub const Runtime = struct {
                     });
                     continue;
                 }
-                const metrics: precision.Metrics = if (format == .f32)
+                const metrics: precision.Metrics = if (format == .f16)
                     .{ .positions = prompt.len, .top1_matches = prompt.len }
                 else
                     try rt.trial(prompt, exact, candidate);
@@ -551,16 +551,22 @@ pub const Runtime = struct {
         for (precision.prefill_rungs) |rung| {
             if (rung == .scalar_f32) break;
             if (!rt.device.supportsPrefill(rung)) continue;
-            var candidate = rt.selection;
-            candidate.prefill = rung;
-            if (!rt.precision_memory.fits(candidate)) continue;
+            const candidate: precision.Selection = .{ .kv = reference.kv, .prefill = rung };
             const metrics = try rt.trial(prompt, exact, candidate);
             try observations.append(rt.arena_state.allocator(), .{ .selection = candidate, .metrics = metrics });
-            if (gate.accepts(metrics)) {
-                rt.selection = candidate;
-                rt.precision_quality_limited = false;
-                break;
+            if (!gate.accepts(metrics)) continue;
+            // Gate operands with the f16 ceiling, not an already-approximate
+            // FP8 cache; also verify the combination before serving it.
+            var combined = rt.selection;
+            combined.prefill = rung;
+            if (combined.kv != candidate.kv) {
+                const combined_metrics = try rt.trial(prompt, exact, combined);
+                try observations.append(rt.arena_state.allocator(), .{ .selection = combined, .metrics = combined_metrics });
+                if (!gate.accepts(combined_metrics)) continue;
             }
+            rt.selection = combined;
+            rt.precision_quality_limited = false;
+            break;
         }
         rt.quality_observations = observations.items;
     }

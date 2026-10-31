@@ -233,9 +233,9 @@ pub fn main(init: std.process.Init) !void {
         try gpuCheck(gpa, init.environ_map, out);
     } else if (std.mem.eql(u8, cmd, "gpu-forward")) {
         if (args.len == 7 and std.mem.eql(u8, args[3], "--precision") and std.mem.eql(u8, args[4], "exact") and std.mem.eql(u8, args[5], "--runs")) {
-            try gpuForward(gpa, io, init.environ_map, args[2], try readRuns(arena, io, args[6]));
+            try gpuForward(gpa, io, init.environ_map, args[2], try readRuns(arena, io, args[6], true));
         } else if (args.len == 5 and std.mem.eql(u8, args[3], "--runs")) {
-            try gpuForward(gpa, io, init.environ_map, args[2], try readRuns(arena, io, args[4]));
+            try gpuForward(gpa, io, init.environ_map, args[2], try readRuns(arena, io, args[4], false));
         } else {
             if (args.len < 5) return fail(usage);
             try gpuForward(gpa, io, init.environ_map, args[2], &.{.{ .tokens_path = args[3], .out_path = args[4], .opts = try ForwardOptions.parse(args[5..]) }});
@@ -364,14 +364,14 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
         try forwardQwen4exp(gpa, pool, file, mapped.bytes, tokens, &rec, cpu_kv orelse .f16);
     } else if (arch == .string and zllm.graph.dense.Arch.fromName(arch.string) != null) {
         if (mtp) return error.NoMtpBlock;
-        if (cpu_kv == .f16) return error.UnsupportedCpuKv;
         var model = try zllm.ref.dense.Model.load(gpa, pool, file, mapped.bytes);
         defer model.deinit();
+        model.kv_format = if (cpu_kv == .f16) .f16 else .f32;
         try model.forward(gpa, tokens, pool, obs, act);
     } else {
-        if (cpu_kv == .f16) return error.UnsupportedCpuKv;
         var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped.bytes);
         defer model.deinit();
+        model.kv_format = if (cpu_kv == .f16) .f16 else .f32;
         try model.forward(gpa, tokens, pool, obs, act, mtp);
     }
     try fw.interface.flush();
@@ -488,7 +488,7 @@ const FileBytes = struct {
     }
 };
 
-/// Flags override environment defaults; exact mode later overrides forced KV.
+/// Flags override environment defaults; exact preserves an explicitly forced KV.
 fn applyPrecisionEnv(opts: *gen.Options, env: *const std.process.Environ.Map, args: []const []const u8) !void {
     var has_kv = false;
     var has_precision = false;
@@ -517,7 +517,7 @@ fn precisionCheck(rt: *gen.Runtime, token_path: []const u8, logits_path: []const
         const selection: zllm.precision.Selection = .{ .kv = format };
         try observations.append(arena, .{
             .selection = selection,
-            .metrics = if (format == .f32)
+            .metrics = if (format == .f16)
                 try gen.Runtime.qualityMetrics(exact, exact, prompt.len)
             else
                 try rt.trial(prompt, exact, selection),
@@ -543,7 +543,7 @@ fn precisionCheck(rt: *gen.Runtime, token_path: []const u8, logits_path: []const
         .observations = observations.items,
         .metrics = metrics,
         .precision_cached = rt.precision_cached,
-        .reference_kv = zllm.plan.common.KvFormat.f32,
+        .reference_kv = zllm.plan.common.KvFormat.f16,
         .positions = prompt.len,
         .quality_ms = rt.load.quality / std.time.ns_per_ms,
     });
@@ -603,6 +603,8 @@ const ForwardOptions = struct {
 
     fn parse(args: []const []const u8) !ForwardOptions {
         var o: ForwardOptions = .{};
+        var exact = false;
+        var forced_kv = false;
         var i: usize = 0;
         while (i < args.len) : (i += 2) {
             if (std.mem.eql(u8, args[i], "--mtp") or std.mem.eql(u8, args[i], "--tune") or std.mem.eql(u8, args[i], "--no-fuse")) {
@@ -620,12 +622,15 @@ const ForwardOptions = struct {
                 if (o.chunk == 0) return fail(usage);
             } else if (std.mem.eql(u8, args[i], "--kv")) {
                 o.kv = std.meta.stringToEnum(zllm.plan.common.KvFormat, args[i + 1]) orelse return fail(usage);
+                forced_kv = true;
             } else if (std.mem.eql(u8, args[i], "--precision")) {
                 if (!std.mem.eql(u8, args[i + 1], "exact")) return fail(usage);
+                exact = true;
             } else if (std.mem.eql(u8, args[i], "--path")) {
                 o.path = std.meta.stringToEnum(zllm.plan.qwen35.Path, args[i + 1]) orelse return fail(usage);
             } else return fail(usage);
         }
+        if (exact and !forced_kv) o.kv = .f16;
         if (o.path == .decode and o.chunk > zllm.kernels.decode_max_rows) return fail(usage);
         return o;
     }
@@ -654,10 +659,19 @@ test "generation precision defaults and explicit opt-outs stay distinct" {
     try std.testing.expectEqual(zllm.plan.common.KvFormat.f16, forced.kv.?);
     try std.testing.expectEqual(zllm.precision.Mode.auto, forced.precision);
     const exact = try gen.Options.parse(arena.allocator(), &.{ "--kv", "fp8", "--precision", "exact" });
-    try std.testing.expectEqualDeep(zllm.precision.Selection{}, (zllm.precision.Policy{ .mode = exact.precision, .kv = exact.kv }).resolve(.{ .prefill = .fp16_single }));
+    try std.testing.expectEqualDeep(zllm.precision.Selection{ .kv = .fp8 }, (zllm.precision.Policy{ .mode = exact.precision, .kv = exact.kv }).resolve(.{ .prefill = .fp16_single }));
     try std.testing.expectError(error.InvalidUsage, gen.Options.parse(arena.allocator(), &.{ "--precision", "unknown" }));
     const diagnostic = try ForwardOptions.parse(&.{ "--precision", "exact", "--kv", "f16" });
     try std.testing.expectEqual(zllm.plan.common.KvFormat.f16, diagnostic.kv);
+    const default_exact = try ForwardOptions.parse(&.{ "--precision", "exact" });
+    try std.testing.expectEqual(zllm.plan.common.KvFormat.f16, default_exact.kv);
+    for ([_][]const []const u8{
+        &.{ "--precision", "exact", "--kv", "f32" },
+        &.{ "--kv", "f32", "--precision", "exact" },
+    }) |args| {
+        const explicit = try ForwardOptions.parse(args);
+        try std.testing.expectEqual(zllm.plan.common.KvFormat.f32, explicit.kv);
+    }
 }
 
 /// One gpu-forward run: token ids in, activation records out.
@@ -669,7 +683,7 @@ const ForwardRun = struct {
 
 /// The runs of `gpu-forward <model> --runs <file>`: one per non-empty line,
 /// `<tokens.i32> <out.bin> [options]`.
-fn readRuns(arena: std.mem.Allocator, io: Io, path: []const u8) ![]ForwardRun {
+fn readRuns(arena: std.mem.Allocator, io: Io, path: []const u8, exact: bool) ![]ForwardRun {
     const text = try Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
     var runs: std.ArrayList(ForwardRun) = .empty;
     var lines = std.mem.tokenizeAny(u8, text, "\r\n");
@@ -678,7 +692,14 @@ fn readRuns(arena: std.mem.Allocator, io: Io, path: []const u8) ![]ForwardRun {
         var it = std.mem.tokenizeScalar(u8, line, ' ');
         while (it.next()) |w| try words.append(arena, w);
         if (words.items.len < 2) return fail(usage);
-        try runs.append(arena, .{ .tokens_path = words.items[0], .out_path = words.items[1], .opts = try ForwardOptions.parse(words.items[2..]) });
+        var opts = try ForwardOptions.parse(words.items[2..]);
+        if (exact) {
+            const forced_kv = for (words.items[2..]) |arg| {
+                if (std.mem.eql(u8, arg, "--kv")) break true;
+            } else false;
+            if (!forced_kv) opts.kv = .f16;
+        }
+        try runs.append(arena, .{ .tokens_path = words.items[0], .out_path = words.items[1], .opts = opts });
     }
     return runs.items;
 }

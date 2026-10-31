@@ -1,6 +1,6 @@
 //! Load-time precision choices and CPU-only quality gates. Each tensor class
 //! walks its own fastest-first ladder; every observation uses the same exact
-//! f32 reference logits. Stored weights are never silently re-quantized.
+//! f16-KV reference logits. Stored weights are never silently re-quantized.
 
 const std = @import("std");
 const common = @import("plan/common.zig");
@@ -9,12 +9,12 @@ pub const Mode = enum { auto, exact };
 pub const Prefill = enum { fp16_single, fp16_compensated, scalar_f32 };
 pub const WeightStorage = enum { stored };
 
-pub const kv_rungs = [_]common.KvFormat{ .fp8, .f16, .f32 };
+pub const kv_rungs = [_]common.KvFormat{ .fp8, .f16 };
 pub const prefill_rungs = [_]Prefill{ .fp16_single, .fp16_compensated, .scalar_f32 };
 pub const weight_rungs = [_]WeightStorage{.stored};
 
 pub const Selection = struct {
-    kv: common.KvFormat = .f32,
+    kv: common.KvFormat = .f16,
     prefill: Prefill = .scalar_f32,
     weights: WeightStorage = .stored,
 };
@@ -23,10 +23,10 @@ pub const Policy = struct {
     mode: Mode = .auto,
     kv: ?common.KvFormat = null,
 
-    /// A forced KV format only opts out of the KV ladder. Exact overrides
-    /// every approximation, including an explicitly forced KV format.
+    /// Exact uses scalar-f32 prefill and f16 KV unless KV was explicitly forced.
+    /// A forced format opts out of the KV ladder, including explicit f32.
     pub fn resolve(policy: Policy, selection: Selection) Selection {
-        if (policy.mode == .exact) return .{};
+        if (policy.mode == .exact) return .{ .kv = policy.kv orelse .f16 };
         var resolved = selection;
         if (policy.kv) |kv| resolved.kv = kv;
         return resolved;
@@ -35,7 +35,7 @@ pub const Policy = struct {
 
 /// Bump whenever model thresholds, metric semantics or ladder ordering change.
 /// The plan cache hashes this version together with the requested policy.
-pub const gate_policy_version: u32 = 1;
+pub const gate_policy_version: u32 = 3;
 
 /// The device budget is total usable local memory, not free bytes after the
 /// model upload. Reserve 5% (at least 512 MiB) for driver allocations, uploads
@@ -44,8 +44,8 @@ pub const Memory = struct {
     budget_bytes: ?u64 = null,
     headroom_bytes: u64 = 0,
     weight_bytes: u64 = 0,
-    /// Program allocations in the same fastest-first order as kv_rungs.
-    program_bytes: [kv_rungs.len]u64 = @splat(0),
+    /// FP8, f16, then explicit f32; f32 is not an automatic rung.
+    program_bytes: [3]u64 = @splat(0),
 
     pub fn init(budget: ?u64) Memory {
         return .{
@@ -244,12 +244,14 @@ pub fn fastestPassing(observations: []const Observation, gate: Gate, memory: Mem
     return null;
 }
 
-test "exact policy overrides forced KV; auto only overrides KV" {
+test "exact defaults to f16 KV and preserves every explicit format" {
     const approximate: Selection = .{ .kv = .fp8, .prefill = .fp16_single };
-    try std.testing.expectEqualDeep(Selection{}, (Policy{ .mode = .exact, .kv = .f16 }).resolve(approximate));
+    try std.testing.expectEqualDeep(Selection{}, (Policy{ .mode = .exact }).resolve(approximate));
+    try std.testing.expectEqualDeep(Selection{ .kv = .f32 }, (Policy{ .mode = .exact, .kv = .f32 }).resolve(approximate));
+    try std.testing.expectEqualDeep(Selection{ .kv = .fp8 }, (Policy{ .mode = .exact, .kv = .fp8 }).resolve(approximate));
     try std.testing.expectEqualDeep(approximate, (Policy{}).resolve(approximate));
     try std.testing.expectEqualDeep(Selection{ .kv = .f16, .prefill = .fp16_single }, (Policy{ .kv = .f16 }).resolve(approximate));
-    try std.testing.expectEqualSlices(common.KvFormat, &.{ .fp8, .f16, .f32 }, &kv_rungs);
+    try std.testing.expectEqualSlices(common.KvFormat, &.{ .fp8, .f16 }, &kv_rungs);
     try std.testing.expectEqualSlices(Prefill, &.{ .fp16_single, .fp16_compensated, .scalar_f32 }, &prefill_rungs);
     try std.testing.expectEqual(@as(usize, 1), weight_rungs.len);
 }
@@ -357,7 +359,7 @@ test "non-fitting rung is skipped and budget mutation changes the winner" {
     try std.testing.expect(memory.mostAccurateFitting() == null);
     memory.budget_bytes = null;
     try std.testing.expectEqual(common.KvFormat.f16, fastestPassing(&observations, .{}, memory).?.kv);
-    try std.testing.expectEqual(common.KvFormat.f32, memory.mostAccurateFitting().?.kv);
+    try std.testing.expectEqual(common.KvFormat.f16, memory.mostAccurateFitting().?.kv);
     try std.testing.expectEqual(@as(u64, 512 << 20), Memory.init(1 << 30).headroom_bytes);
     try std.testing.expectEqual(@as(u64, (24 << 30) / 20), Memory.init(24 << 30).headroom_bytes);
 }

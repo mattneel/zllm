@@ -18,6 +18,7 @@ const precision = @import("../precision.zig");
 const version = @import("../version.zig").zllm;
 
 pub const Key = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+pub const format_version: u32 = 5;
 
 pub const Entry = struct {
     tuning: Tuning,
@@ -61,7 +62,7 @@ pub fn key(in: KeyInputs) Key {
             hh.update(b);
         }
     };
-    Feed.bytes(&h, "zllm plan cache 3: memory headroom 5% minimum 512MiB");
+    Feed.bytes(&h, "zllm plan cache 5: f16 KV ceiling and operand gate; memory headroom 5% minimum 512MiB");
     Feed.bytes(&h, std.mem.asBytes(&precision.gate_policy_version));
     Feed.bytes(&h, @tagName(in.policy.mode));
     Feed.bytes(&h, if (in.policy.kv) |kv| @tagName(kv) else "automatic");
@@ -81,6 +82,7 @@ pub fn key(in: KeyInputs) Key {
 
 const Json = struct {
     key: []const u8,
+    format_version: u32,
     tuned: bool,
     tuning: []const struct {
         type: []const u8,
@@ -128,7 +130,7 @@ pub fn serialize(gpa: Allocator, k: Key, entry: Entry, out: *std.ArrayList(u8)) 
     var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, out);
     defer out.* = aw.toArrayList();
     const w = &aw.writer;
-    w.print("{{\"key\":\"{x}\",\"tuning\":[", .{&k}) catch return error.OutOfMemory;
+    w.print("{{\"format_version\":{d},\"key\":\"{x}\",\"tuning\":[", .{ format_version, &k }) catch return error.OutOfMemory;
     for (entry.tuning.entries, 0..) |e, i| {
         w.print("{s}\n{{\"type\":\"{t}\",\"n\":{d},\"k\":{d},\"wg\":{d},\"lanes\":{d},\"rows\":{d}}}", .{
             if (i == 0) "" else ",", e.type, e.n, e.k, e.variant.wg, e.variant.lanes, e.variant.rows,
@@ -147,6 +149,7 @@ pub fn serialize(gpa: Allocator, k: Key, entry: Entry, out: *std.ArrayList(u8)) 
 /// outside the actual kernel candidates), which a fresh sweep then replaces.
 pub fn parse(arena: Allocator, bytes: []const u8, k: Key) ?Entry {
     const json = std.json.parseFromSliceLeaky(Json, arena, bytes, .{}) catch return null;
+    if (json.format_version != format_version) return null;
     var want: [2 * k.len]u8 = undefined;
     _ = std.fmt.bufPrint(&want, "{x}", .{&k}) catch unreachable;
     if (!std.mem.eql(u8, json.key, &want)) return null;
@@ -220,7 +223,7 @@ test "malformed caches are ignored" {
     const k = key(.{ .adapter = &.{}, .runtime = "dawn", .limits = &.{}, .model_header = "" });
     var hex: [64]u8 = undefined;
     _ = try std.fmt.bufPrint(&hex, "{x}", .{&k});
-    const precision_fields = "\"tuned\":true,\"selection\":{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"},\"observations\":[]";
+    const precision_fields = "\"format_version\":5,\"tuned\":true,\"selection\":{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"},\"observations\":[]";
     const bad_variant = try std.fmt.allocPrint(arena, "{{\"key\":\"{s}\",\"tuning\":[{{\"type\":\"q3_k\",\"n\":1,\"k\":256,\"wg\":64,\"lanes\":8,\"rows\":1}}],{s}}}", .{ &hex, precision_fields });
     try std.testing.expect(parse(arena, bad_variant, k) == null);
     const bad_type = try std.fmt.allocPrint(arena, "{{\"key\":\"{s}\",\"tuning\":[{{\"type\":\"bf16\",\"n\":1,\"k\":256,\"wg\":256,\"lanes\":8,\"rows\":1}}],{s}}}", .{ &hex, precision_fields });
@@ -271,14 +274,14 @@ test "unknown and missing precision enum fields reject rather than default" {
         "{\"kv\":\"f32\",\"prefill\":\"scalar_f32\"}",
         "{}",
     }) |selection| {
-        const bytes = try std.fmt.allocPrint(arena, "{{\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"selection\":{s},\"observations\":[]}}", .{ &k, selection });
+        const bytes = try std.fmt.allocPrint(arena, "{{\"format_version\":5,\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"selection\":{s},\"observations\":[]}}", .{ &k, selection });
         try std.testing.expect(parse(arena, bytes, k) == null);
-        const observation = try std.fmt.allocPrint(arena, "{{\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}},\"observations\":[{{\"selection\":{s},\"metrics\":{{\"positions\":1,\"top1_matches\":1,\"mean_kl\":0,\"max_rel_l2\":0}}}}]}}", .{ &k, selection });
+        const observation = try std.fmt.allocPrint(arena, "{{\"format_version\":5,\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}},\"observations\":[{{\"selection\":{s},\"metrics\":{{\"positions\":1,\"top1_matches\":1,\"mean_kl\":0,\"max_rel_l2\":0}}}}]}}", .{ &k, selection });
         try std.testing.expect(parse(arena, observation, k) == null);
     }
-    const missing_observations = try std.fmt.allocPrint(arena, "{{\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}}}}", .{&k});
+    const missing_observations = try std.fmt.allocPrint(arena, "{{\"format_version\":5,\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}}}}", .{&k});
     try std.testing.expect(parse(arena, missing_observations, k) == null);
-    const missing_selection = try std.fmt.allocPrint(arena, "{{\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"observations\":[]}}", .{&k});
+    const missing_selection = try std.fmt.allocPrint(arena, "{{\"format_version\":5,\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"observations\":[]}}", .{&k});
     try std.testing.expect(parse(arena, missing_selection, k) == null);
 }
 
@@ -299,7 +302,7 @@ test "invalid and incomplete observation metrics reject" {
         "{\"top1_matches\":1,\"mean_kl\":0,\"max_rel_l2\":0}",
         "{}",
     }) |metrics| {
-        const bytes = try std.fmt.allocPrint(arena, "{{\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}},\"observations\":[{{\"selection\":{{\"kv\":\"f16\",\"prefill\":\"fp16_compensated\",\"weights\":\"stored\"}},\"metrics\":{s}}}]}}", .{ &k, metrics });
+        const bytes = try std.fmt.allocPrint(arena, "{{\"format_version\":5,\"key\":\"{x}\",\"tuned\":true,\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}},\"observations\":[{{\"selection\":{{\"kv\":\"f16\",\"prefill\":\"fp16_compensated\",\"weights\":\"stored\"}},\"metrics\":{s}}}]}}", .{ &k, metrics });
         try std.testing.expect(parse(arena, bytes, k) == null);
     }
 }
@@ -333,7 +336,7 @@ test "tuning completion metadata must be an explicit boolean" {
     const arena = arena_state.allocator();
     const k = key(.{ .adapter = &.{}, .runtime = "dawn", .limits = &.{}, .model_header = "" });
     for ([_][]const u8{ "", "\"tuned\":null,", "\"tuned\":1,", "\"tuned\":\"true\"," }) |field| {
-        const bytes = try std.fmt.allocPrint(arena, "{{\"key\":\"{x}\",{s}\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}},\"observations\":[]}}", .{ &k, field });
+        const bytes = try std.fmt.allocPrint(arena, "{{\"format_version\":5,\"key\":\"{x}\",{s}\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}},\"observations\":[]}}", .{ &k, field });
         try std.testing.expect(parse(arena, bytes, k) == null);
     }
 }
@@ -349,4 +352,15 @@ test "context and memory budget invalidate cached precision" {
     inputs.context = 8192;
     inputs.memory_budget = (24 << 30) - 1;
     try std.testing.expect(!std.mem.eql(u8, &known, &key(inputs)));
+}
+
+test "old and missing cache format versions reject even with the current key" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const k = key(.{ .adapter = &.{}, .runtime = "dawn", .limits = &.{}, .model_header = "" });
+    for ([_][]const u8{ "", "\"format_version\":4," }) |field| {
+        const bytes = try std.fmt.allocPrint(arena, "{{{s}\"key\":\"{x}\",\"tuned\":false,\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}},\"observations\":[]}}", .{ field, &k });
+        try std.testing.expect(parse(arena, bytes, k) == null);
+    }
 }

@@ -4,7 +4,8 @@
 //! state and reports activations for every position. Weights are decoded to
 //! f32 (f32, f16 and bf16 matrices repacked for `matmul` at load, quantized
 //! ones panel by panel as they are used); every operation accumulates in
-//! f32.
+//! f32. Full-attention K/V optionally round through binary16 at the cache
+//! boundary; the default remains f32 and DeltaNet state is always f32.
 //! See docs/src/qwen35.md for the tensor semantics this code assumes.
 
 const std = @import("std");
@@ -24,6 +25,21 @@ const V = @Vector(vec_len, f32);
 const max_head_vecs = 16;
 
 pub const Hparams = graph.Hparams;
+
+/// Storage precision for full-attention K/V, independent of matrix activation
+/// rounding. The reference keeps decoded f32 values so attention arithmetic is
+/// unchanged; f16 models the exact nearest-even binary16 store/load boundary.
+pub const KvFormat = enum {
+    f32,
+    f16,
+
+    pub fn round(format: KvFormat, values: []f32) void {
+        switch (format) {
+            .f32 => {},
+            .f16 => mm.roundLikeLlama(.f16, values),
+        }
+    }
+};
 
 const Attention = struct {
     /// Query and output gate, interleaved per head: [q_h (head_dim), gate_h (head_dim)].
@@ -77,6 +93,8 @@ const Mtp = struct {
 
 pub const Model = struct {
     hp: Hparams,
+    /// Select before forward; model loading and existing callers default to f32.
+    kv_format: KvFormat = .f32,
     /// The MTP block, for models that have one.
     mtp: ?Mtp = null,
     /// Embeddings (row j = token j), also the LM head when tied.
@@ -212,7 +230,7 @@ pub const Model = struct {
             _ = scratch_arena.reset(.retain_capacity);
             normRows(h, x, layer.attn_norm, hp.rms_eps);
             switch (layer.mixer) {
-                .attention => |*att| try attention(scratch, hp, att, h, mix, n, 0, pool, act),
+                .attention => |*att| try attention(scratch, hp, att, h, mix, n, 0, pool, act, m.kv_format),
                 .delta_net => |*dn| try deltaNet(scratch, hp, dn, h, mix, n, pool, act),
             }
             for (x, mix) |*a, b| a.* += b;
@@ -253,7 +271,7 @@ pub const Model = struct {
         const mh = h[0 .. r * e];
         const mmix = mix[0 .. r * e];
         normRows(mh, mx, block.block.attn_norm, hp.rms_eps);
-        try attention(scratch, hp, &block.block.mixer.attention, mh, mmix, r, 1, pool, act);
+        try attention(scratch, hp, &block.block.mixer.attention, mh, mmix, r, 1, pool, act, m.kv_format);
         for (mx, mmix) |*a, b| a.* += b;
         normRows(mh, mx, block.block.post_norm, hp.rms_eps);
         try ffn(scratch, hp, &block.block, mh, mmix, r, pool, act);
@@ -310,7 +328,7 @@ fn ffn(gpa: Allocator, hp: Hparams, layer: *const Layer, h: []const f32, out: []
 /// Gated full attention: joint Q+gate projection, per-head Q/K RMSNorm,
 /// partial NeoX RoPE, causal GQA softmax attention, sigmoid output gate.
 /// Row t is position pos0 + t.
-fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, out: []f32, n: usize, pos0: u32, pool: *Pool, act: mm.Activations) !void {
+fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, out: []f32, n: usize, pos0: u32, pool: *Pool, act: mm.Activations, kv_format: KvFormat) !void {
     const hd: usize = hp.head_dim;
     const n_head: usize = hp.n_head;
     const n_kv: usize = hp.n_head_kv;
@@ -328,10 +346,11 @@ fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, o
         w: *const Attention,
         qg: []f32,
         k: []f32,
-        v: []const f32,
+        v: []f32,
         attn: []f32,
         n: usize,
         pos0: u32,
+        kv_format: KvFormat,
 
         fn q(c: *const @This(), t: usize, hh: usize) []f32 {
             const hd_ = c.hp.head_dim;
@@ -359,6 +378,9 @@ fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, o
                     const kh = c.k[(t * c.hp.n_head_kv + kvh) * hd_ ..][0..hd_];
                     ops.rmsNorm(kh, c.w.k_norm, c.hp.rms_eps);
                     ops.rope(kh, pos, c.hp.n_rot, c.hp.rope_base);
+                    c.kv_format.round(kh);
+                    const vh = c.v[(t * c.hp.n_head_kv + kvh) * hd_ ..][0..hd_];
+                    c.kv_format.round(vh);
                 }
             }
         }
@@ -391,7 +413,7 @@ fn attention(gpa: Allocator, hp: Hparams, w: *const Attention, h: []const f32, o
             }
         }
     };
-    const ctx: Ctx = .{ .hp = hp, .w = w, .qg = qg, .k = k, .v = v, .attn = attn, .n = n, .pos0 = pos0 };
+    const ctx: Ctx = .{ .hp = hp, .w = w, .qg = qg, .k = k, .v = v, .attn = attn, .n = n, .pos0 = pos0, .kv_format = kv_format };
     pool.parallelFor(n, 1, 1, &ctx, Ctx.normRope);
     pool.parallelFor(n_head * n, 1, 1, &ctx, Ctx.attend);
     mm.matmul(pool, out, attn, &w.wo, n, act);
@@ -538,4 +560,88 @@ fn deltaNet(gpa: Allocator, hp: Hparams, w: *const DeltaNet, h: []const f32, out
     pool.parallelFor(n, 1, 1, &ctx, Ctx.convNorm);
     pool.parallelFor(hv, 1, 1, &ctx, Ctx.recur);
     mm.matmul(pool, out, o_all, &w.wout, n, act);
+}
+
+test "KV f16 rounds ties to even and decodes binary16 exactly" {
+    var values = [_]f32{
+        1.00048828125, 1.00146484375, -1.00048828125, -1.00146484375,
+        0x1p-25,       0x1.8p-24,     -0x1p-25,       65504,
+    };
+    KvFormat.f16.round(&values);
+    const expected = [_]f32{
+        1, 1.001953125, -1,   -1.001953125,
+        0, 0x1p-23,     -0.0, 65504,
+    };
+    for (values, expected) |actual, want| {
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(actual)));
+    }
+}
+
+test "KV f32 leaves every input bit unchanged" {
+    const bits = [_]u32{ 0, 0x80000000, 0x3f801000, 0x00000001, 0x7f800000, 0xff800000, 0x7fc12345 };
+    var values: [bits.len]f32 = undefined;
+    for (&values, bits) |*value, pattern| value.* = @bitCast(pattern);
+    KvFormat.f32.round(&values);
+    for (values, bits) |value, pattern| try std.testing.expectEqual(pattern, @as(u32, @bitCast(value)));
+}
+
+test "hybrid attention rounds only cached K and V after normalization and RoPE" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const pool = try Pool.init(std.testing.allocator, std.testing.io, 1);
+    defer pool.deinit();
+
+    var hp = std.mem.zeroes(Hparams);
+    hp.n_embd = 2;
+    hp.n_head = 1;
+    hp.n_head_kv = 1;
+    hp.head_dim = 2;
+    hp.n_rot = 2;
+    hp.rope_base = 10000;
+    hp.rms_eps = 1e-5;
+    const input = [_]f32{ 1, 0, 0, 1 };
+    const query_weights = [_]f32{ 0.234567, 0.7654321, -0.987654, 1.234567, 0, 0, 0, 0 };
+    const key_weights = [_]f32{ 0.3456789, -1.234567, 1.234567, 0.456789 };
+    const value_weights = [_]f32{ 1.00048828125, -0.33333334, 2.00146484375, 0.1234567 };
+    const identity = [_]f32{ 1, 0, 0, 1 };
+    var norm = [_]f32{ 1, 1 };
+    const weights: Attention = .{
+        .wq = try Matrix.init(scratch, pool, .f32, std.mem.sliceAsBytes(&query_weights), 4, 2),
+        .wk = try Matrix.init(scratch, pool, .f32, std.mem.sliceAsBytes(&key_weights), 2, 2),
+        .wv = try Matrix.init(scratch, pool, .f32, std.mem.sliceAsBytes(&value_weights), 2, 2),
+        .wo = try Matrix.init(scratch, pool, .f32, std.mem.sliceAsBytes(&identity), 2, 2),
+        .q_norm = &norm,
+        .k_norm = &norm,
+    };
+    var output: [4]f32 = undefined;
+    var full_output: [4]f32 = undefined;
+    // A nonzero starting position also exercises the MTP attention path.
+    try attention(scratch, hp, &weights, &input, &output, 2, 1, pool, .f32, .f16);
+    try attention(scratch, hp, &weights, &input, &full_output, 2, 1, pool, .f32, .f32);
+    try std.testing.expect(!std.mem.eql(f32, &output, &full_output));
+
+    var keys = [2][2]f32{ .{ key_weights[0], key_weights[2] }, .{ key_weights[1], key_weights[3] } };
+    var queries = [2][2]f32{ .{ query_weights[0], query_weights[2] }, .{ query_weights[1], query_weights[3] } };
+    var values = [2][2]f32{ .{ value_weights[0], value_weights[2] }, .{ value_weights[1], value_weights[3] } };
+    for (&keys, &queries, &values, 0..) |*key_row, *query_row, *value_row, row| {
+        ops.rmsNorm(key_row, &norm, hp.rms_eps);
+        ops.rmsNorm(query_row, &norm, hp.rms_eps);
+        ops.rope(key_row, @intCast(row + 1), 2, hp.rope_base);
+        ops.rope(query_row, @intCast(row + 1), 2, hp.rope_base);
+        for (key_row, value_row) |*key_value, *value_value| {
+            key_value.* = @as(f16, @floatCast(key_value.*));
+            value_value.* = @as(f16, @floatCast(value_value.*));
+        }
+    }
+    for (0..2) |dim| try std.testing.expectApproxEqAbs(values[0][dim] * 0.5, output[dim], 1e-6);
+    const first_score = ops.dot(&queries[1], &keys[0]) / @sqrt(@as(f32, 2));
+    const second_score = ops.dot(&queries[1], &keys[1]) / @sqrt(@as(f32, 2));
+    const max_score = @max(first_score, second_score);
+    const first_prob = @exp(first_score - max_score);
+    const second_prob = @exp(second_score - max_score);
+    for (0..2) |dim| {
+        const expected = (first_prob * values[0][dim] + second_prob * values[1][dim]) / (first_prob + second_prob) * 0.5;
+        try std.testing.expectApproxEqAbs(expected, output[2 + dim], 1e-6);
+    }
 }

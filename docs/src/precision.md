@@ -19,7 +19,7 @@ quality-gated selection policy described in [spec §9](spec.md#9-state-and-prefi
 | BF16/F16 prefill multiplies | Scalar f32, or FP16 single-product / activation-high-and-residual LinAlg products with f32 accumulation | Native quality-gated operand ladder on capable Agility; scalar on Dawn |
 | Quantized prefill multiplies | Round operands to Q8_K blocks for K-quants or Q8_0 blocks for Q8_0 weights; accumulate in f32 | Part of the existing quantized prefill path, not an adaptive precision choice |
 | Gyro-Coder float-activation Q8_0 and grouped TQ2_T prefill | Scalar f32; FP16-rounded activations and scaled weights (single product); or compensated high/residual activation products with exact unscaled weight operands | Native quality-gated operand ladder on capable Agility; scalar HLSL fallback |
-| Attention KV | f32, f16, FP8 E4M3FN | Native quality ladder FP8 → f16 → f32; browser remains explicit, default f16; `gpu-forward` defaults f32 |
+| Attention KV | f32, f16, FP8 E4M3FN | Native quality ladder FP8 → f16; browser remains explicit, default f16; `gpu-forward` defaults f32 |
 | DeltaNet recurrent state and convolution history | f32 | Not changed by `--kv` |
 | Gyro sparse indexer keys / pooled blocks | f16 / f32 | Separate from the attention KV choice |
 
@@ -30,8 +30,9 @@ CPU runtime. Its `--llama-activations` mode deliberately reproduces that
 runtime's active x86 multiply-operand rounding for quantized comparisons,
 including ties-to-even Q8_0 rather than the scalar file quantizer's rule.
 Gyro-Coder's CPU reference defaults to f16 attention and indexer caches.
-`forward --kv f32` selects f32 attention KV for the ladder oracle while
-retaining the model's fixed f16 indexer storage.
+`forward --kv f32` selects the explicit f32 attention-KV diagnostic path while
+retaining the model's fixed f16 indexer storage. Native ladder calibration
+uses f16 attention KV as its reference.
 
 ## Weight formats
 
@@ -97,8 +98,8 @@ The shared `KvFormat` has three choices:
 
 | Choice | Storage | Intended use |
 |---|---|---|
-| `f32` | f32 cached values | High-precision diagnostic baseline; larger cache |
-| `f16` | Packed binary16 values, explicitly rounded to nearest with ties to even | Middle native ladder rung; explicit browser default |
+| `f32` | f32 cached values | Fully supported on explicit request; never selected automatically |
+| `f16` | Packed binary16 values, explicitly rounded to nearest with ties to even | Automatic ladder ceiling and reference; explicit browser default |
 | `fp8` | E4M3FN bytes, four values per word, with an f32 scale for each position and KV head | First native ladder rung, accepted only by the model gate |
 
 FP8 uses the smallest power-of-two row scale that puts the row's maximum
@@ -146,7 +147,7 @@ cache is therefore not a global exact-precision mode.
 Native generation, chat and benchmarks default to a deterministic load-time
 ladder. Each class is ordered fastest-first:
 
-- attention KV: **FP8 → f16 → f32**;
+- attention KV: **FP8 → f16**;
 - prefill GEMM operands: **FP16 single product → FP16 compensated two
   products → scalar f32**;
 - weight storage: **stored** only. There are no unimplemented weight rungs
@@ -163,17 +164,21 @@ unsupported and skipped before its quality trial. If memory information
 is unavailable, loading explicitly warns that fit filtering is disabled.
 
 The loader runs a fixed coding/language text (the first 64 model-tokenized
-positions) through the exact device path, with f32 KV and scalar operands.
-The oracle uses only the short probe context, not a full-size f32 serving
-cache. It tries fitting KV candidates first with scalar operands, then
-supported operand candidates with the chosen KV. The latter comparison uses
-the same exact logits, so the combined choice must pass, not merely its
-isolated classes. If no quality-passing KV rung fits, the loader uses the
-most accurate fitting rung and emits an explicit warning that the unchanged
-quality gate was not satisfied; it never silently allocates a non-fitting
-f32 fallback. If no rung fits at all, loading fails with the budget and
-context in the error. Explicit KV/exact requests also must fit. Dawn
-currently has only scalar-f32 prefill. Browser loading still uses its
+positions) through the exact operand path, with **f16 KV and scalar operands**.
+It measures FP8 against that f16-KV reference. f16 is always acceptable:
+there is no automatic f32-KV rung and no quality gate that can reject the
+reference itself. It then checks supported prefill-operand candidates with
+f16 KV against the same scalar-operand reference.
+
+If FP8 fails its quality gate or does not fit, the loader selects f16 when
+it fits. If f16 does not fit but FP8 does, the loader preserves the existing
+warned FP8 fallback, explicitly disclosing any failed quality gate. If no
+automatic rung fits, loading fails with the budget and context in the error.
+Explicit KV/exact requests also must fit. `--precision exact` means scalar
+operands and f16 KV unless `--kv` explicitly requests another format.
+The automatic KV ladder is FP8 → f16; f32 KV is available on explicit
+request (`--kv f32`) for normal inference as well as correctness checks.
+Dawn currently has only scalar-f32 prefill. Browser loading still uses its
 explicit KV option and does not run native calibration.
 
 The model policy in `src/precision.zig` requires top-1 agreement ≥99%,
@@ -191,18 +196,23 @@ This is a short calibration gate, not a guarantee about every future prompt
 or long-context workload. The existing strict kernel/model correctness
 gates are separate and are not relaxed.
 
-The native JSON plan cache records selected rungs and gate observations
-alongside tuning. A valid hit restores the same choice and skips the gate.
+The versioned native JSON plan cache records selected rungs and gate
+observations alongside tuning. Caches predating the f16 reference and
+two-rung KV ladder are invalidated rather than restoring automatic f32
+choices. A valid hit restores the same choice and skips the gate.
 The key includes requested context, device memory budget, requested
 overrides, model/header identity, native operand capability, all backend
 shader variants and the versioned gate and memory policies. Its JSON also
-records the budget, headroom, resident weights and each KV rung's program
-allocation estimate.
+records the budget, headroom, resident weights and each automatic KV rung's
+program allocation estimate.
 `--no-tune` skips only the decode sweep, not quality selection; cache metadata
 distinguishes a quality-only entry from completed empty tuning.
 
-### Memory-aware selections on the RTX 5090 Laptop
+### Historical memory-aware selections on the RTX 5090 Laptop
 
+The following table predates the f16-ceiling policy and used f32-KV
+calibration. It records the former behavior, not the current automatic
+choices. Updated measurements use the f16 reference.
 The 2026-10-31 runs used the unchanged 64-position quality gate, stored
 weights and the requested full serving context. Each cell is **KV /
 prefill operands**:

@@ -30,6 +30,7 @@ class PrecisionChecks(unittest.TestCase):
         self.report = {
             "selection": self.selection.copy(),
             "gate": GATE.copy(),
+            "reference_kv": "f16",
             "observations": [{"selection": self.selection.copy(), "metrics": self.metrics.copy()}],
             "metrics": self.metrics.copy(),
         }
@@ -132,6 +133,8 @@ class PrecisionChecks(unittest.TestCase):
             lambda r: r["gate"].update(max_rel_l2=1),
             lambda r: r["selection"].update(kv="fp8"),
             lambda r: r["selection"].update(prefill="unknown"),
+            lambda r: r["selection"].update(kv="f32"),
+            lambda r: r.update(reference_kv="f32"),
             lambda r: r["metrics"].update(mean_kl=np.nan),
             lambda r: r["metrics"].update(positions=63),
             lambda r: r["metrics"].update(top1_matches=63),
@@ -162,9 +165,9 @@ class PrecisionChecks(unittest.TestCase):
 
             def cpu(paths, kind, gguf, tokens, out, cmd):
                 calls.append(("cpu", gguf))
-                options = ["--kv", "f32"] if gguf == gyro else []
+                options = ["--kv", "f16"]
                 self.assertEqual(cmd, ["zllm", "forward", str(gguf), str(tokens), str(out), *options])
-                self.assertEqual(kind, "zllm-forward precision --kv f32")
+                self.assertEqual(kind, "zllm-forward precision --kv f16")
                 self.assertEqual(np.fromfile(tokens, dtype="<i4").tolist(), list(range(64)))
                 name = b"result_output"
                 out.write_bytes(struct.pack("<I", len(name)) + name + struct.pack("<Iqq", 2, 2, 64) + self.reference.astype("<f4").tobytes())
@@ -173,7 +176,7 @@ class PrecisionChecks(unittest.TestCase):
                 self.assertEqual(check_precision.main(), 0)
             self.assertEqual(calls, [("gpu", model), ("cpu", model), ("gpu", gyro), ("cpu", gyro)])
             report = json.loads((root / "reports" / "precision.json").read_text())
-            self.assertEqual([r["reference_kv"] for r in report], ["f32", "f32"])
+            self.assertEqual([r["reference_kv"] for r in report], ["f16", "f16"])
             self.assertTrue(all(r["cpu_metrics"]["top1_matches"] == 64 for r in report))
 
     def test_shared_gpu_batch_requests_exact_and_retains_run_kv(self) -> None:
