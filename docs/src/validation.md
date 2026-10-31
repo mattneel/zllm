@@ -45,7 +45,7 @@ The pins live in `scripts/fixtures.sh`, which downloads into the gitignored
 | Model | [`ggml-org/Qwen3.5-0.8B-GGUF`](https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF) @ `807dfd9a6fadbf703207aac3bfb0b2b3040d077c`, file `Qwen3.5-0.8B-BF16.gguf`, SHA-256 `9a7bed4041b7975e0f71fa34670d1e9025213bc92905ac0db75d36c4fa3fa623` |
 | GGUF header | bytes 0–10962463 of the same file (metadata and tensor index), SHA-256 `4c21351af5833ba7aec5063df9400a087ca60884f4052e440ba1b80b265fd4a5` |
 | Hugging Face tokenizer | [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) @ `2fc06364715b967f1860aea9cf38778875588b17`, `tokenizer.json` SHA-256 `5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42` |
-| llama.cpp | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) @ `e09a78a25dec3f42175ad59ecc540a54bed0b9b2`, CPU build with `GGML_NATIVE=OFF` |
+| llama.cpp | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) @ `e09a78a25dec3f42175ad59ecc540a54bed0b9b2`, CPU build with `GGML_NATIVE=OFF`; recorded x86 runtime enables SSE3, SSSE3, AVX, AVX2, F16C, FMA and BMI2 |
 | Dawn | [`google/dawn`](https://github.com/google/dawn) release `v20261027.184652` (`106704a9ac3fc21b1580ea85aea302ac17d416f1`); `webgpu.h` vendored in `third_party/dawn` |
 | `tokenizers` | 0.23.3, locked in `tools/uv.lock` |
 | Chat template | [`froggeric/Qwen-Fixed-Chat-Templates`](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) @ `855bffc49448e299789730ff92c9b8d834d6cc14`, `chat_template.jinja` (v22.5) SHA-256 `e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2`; Jinja2 3.1.6, locked in `tools/uv.lock` |
@@ -562,14 +562,51 @@ stay in the file mapping, and each thread of the reference multiply decodes
 a 32-row panel just before using it. A 148-token sequence takes 8 s on 32
 threads.
 
-`zig build check-rounding` compares 8,192 activation values per format
-bitwise with ggml's exported quantizers and decoders. Its probes distinguish
-Q8_K's `nearest_int` (halfway to even) from Q8_0's `roundf` (halfway away
-from zero), including each half step's immediate f32 neighbors and signed
-zero. Both GPU shaders and the CPU emulation preserve that distinction.
-Restoring tie-away Q8_K rounding deliberately fails the independent oracle.
-The GPU probes additionally check exact half steps, so a shared incorrect
-rule cannot pass solely by agreement between zllm's implementations.
+`zig build check-rounding` compares activation values bitwise with the
+quantizers and decoders used by the pinned CPU build. The active x86
+`libggml-cpu` Q8_0 encoder uses `_MM_ROUND_NEAREST` (halfway to even)
+and computes its integer multiplier directly as `127 / amax`.
+`libggml-base`'s scalar Q8_0 **file quantizer** instead uses `roundf`
+(halfway away) and `1 / (amax / 127)`; the different f32 operation order
+can change an integer code near a half step. The rounded forward reference
+must emulate the active former path, not the scalar latter path.
+Q8_K's `nearest_int` is halfway to even as well.
+
+The same pinned CPU runtime accumulates RMSNorm's **f32 products** in f64,
+then rounds the mean, square root and reciprocal to f32. The reference
+follows that order; the GPU uses a compensated two-float reduction without
+requiring shader f64. This is build-and-CPU-path-specific evidence, not a
+claim that all upstream architecture-specific encoders use identical rules.
+Exact half-step probes and their immediate f32 neighbors prevent the
+implementations from passing merely by sharing an incorrect rounding rule.
+
+The runtime-fidelity correction keeps every existing quality bound unchanged.
+On the RTX 5090 Laptop, both Dawn and Agility still pass `check-gpu` for
+Qwen3.5 0.8B, Qwen3 0.6B, Llama 3.2 1B and Granite 4.2 3B, including the
+prefill/decode split, each KV format and engine reuse/recovery checks.
+Their worst first-layer F32-KV relative L2 errors after the change are:
+
+| Model | Prefill max | Decode max |
+|---|---:|---:|
+| Qwen3.5 0.8B (all five eval texts) | 1.41e-6 | 3.13e-6 |
+| Qwen3 0.6B (prose) | 1.26e-6 | 1.87e-6 |
+| Llama 3.2 1B (prose) | 1.36e-6 | 2.37e-6 |
+| Granite 4.2 3B (prose) | 8.85e-7 | 2.03e-6 |
+
+The existing large quantized fixtures also pass `check-quant` on both
+backends. The table compares retained pre-correction observations with the
+new run; these columns are the **worst sequence median** first-layer relative
+L2, not the per-position maxima above:
+
+| Model | Rounded reference vs llama.cpp: before → after | GPU prefill vs rounded reference: before → after |
+|---|---:|---:|
+| Qwen3.8 27B Q3_K_M | 3.40e-5 → 1.28e-6 | 2.89e-5 → 4.14e-5 |
+| Granite 4.2 30B Q4_K_M | 3.56e-7 → 3.55e-7 | 3.50e-7 → 3.54e-7 |
+
+All four first-layer results remain below the unchanged 1e-4 bound.
+The Gyro-Coder's `check-gyro --fast` regression also passes on both backends:
+66/66 top-1 positions, 40/40 runtime greedy tokens, zero expert flips, and
+bitwise equality across split steps and fused/unfused runs.
 
 ### The 27B
 

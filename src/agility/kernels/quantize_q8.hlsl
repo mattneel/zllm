@@ -1,37 +1,16 @@
 // Rounds activation rows to Q8_K or Q8_0 from quantize_q8.wgsl, with
-// optional RMSNorm or SiLU(gate)*up, exact division and ggml's rounding.
-groupshared float squares[64];
+// optional RMSNorm or SiLU(gate)*up, exact division and pinned x86 CPU
+// tie-even rounding (Q8_0's scalar reference instead rounds ties away).
+groupshared float2 squares[64];
+groupshared float row_scale;
 groupshared float4 vals[64];
 groupshared float2 best[64];
 float4 load_x(uint v) { return asfloat(rw(1).Load4(base(1) + 16u * v)); }
 float4 load_nw(uint v) { return asfloat(ro(4).Load4(base(4) + 16u * v)); }
-float div_rn(float a, float b) {
-    uint ua = asuint(a), ub = asuint(b);
-    uint signbit = (ua ^ ub) & 0x80000000u;
-    int e = int((ua >> 23u) & 0xffu) - int((ub >> 23u) & 0xffu) + 127;
-    uint ma = (ua & 0x7fffffu) | 0x800000u;
-    uint mb = (ub & 0x7fffffu) | 0x800000u;
-    uint rem = ma;
-    if (ma < mb) { rem = ma << 1u; e -= 1; }
-    uint q = 0u;
-    for (uint i = 0u; i < 25u; i++) {
-        q <<= 1u;
-        if (rem >= mb) { rem -= mb; q |= 1u; }
-        rem <<= 1u;
-    }
-    uint m = q >> 1u;
-    if ((q & 1u) == 1u && (rem != 0u || (m & 1u) == 1u)) m += 1u;
-    if (m == 0x1000000u) { m = 0x800000u; e += 1; }
-    return asfloat(signbit | (uint(e) << 23u) | (m & 0x7fffffu));
-}
 float f16_rne(float x) {
     uint u = asuint(x);
     if (((u >> 23u) & 0xffu) < 113u) return round(x * 16777216.0) * (1.0 / 16777216.0);
     return asfloat((u + 0xfffu + ((u >> 13u) & 1u)) & 0xffffe000u);
-}
-float round_away(float y) {
-    float t = trunc(y);
-    return abs(y - t) == 0.5 ? t + sign(y) : round(y);
 }
 float round_even(float y) {
     return float(int(asuint(y + 12582912.0)) - 0x4b400000);
@@ -48,19 +27,24 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
         v = g / (1.0 + exp(-g)) * load_x(src + k / 4u);
     } else v = load_x(xbase + li);
     if (mode == 1u) {
-        precise float sum = 0.0;
+        float2 sum = 0.0;
         for (uint i = li; i < k / 4u; i += 64u) {
             float4 r = load_x(row * (k / 4u) + i);
-            sum += dot(r, r);
+            precise float4 square = r * r;
+            sum = norm_add(sum, square.x);
+            sum = norm_add(sum, square.y);
+            sum = norm_add(sum, square.z);
+            sum = norm_add(sum, square.w);
         }
         squares[li] = sum;
         GroupMemoryBarrierWithGroupSync();
         for (uint s = 32u; s > 0u; s /= 2u) {
-            if (li < s) { precise float v = squares[li] + squares[li + s]; squares[li] = v; }
+            if (li < s) squares[li] = norm_merge(squares[li], squares[li + s]);
             GroupMemoryBarrierWithGroupSync();
         }
-        precise float scale = 1.0 / sqrt(squares[0] / float(k) + paramf(3));
-        v = v * scale * load_nw(wg.x * 64u + li);
+        if (li == 0u) row_scale = norm_scale(squares[0], k, paramf(3));
+        GroupMemoryBarrierWithGroupSync();
+        v = v * row_scale * load_nw(wg.x * 64u + li);
     }
     vals[li] = v;
     float4 a = abs(v);
@@ -92,9 +76,9 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
     } else {
         if (lead.x != 0.0) {
             float d32 = div_rn(lead.x, 127.0);
-            float id = div_rn(1.0, d32);
+            float id = div_rn(127.0, lead.x);
             d = f16_rne(d32);
-            q = float4(round_away(v.x * id), round_away(v.y * id), round_away(v.z * id), round_away(v.w * id));
+            q = float4(round_even(v.x * id), round_even(v.y * id), round_even(v.z * id), round_even(v.w * id));
         }
     }
     int4 qi = int4(q);

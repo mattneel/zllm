@@ -300,6 +300,9 @@ test "half-weight prefill specializes real single and compensated products" {
 fn composed(comptime name: []const u8) []const u8 {
     @setEvalBranchQuota(10_000);
     if (std.mem.eql(u8, name, "matmul_q8_0_float")) return @embedFile("kernels/matmul_q8_0_float.hlsl");
+    if (std.mem.eql(u8, name, "rmsnorm") or std.mem.eql(u8, name, "quantize_q8")) {
+        return @embedFile("kernels/norm.hlsli") ++ @embedFile("kernels/" ++ name ++ ".hlsl");
+    }
     for (std.enums.values(kernels.QuantOp)) |op| {
         for ([_][]const u8{ "bf16", "f16" }) |h| {
             if (std.mem.eql(u8, name, @tagName(op) ++ "_" ++ h)) {

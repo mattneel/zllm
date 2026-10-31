@@ -8,8 +8,8 @@
 //! registers. There are no horizontal reductions. A thread walks its panels;
 //! each 128 KiB panel stays in L2 while every token block streams past.
 //!
-//! Accumulation is in f32, as in the rest of the reference; only the
-//! summation order differs from a naive dot product.
+//! Accumulation is in f32; only the summation order differs from a naive
+//! f32 dot product.
 //!
 //! Quantized weights are not packed at load: in f32 a 27B model would need
 //! 108 GB. They stay in the file mapping, and each thread decodes a panel
@@ -194,11 +194,14 @@ pub fn matmul(pool: *Pool, out: []f32, x_in: []const f32, w: *const Matrix, rows
     pool.parallelFor(w.panels(), 1, 1, &ctx, Ctx.run);
 }
 
-/// Rounds one row of activations as ggml's CPU backend quantizes them for a
-/// dot product with weights of type `t` (quantize_row_q8_0_ref,
-/// quantize_row_q8_K_ref, GGML_FP32_TO_BF16, f16), back to f32; f32
-/// weights take f32 activations.
+/// Rounds one row of activations as the pinned actual x86 ggml CPU backend
+/// quantizes them for a dot product with weights of type `t`, back to f32.
+/// Q8_0 uses arch/x86/quants.c quantize_row_q8_0 (ties-even and 127/amax),
+/// not the scalar file quantizer quantize_row_q8_0_ref (ties-away and 1/d).
+/// K-quants use quantize_row_q8_K_ref; bf16/f16 use their ggml conversions.
+/// f32 weights take f32 activations.
 pub fn roundLikeLlama(t: gguf.TensorType, x: []f32) void {
+    @setFloatMode(.strict);
     switch (t) {
         .q8_0 => {
             var b: usize = 0;
@@ -207,10 +210,13 @@ pub fn roundLikeLlama(t: gguf.TensorType, x: []f32) void {
                 var amax: f32 = 0;
                 for (blk) |v| amax = @max(amax, @abs(v));
                 const d = amax / 127;
-                const id: f32 = if (d != 0) 1 / d else 0;
+                const id: f32 = if (amax != 0) 127 / amax else 0;
                 const d16: f32 = @as(f16, @floatCast(d));
                 for (blk) |*v| {
-                    const q: i8 = @intFromFloat(@round(v.* * id));
+                    // The x86 AVX quantizer rounds scaled values to nearest
+                    // even. Within [-127, 127], ggml's nearest_int trick is exact.
+                    const bits: i32 = @bitCast(v.* * id + @as(f32, 12582912));
+                    const q: i8 = @intCast(bits - 0x4b400000);
                     v.* = @as(f32, @floatFromInt(q)) * d16;
                 }
             }
@@ -366,7 +372,7 @@ test "quantized matrices decode panels on the fly" {
     };
 }
 
-test "Q8_K rounds halfway values to even while Q8_0 rounds away" {
+test "Q8_K and actual x86 Q8_0 round halfway values to even" {
     var x: [256]f32 = @splat(0);
     x[0] = 127;
     x[1..7].* = .{ 0.5, 1.5, 2.5, -0.5, -1.5, -2.5 };
@@ -375,6 +381,20 @@ test "Q8_K rounds halfway values to even while Q8_0 rounds away" {
     roundLikeLlama(.q4_k, &x);
     try std.testing.expectEqualSlices(f32, &.{ 0, 2, 2, 0, -2, -2 }, x[1..7]);
     roundLikeLlama(.q8_0, &q8);
-    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, -1, -2, -3 }, q8[1..7]);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 2, 2, 0, -2, -2 }, q8[1..7]);
     try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(q8[7])));
+}
+
+test "actual x86 Q8_0 uses 127 over amax before rounding" {
+    var x: [32]f32 = @splat(0);
+    x[0] = @bitCast(@as(u32, 0x3f80000f));
+    x[1] = @bitCast(@as(u32, 0x3ca14298));
+    x[2] = -x[1];
+    // 127/amax gives exactly +/-2.5; 1/(amax/127) gives +/-2.5000002.
+    // With the runtime multiplier, ties-even selects +/-2 rather than +/-3.
+    roundLikeLlama(.q8_0, &x);
+    const d: f32 = @as(f16, @floatCast(@as(f32, @bitCast(@as(u32, 0x3f80000f))) / 127));
+    try std.testing.expectEqual(@as(f32, 127) * d, x[0]);
+    try std.testing.expectEqual(@as(f32, 2) * d, x[1]);
+    try std.testing.expectEqual(@as(f32, -2) * d, x[2]);
 }

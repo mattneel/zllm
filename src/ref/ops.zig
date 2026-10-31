@@ -1,7 +1,7 @@
-//! CPU f32 reference operators: straightforward loops with f32 accumulation.
+//! CPU reference operators. RMSNorm follows pinned ggml's mixed-precision
+//! reduction; other reductions use f32 accumulation.
 //! They define correct results for the GPU kernels, so clarity comes first.
-//! The matrix multiply, which dominates run time, is tuned separately in
-//! matmul.zig.
+//! The matrix multiply is tuned separately in matmul.zig.
 
 const std = @import("std");
 
@@ -23,10 +23,20 @@ pub fn dot(a: []const f32, b: []const f32) f32 {
 }
 
 /// In place: x / sqrt(mean(x²) + eps) * weight.
+/// Shared by both activation modes: pinned ggml-cpu/ops.cpp RMSNorm sums f32
+/// squares in f64, divides in f64, then uses an f32 mean, sqrt and reciprocal.
+/// Keep this accurate normalization global rather than duplicating every caller
+/// for the rounded-reference diagnostic. Multiplications remain x * scale * w.
 pub fn rmsNorm(x: []f32, weight: []const f32, eps: f32) void {
+    @setFloatMode(.strict);
     std.debug.assert(x.len == weight.len);
-    const mean = dot(x, x) / @as(f32, @floatFromInt(x.len));
-    const scale = 1.0 / @sqrt(mean + eps);
+    var sum: f64 = 0;
+    for (x) |v| {
+        const square: f32 = v * v;
+        sum += square;
+    }
+    const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(x.len)));
+    const scale: f32 = 1.0 / @sqrt(mean + eps);
     for (x, weight) |*v, w| v.* = v.* * scale * w;
 }
 
@@ -124,4 +134,35 @@ test "norms" {
     rmsNorm(&b, &.{ 1, 0.5 }, 0);
     try std.testing.expectApproxEqAbs(@as(f32, 1), b[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -0.5), b[1], 1e-6);
+}
+
+test "RMSNorm matches pinned ggml arithmetic bitwise" {
+    // Independent oracle: each input square rounded to f32, sequential f64
+    // sum/division, f32 mean/add/sqrt/reciprocal, then f32 x*scale followed by *w.
+    // This fixture distinguishes f64 squares, f32 reduction, f64 mean/sqrt,
+    // division by sqrt instead of reciprocal multiplication, and x*(scale*w).
+    const input = [_]u32{
+        0xbf857c32, 0xbf8d2c0b, 0xbfa5eb34, 0x3ddf5988, 0xbdc29599,
+        0x3e230df4, 0xc10ccddd, 0x4052123d, 0xbf446fd1, 0xbf128c7d,
+        0xbe8b3a39, 0x3f1207f1, 0xbf78507a, 0x3d3ab508, 0x406c1281,
+        0x3e8f5b63, 0x3f2c4248,
+    };
+    const weight = [_]u32{
+        0x3e9d12e6, 0x3f923ccb, 0xbf00548d, 0x3f07a020, 0x3f840c9f,
+        0x3f407d1a, 0xbfeefd55, 0xbf682ff8, 0x3e78a781, 0x3ea24f78,
+        0xbf9ced24, 0x3e55d151, 0x3fd00030, 0x3ffb9078, 0xbfab6e01,
+        0xbf50616f, 0x3fa4b9e8,
+    };
+    const expected = [_]u32{
+        0xbe019766, 0xbeff32a0, 0x3e839a3d, 0x3cbb39dd, 0xbd1ecfe4,
+        0x3d41fd3a, 0x40cffc64, 0xbf96bc37, 0xbd96f2c6, 0xbd930467,
+        0x3e070a0f, 0x3d40fcae, 0xbf1f9dac, 0x3d11269c, 0xbffa21fc,
+        0xbdb8a2bc, 0x3eaf61ac,
+    };
+    var x: [input.len]f32 = undefined;
+    var w: [weight.len]f32 = undefined;
+    for (&x, input) |*v, bits| v.* = @bitCast(bits);
+    for (&w, weight) |*v, bits| v.* = @bitCast(bits);
+    rmsNorm(&x, &w, 1e-5);
+    for (x, expected) |v, bits| try std.testing.expectEqual(bits, @as(u32, @bitCast(v)));
 }

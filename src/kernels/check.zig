@@ -15,6 +15,7 @@ const P = kernels.params;
 const gguf = @import("../gguf/gguf.zig");
 const ref_tensor = @import("../ref/tensor.zig");
 const ref_matmul = @import("../ref/matmul.zig");
+const ref_ops = @import("../ref/ops.zig");
 const fp8 = @import("../ref/fp8.zig");
 const KvFormat = @import("../plan/common.zig").KvFormat;
 const precision = @import("../precision.zig");
@@ -41,21 +42,22 @@ pub fn run(gpa: Allocator, device: platform.Device, host: *Host, out: *std.Io.Wr
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,         checkMatmul,            checkMatmulChunked,       checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair,  checkMatmulF16,         checkMatvecNormF16,       checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,         checkEmbed,             checkRopeAppendF32,       checkRopeAppendF16,     checkRopeAppendRounding,
-        checkRopeAppendDense, checkRopeAppendQwen3,   checkRopeAppendFp8Values, checkRopeAppendFp8,     checkAttentionF32,
-        checkAttentionF16,    checkAttentionFp8,      checkAttentionWide,       checkAttentionUngated,  checkAttnDecode,
-        checkAttnDecodeWide,  checkAttnDecodeUngated, checkAttnSparse,          checkQsaIndexer,        checkDeltaPrep,
-        checkDeltaKeep,       checkDeltaRule,         checkGatedNormSigmoid,    checkDraft,             checkGyroMatvec,
-        checkMoeRoute,        checkRotate128,         checkMoeCombine,          checkHc,                checkPle,
-        checkSampleGreedy,    checkSampleTopKTopP,    checkSampleMinP,          checkSampleTopP,        checkSamplePlain,
-        checkSampleTopK1,     checkSampleLargeTopK,   checkSampleTopKSkipped,   checkSampleVocab,       Quant(.q8_0).matvec,
-        Quant(.q8_0).matmul,  Quant(.q8_0).embed,     checkEmbedStride,         Quant(.q3_k).matvec,    Quant(.q3_k).matmul,
-        Quant(.q3_k).embed,   Quant(.q4_k).matvec,    Quant(.q4_k).matmul,      Quant(.q4_k).embed,     Quant(.q5_k).matvec,
-        Quant(.q5_k).matmul,  Quant(.q5_k).embed,     Quant(.q6_k).matvec,      Quant(.q6_k).matmul,    Quant(.q6_k).embed,
-        checkQuantTiles,      checkQuantSiluPair,     checkQuantAct,            checkQuantizeQ8K,       checkQuantizeQ80,
-        checkQuantizeNorm,    checkQuantizeSilu,      checkGyroMatmul,          checkMatmulQ80Float,    checkQuantQ80Tiles,
+        checkRmsNorm,         checkMatmul,                  checkMatmulChunked,           checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair,  checkMatmulF16,               checkMatvecNormF16,           checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,         checkEmbed,                   checkRopeAppendF32,           checkRopeAppendF16,     checkRopeAppendRounding,
+        checkRopeAppendDense, checkRopeAppendQwen3,         checkRopeAppendFp8Values,     checkRopeAppendFp8,     checkAttentionF32,
+        checkAttentionF16,    checkAttentionFp8,            checkAttentionWide,           checkAttentionUngated,  checkAttnDecode,
+        checkAttnDecodeWide,  checkAttnDecodeUngated,       checkAttnSparse,              checkQsaIndexer,        checkDeltaPrep,
+        checkDeltaKeep,       checkDeltaRule,               checkGatedNormSigmoid,        checkDraft,             checkGyroMatvec,
+        checkMoeRoute,        checkRotate128,               checkMoeCombine,              checkHc,                checkPle,
+        checkSampleGreedy,    checkSampleTopKTopP,          checkSampleMinP,              checkSampleTopP,        checkSamplePlain,
+        checkSampleTopK1,     checkSampleLargeTopK,         checkSampleTopKSkipped,       checkSampleVocab,       Quant(.q8_0).matvec,
+        Quant(.q8_0).matmul,  Quant(.q8_0).embed,           checkEmbedStride,             Quant(.q3_k).matvec,    Quant(.q3_k).matmul,
+        Quant(.q3_k).embed,   Quant(.q4_k).matvec,          Quant(.q4_k).matmul,          Quant(.q4_k).embed,     Quant(.q5_k).matvec,
+        Quant(.q5_k).matmul,  Quant(.q5_k).embed,           Quant(.q6_k).matvec,          Quant(.q6_k).matmul,    Quant(.q6_k).embed,
+        checkQuantTiles,      checkQuantSiluPair,           checkQuantAct,                checkQuantizeQ8K,       checkQuantizeQ80,
+        checkQuantizeNorm,    checkQuantizeSilu,            checkGyroMatmul,              checkMatmulQ80Float,    checkQuantQ80Tiles,
+        checkRmsNormDiscrete, checkQuantizeNormQ8KDiscrete, checkQuantizeNormQ80Discrete,
     }) |f| {
         ok = try report(&ctx, f, out) and ok;
         _ = arena_state.reset(.retain_capacity);
@@ -510,7 +512,7 @@ fn quantizeX(c: *Ctx, t: gguf.TensorType, x: kernels.Arg, rows: u32, k: u32) !Ac
 /// quantize_q8 against the reference's rounding (roundLikeLlama), value
 /// for value: rows of random values, one whose largest magnitude is
 /// negative, one with a tie between +amax and −amax, a zero row and exact
-/// half-integer probes distinguishing Q8_K tie-even from Q8_0 tie-away.
+/// half-integer probes requiring both Q8_K and the active x86 Q8_0's tie-even.
 fn checkQuantize(c: *Ctx, t: gguf.TensorType, name: []const u8) !Result {
     const rows = 6;
     const k = 512;
@@ -589,6 +591,147 @@ fn checkQuantizeQ8K(c: *Ctx) !Result {
 
 fn checkQuantizeQ80(c: *Ctx) !Result {
     return checkQuantize(c, .q8_0, "quantize_q8 Q8_0 (32)");
+}
+
+const NormProbe = struct {
+    const rows = 3;
+    const k = 7168;
+    const eps: f32 = 1e-6;
+
+    x: []f32,
+    w: []f32,
+    normalized: []f32,
+
+    fn init(allocator: Allocator) !NormProbe {
+        const x = try allocator.alloc(f32, rows * k);
+        const w = try allocator.alloc(f32, k);
+        const normalized = try allocator.alloc(f32, rows * k);
+        // A wide row whose small, exactly representable f32 squares are
+        // lost by both old reductions (256 scalar lanes / 64 vec4 lanes).
+        // The next row uses model-like discrete residual values instead.
+        var state: u32 = 0x71685eed;
+        for (0..k) |i| {
+            const sign: f32 = if (i % 2 == 0) 1 else -1;
+            x[i] = sign * (if (i < 256) @as(f32, 32) else 1.0 / 256.0);
+            state = state *% 1664525 +% 1013904223;
+            const discrete: i32 = @as(i32, @intCast((state >> 16) & 2047)) * 2 - 2047;
+            x[k + i] = @as(f32, @floatFromInt(discrete)) / 512.0;
+        }
+        @memset(x[2 * k ..], 0);
+        @memset(w, 1);
+        @memcpy(normalized, x);
+        ref_ops.rmsNorm(normalized[0..k], w, eps);
+        for (w, 0..) |*weight, i| {
+            // Every Q8_0 block (and therefore every Q8_K block) has a
+            // positive 127 anchor. Other values sit on or one f32 ULP
+            // beside signed half steps, exposing norm and tie mutations.
+            var target: f32 = if (i % 32 == 0) 127 else @as(f32, @floatFromInt(@as(i32, @intCast(i % 61)) - 30)) + 0.5;
+            if (i % 32 != 0) {
+                var bits: u32 = @bitCast(target);
+                if (i % 3 == 0) bits += 1;
+                if (i % 3 == 1) bits -= 1;
+                target = @bitCast(bits);
+            }
+            weight.* = target / normalized[i];
+        }
+        @memcpy(normalized, x);
+        for (0..rows) |r| ref_ops.rmsNorm(normalized[r * k ..][0..k], w, eps);
+        return .{ .x = x, .w = w, .normalized = normalized };
+    }
+};
+
+fn checkRmsNormDiscrete(c: *Ctx) !Result {
+    const probe = try NormProbe.init(c.arena);
+    const y = try c.output(NormProbe.rows * NormProbe.k);
+    try c.launcher().launch(.rmsnorm, P.RmsNorm{ .rows = NormProbe.rows, .dim = NormProbe.k, .eps = NormProbe.eps }, &.{ try c.upload(probe.x), try c.upload(probe.w), y }, .{ NormProbe.rows, 1, 1 });
+    const got = try c.read(y);
+    // Use row-local scales: the zero and half-step rows must not be hidden
+    // by the discrete row's much larger weighted outputs.
+    var worst: f64 = 0;
+    for (0..NormProbe.rows) |r| {
+        const want = try c.arena.alloc(f64, NormProbe.k);
+        for (want, probe.normalized[r * NormProbe.k ..][0..NormProbe.k]) |*dst, value| dst.* = value;
+        worst = worse(worst, relErr(got[r * NormProbe.k ..][0..NormProbe.k], want));
+    }
+    return .{ .name = "rmsnorm discrete 7168 (CPU f64 sum)", .err = worst, .tolerance = 3e-7 };
+}
+
+fn checkQuantizeNormDiscrete(c: *Ctx, t: gguf.TensorType, name: []const u8) !Result {
+    const probe = try NormProbe.init(c.arena);
+    const k = NormProbe.k;
+    const rows = NormProbe.rows;
+    const block = kernels.actBlock(t);
+    const xa = try c.upload(probe.x);
+    const wa = try c.upload(probe.w);
+    const y = try c.output(rows * k);
+    try c.launcher().launch(.rmsnorm, P.RmsNorm{ .rows = rows, .dim = k, .eps = NormProbe.eps }, &.{ xa, wa, y }, .{ rows, 1, 1 });
+    const separate = try quantizeX(c, t, y, rows, k);
+    const fused: Act = .{ .qx = try c.output(rows * k / 4), .dx = try c.output(rows * k / block) };
+    try c.launcher().launch(.quantize_q8, P.QuantizeQ8{ .k = k, .block = block, .mode = 1, .eps = NormProbe.eps }, &.{ xa, fused.qx, fused.dx, wa }, .{ k / 256, rows, 1 });
+    const want = try c.arena.dupe(f32, probe.normalized);
+    for (0..rows) |r| ref_matmul.roundLikeLlama(t, want[r * k ..][0..k]);
+    var worst: f64 = 0;
+    for ([_]Act{ separate, fused }) |act| {
+        const words = try c.readWords(act.qx);
+        const scales = try c.read(act.dx);
+        for (want, 0..) |value, i| {
+            const q: i8 = @bitCast(@as(u8, @truncate(words[i / 4] >> @intCast(8 * (i % 4)))));
+            const got = @as(f32, @floatFromInt(q)) * scales[i / block];
+            if (!std.math.isFinite(got) or got != value) worst = 1;
+        }
+    }
+    return .{ .name = name, .err = worst, .tolerance = 0 };
+}
+
+fn checkQuantizeNormQ8KDiscrete(c: *Ctx) !Result {
+    return checkQuantizeNormDiscrete(c, .q4_k, "norm+Q8_K discrete 7168 exact");
+}
+
+fn checkQuantizeNormQ80Discrete(c: *Ctx) !Result {
+    return checkQuantizeNormDiscrete(c, .q8_0, "norm+Q8_0 discrete 7168 exact");
+}
+
+// Reproduce the removed uncompensated reductions only as mutations of the
+// probe's reference, never as its expected answer.
+fn uncompensatedNorm(out: []f32, x: []const f32, w: []const f32, comptime vector: bool) void {
+    const lanes = if (vector) 64 else 256;
+    var sums: [lanes]f32 = @splat(0);
+    for (&sums, 0..) |*sum, li| {
+        var i = li * (if (vector) @as(usize, 4) else 1);
+        while (i < x.len) : (i += 256) {
+            if (vector) {
+                const a = x[i] * x[i];
+                const b = x[i + 1] * x[i + 1];
+                const d = x[i + 2] * x[i + 2];
+                const e = x[i + 3] * x[i + 3];
+                sum.* += ((a + b) + d) + e;
+            } else sum.* += x[i] * x[i];
+        }
+    }
+    var stride: usize = lanes / 2;
+    while (stride > 0) : (stride /= 2) {
+        for (0..stride) |i| sums[i] += sums[i + stride];
+    }
+    const scale = 1.0 / @sqrt(sums[0] / @as(f32, @floatFromInt(x.len)) + NormProbe.eps);
+    for (out, x, w) |*dst, value, weight| dst.* = value * scale * weight;
+}
+
+test "wide discrete norm probes reject uncompensated reductions before Q8" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const probe = try NormProbe.init(arena.allocator());
+    const mutant = try arena.allocator().alloc(f32, NormProbe.k);
+    inline for (.{ false, true }) |vector| {
+        uncompensatedNorm(mutant, probe.x[0..NormProbe.k], probe.w, vector);
+        try std.testing.expect(!std.mem.eql(f32, mutant, probe.normalized[0..NormProbe.k]));
+        inline for (.{ gguf.TensorType.q8_0, gguf.TensorType.q4_k }) |t| {
+            uncompensatedNorm(mutant, probe.x[0..NormProbe.k], probe.w, vector);
+            ref_matmul.roundLikeLlama(t, mutant);
+            const want = try arena.allocator().dupe(f32, probe.normalized[0..NormProbe.k]);
+            ref_matmul.roundLikeLlama(t, want);
+            try std.testing.expect(!std.mem.eql(f32, mutant, want));
+        }
+    }
 }
 
 fn floatQ8Accurate(got: []const f32, want: []const f64) bool {

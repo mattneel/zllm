@@ -14,10 +14,11 @@
 // - block = 256 (Q8_K, for the K-quants): d = −max / 127, where max is the
 //   block's value of largest magnitude (the first, on ties); q = −127 · x /
 //   max, rounded, at most 127.
-// - block = 32 (Q8_0): d = amax / 127 rounded to f16; q = x / d unrounded
-//   d, rounded.
+// - block = 32 (Q8_0): d = amax / 127 rounded to f16; q = x * (127 / amax).
 //
-// Q8_K rounds halfway to even; Q8_0 rounds halfway away from zero, as ggml.
+// Both round halfway to even, matching .fixtures/llama.cpp's active
+// ggml/src/ggml-cpu/arch/x86/quants.c quantize_row_q8_0 (not the scalar
+// quantize_row_q8_0_ref, which rounds halfway away from zero).
 // q goes to `qx`, four per word
 // (dot4I8Packed order), d to `dx`, one per block. A workgroup takes 256
 // values of one row: one Q8_K block, or eight Q8_0 blocks of 8 threads each.
@@ -40,48 +41,13 @@ struct Params {
 // The RMSNorm weights (mode 1; bound to anything otherwise).
 @group(0) @binding(4) var<storage, read> nw: array<vec4f>;
 
-var<workgroup> squares: array<f32, 64>;
+var<workgroup> squares: array<vec2f, 64>;
+var<workgroup> row_scale: f32;
 // The workgroup's computed values.
 var<workgroup> vals: array<vec4f, 64>;
 
 // Per thread: the largest magnitude among its values, and its index.
 var<workgroup> best: array<vec2f, 64>;
-
-// a / b rounded to nearest even, for normal a, b and quotient: long
-// division of the 24-bit significands, then a guard bit and the remainder
-// as sticky.
-fn div_rn(a: f32, b: f32) -> f32 {
-    let ua = bitcast<u32>(a);
-    let ub = bitcast<u32>(b);
-    let sign = (ua ^ ub) & 0x80000000u;
-    var e = i32((ua >> 23u) & 0xffu) - i32((ub >> 23u) & 0xffu) + 127;
-    let ma = (ua & 0x7fffffu) | 0x800000u;
-    let mb = (ub & 0x7fffffu) | 0x800000u;
-    var rem = ma;
-    if (ma < mb) {
-        rem = ma << 1u;
-        e -= 1;
-    }
-    // rem / mb is in [1, 2): 24 significand bits and a guard bit.
-    var q = 0u;
-    for (var i = 0u; i < 25u; i++) {
-        q <<= 1u;
-        if (rem >= mb) {
-            rem -= mb;
-            q |= 1u;
-        }
-        rem <<= 1u;
-    }
-    var m = q >> 1u;
-    if ((q & 1u) == 1u && (rem != 0u || (m & 1u) == 1u)) {
-        m += 1u;
-    }
-    if (m == 0x1000000u) {
-        m = 0x800000u;
-        e += 1;
-    }
-    return bitcast<f32>(sign | (u32(e) << 23u) | (m & 0x7fffffu));
-}
 
 // x ≥ 0 rounded to f16 precision, to nearest even, back to f32.
 fn f16_rne(x: f32) -> f32 {
@@ -91,11 +57,6 @@ fn f16_rne(x: f32) -> f32 {
         return round(x * 16777216.0) * (1.0 / 16777216.0);
     }
     return bitcast<f32>((u + 0xfffu + ((u >> 13u) & 1u)) & 0xffffe000u);
-}
-
-fn round_away(y: f32) -> f32 {
-    let t = trunc(y);
-    return select(round(y), t + sign(y), abs(y - t) == 0.5);
 }
 
 fn round_even(y: f32) -> f32 {
@@ -115,21 +76,28 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
         v = x[base + li];
     }
     if (p.mode == 1u) {
-        var sum = 0.0;
+        var sum = vec2f(0.0);
         for (var i = li; i < p.k / 4u; i += 64u) {
             let r = x[row * (p.k / 4u) + i];
-            sum += dot(r, r);
+            let square = r * r;
+            sum = norm_add(sum, square.x);
+            sum = norm_add(sum, square.y);
+            sum = norm_add(sum, square.z);
+            sum = norm_add(sum, square.w);
         }
         squares[li] = sum;
         workgroupBarrier();
         for (var s = 32u; s > 0u; s /= 2u) {
             if (li < s) {
-                squares[li] += squares[li + s];
+                squares[li] = norm_merge(squares[li], squares[li + s]);
             }
             workgroupBarrier();
         }
-        let scale = 1.0 / sqrt(squares[0] / f32(p.k) + p.eps);
-        v = v * scale * nw[wg.x * 64u + li];
+        if (li == 0u) {
+            row_scale = norm_scale(squares[0], p.k, p.eps);
+        }
+        workgroupBarrier();
+        v = v * row_scale * nw[wg.x * 64u + li];
     }
     vals[li] = v;
     let a = abs(v);
@@ -172,9 +140,9 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
     } else {
         if (lead.x != 0.0) {
             let d32 = div_rn(lead.x, 127.0);
-            let id = div_rn(1.0, d32);
+            let id = div_rn(127.0, lead.x);
             d = f16_rne(d32);
-            q = vec4f(round_away(v.x * id), round_away(v.y * id), round_away(v.z * id), round_away(v.w * id));
+            q = vec4f(round_even(v.x * id), round_even(v.y * id), round_even(v.z * id), round_even(v.w * id));
         }
     }
     let qi = vec4i(q);

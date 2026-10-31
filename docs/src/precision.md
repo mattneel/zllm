@@ -24,9 +24,11 @@ quality-gated selection policy described in [spec §9](spec.md#9-state-and-prefi
 | Gyro sparse indexer keys / pooled blocks | f16 / f32 | Separate from the attention KV choice |
 
 CPU forward passes are correctness references, not a CPU serving backend.
-The ordinary hybrid/dense reference uses f32 activations and accumulation.
-Its `--llama-activations` mode deliberately reproduces the reference
-runtime's multiply-operand rounding for quantized model comparisons.
+The ordinary hybrid/dense reference uses f32 activations and matrix
+accumulation; RMSNorm accumulates f32 squares in f64, matching the pinned
+CPU runtime. Its `--llama-activations` mode deliberately reproduces that
+runtime's active x86 multiply-operand rounding for quantized comparisons,
+including ties-to-even Q8_0 rather than the scalar file quantizer's rule.
 Gyro-Coder's CPU reference defaults to f16 attention and indexer caches.
 `forward --kv f32` selects f32 attention KV for the ladder oracle while
 retaining the model's fixed f16 indexer storage.

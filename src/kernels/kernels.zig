@@ -219,6 +219,9 @@ test "kernel contracts come from the WGSL's binding declarations" {
 fn composed(comptime name: []const u8) []const u8 {
     @setEvalBranchQuota(10_000);
     if (std.mem.eql(u8, name, "matmul_q8_0_float")) return @embedFile("matmul_q8_0_float.wgsl");
+    if (std.mem.eql(u8, name, "rmsnorm") or std.mem.eql(u8, name, "quantize_q8")) {
+        return @embedFile("norm.wgsl") ++ @embedFile(name ++ ".wgsl");
+    }
     for (std.enums.values(QuantOp)) |op| {
         for ([_][]const u8{ "bf16", "f16" }) |h| {
             if (std.mem.eql(u8, name, @tagName(op) ++ "_" ++ h)) {

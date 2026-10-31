@@ -1,0 +1,226 @@
+{
+  "date": "2026-10-31",
+  "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU",
+  "authority": {
+    "llama_revision": "e09a78a25dec3f42175ad59ecc540a54bed0b9b2",
+    "build": "GGML_NATIVE=OFF",
+    "active_cpu_capabilities": "SSE3 SSSE3 AVX AVX2 F16C FMA BMI2 LLAMAFILE OPENMP REPACK",
+    "q8_0": "active libggml-cpu quantize_row_q8_0: nearest-even, multiplier127/amax",
+    "q8_k": "libggml-base quantize_row_q8_K_ref: nearest-even",
+    "rmsnorm": "f32 squares, sequential f64 sum/division, f32 mean/sqrt/reciprocal, ordered x*scale*weight"
+  },
+  "bounds_changed": false,
+  "cause_capture": {
+    "normalization": {
+      "tokens": 40,
+      "values": 286720,
+      "reference_vs_llama_different_values": 132477,
+      "reference_vs_llama_max_ulps": 5,
+      "reference_vs_llama_max_relative": 3.571424e-07,
+      "ggml_order_recreation_different_values": 0
+    },
+    "q8_0": {
+      "scalar_file_vs_active_cpu_different_codes": 285,
+      "reference_norm_vs_llama_norm_active_different_codes": 150,
+      "integer_code_max_difference": 1,
+      "same_llama_norm_active_v_median_rel_l2": 1.854838751726721e-07,
+      "same_llama_norm_scalar_v_median_rel_l2": 0.00038400452311623454,
+      "reference_norm_active_v_median_rel_l2": 0.00017073430037386692
+    }
+  },
+  "before": {
+    "RVN-Q3_K_M-mtp": {
+      "model": "RVN-Q3_K_M-mtp.gguf",
+      "worst_first_layer": 3.396895159525696e-05,
+      "gpu_rounded": {
+        "ratio": 1.0757100617922681,
+        "first": 2.885117116134592e-05,
+        "agree": 810,
+        "total": 818
+      },
+      "gpu": {
+        "decode": [
+          0.9999999998172425,
+          2.0422746295627193e-05
+        ]
+      },
+      "worst_ratio": 1.0795425136687813
+    },
+    "granite-4.2-30b-Q4_K_M": {
+      "model": "granite-4.2-30b-Q4_K_M.gguf",
+      "worst_first_layer": 3.5587602687156235e-07,
+      "gpu_rounded": {
+        "ratio": 1.0470472954798797,
+        "first": 3.4984014042435244e-07,
+        "agree": 870,
+        "total": 890
+      },
+      "gpu": {
+        "decode": [
+          0.9999999994978899,
+          3.490159367400639e-05
+        ]
+      },
+      "worst_ratio": 1.06045553522367
+    },
+    "Nanbeige4.3-33B-AD-Q4_K_M": {
+      "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+      "worst_first_layer": 0.006330476877095469,
+      "gpu_rounded": {
+        "ratio": 1.0628034533970465,
+        "first": 0.005918212278943397,
+        "agree": 882,
+        "total": 901
+      },
+      "gpu": {
+        "decode": [
+          0.9999999997979439,
+          2.0634425710093766e-05
+        ]
+      },
+      "worst_ratio": 1.0814559108078055
+    }
+  },
+  "before_provenance": "Retained Qwen/Granite reports predate runtime-fidelity changes; Nanbeige before metrics are same-session runs with IQ4_XS support and unchanged check-quant thresholds.",
+  "after": {
+    "RVN-Q3_K_M-mtp": {
+      "model": "RVN-Q3_K_M-mtp.gguf",
+      "worst_first_layer": 1.277360888442179e-06,
+      "worst_ratio": 1.0594432625553207,
+      "gpu_rounded": {
+        "ratio": 1.0446938377363595,
+        "first": 4.1427017298389204e-05,
+        "agree": 804,
+        "total": 818
+      },
+      "gpu": {
+        "decode": [
+          0.999999999748352,
+          2.3865090814193513e-05
+        ]
+      }
+    },
+    "granite-4.2-30b-Q4_K_M": {
+      "model": "granite-4.2-30b-Q4_K_M.gguf",
+      "worst_first_layer": 3.55192458933106e-07,
+      "worst_ratio": 1.0342502339843516,
+      "gpu_rounded": {
+        "ratio": 1.064234372643777,
+        "first": 3.5365001206086285e-07,
+        "agree": 877,
+        "total": 890
+      },
+      "gpu": {
+        "decode": [
+          0.9999999997185525,
+          2.618569099808938e-05
+        ]
+      }
+    },
+    "Nanbeige4.3-33B-AD-Q4_K_M": {
+      "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+      "worst_first_layer": 0.001672560438730909,
+      "worst_ratio": 1.06347577204657,
+      "gpu_rounded": {
+        "ratio": 1.0815631673032957,
+        "first": 0.004112237921609885,
+        "agree": 881,
+        "total": 901
+      },
+      "gpu": {
+        "decode": [
+          0.9999999993833144,
+          4.5196102355626354e-05
+        ]
+      },
+      "top1_vs_llama": 0.9733629300776915,
+      "min_cos_vs_llama": 0.9089422901823175,
+      "sequences": [
+        {
+          "name": "prose",
+          "first_layer_emulated": 0.0007474654501173733,
+          "top1_vs_llama": 140
+        },
+        {
+          "name": "chat",
+          "first_layer_emulated": 0.0005303967272520176,
+          "top1_vs_llama": 128
+        },
+        {
+          "name": "code",
+          "first_layer_emulated": 0.000487045547997674,
+          "top1_vs_llama": 253
+        },
+        {
+          "name": "multilingual",
+          "first_layer_emulated": 0.001672560438730909,
+          "top1_vs_llama": 169
+        },
+        {
+          "name": "math",
+          "first_layer_emulated": 0.0002779955792234771,
+          "top1_vs_llama": 187
+        }
+      ]
+    }
+  },
+  "after_hosts": [
+    "Dawn D3D12",
+    "Agility D3D12"
+  ],
+  "after_host_note": "Both hosts pass existing model gates; Nanbeige fails the same10first-layer checks on both hosts. Structured reports are the final Agility observations except Nanbeige preserved Dawn; displayed summaries match across hosts.",
+  "small_model_gpu_max_first_layer_relative_l2": {
+    "Qwen3.5-0.8B-BF16.gguf": {
+      "prefill": 1.41e-06,
+      "decode": 3.13e-06,
+      "scope": "five eval texts"
+    },
+    "Qwen3-0.6B-BF16.gguf": {
+      "prefill": 1.26e-06,
+      "decode": 1.87e-06,
+      "scope": "prose"
+    },
+    "Llama-3.2-1B-Instruct-BF16.gguf": {
+      "prefill": 1.36e-06,
+      "decode": 2.37e-06,
+      "scope": "prose"
+    },
+    "granite-4.2-3b-bf16.gguf": {
+      "prefill": 8.85e-07,
+      "decode": 2.03e-06,
+      "scope": "prose"
+    }
+  },
+  "kernel_checks": {
+    "both_hosts_pass": true,
+    "norm_probe_width": 7168,
+    "norm_probe_relative_error": 0,
+    "quantized_norm_probe_q8_k_error": 0,
+    "quantized_norm_probe_q8_0_error": 0
+  },
+  "nanbeige_status": {
+    "model_gate_pass": false,
+    "failed_assertions_per_host": 10,
+    "first_layer_bound": 0.0001,
+    "strict_decode_top1": [
+      200,
+      200
+    ],
+    "strict_decode_max_relative_l2": 4.5196102355626354e-05,
+    "remaining_gap_cause": "Unresolved beyond identified/corrected active-quantizer and RMSNorm differences; thresholds were not relaxed."
+  },
+  "gyro_fast": {
+    "hosts": [
+      "d3d12",
+      "agility"
+    ],
+    "positions": 66,
+    "top1_agreement": 66,
+    "runtime_greedy_agreement": [
+      40,
+      40
+    ],
+    "expert_flips": 0,
+    "split_and_fusion_bitwise": true
+  }
+}
