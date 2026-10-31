@@ -1,27 +1,48 @@
 # Browser
 
-M3 runs the engine in the browser. `zllm.wasm` is the same Zig core the
-native CLI uses, built for `wasm32-freestanding`. `zllm.js` (`web/src/zllm`)
-is the shim around it: it runs the core's command batches on WebGPU, streams
-weights from the model file, and exposes the spec's JavaScript API.
+The browser runs the same Zig inference core as the native CLI, compiled
+for `wasm32-freestanding`. `zllm.js` (`web/src/zllm`) executes its command
+batches on WebGPU, reads weights from a GGUF source, and exposes streaming
+generation and an OpenAI-style chat facade. Inference runs locally; the
+browser is one host for the portable engine, not a separate model runtime.
 
-**[Try the demo](demo/)** in a browser with WebGPU (Chrome or Edge). It
-streams Qwen3.5-0.8B (1.5 GB, BF16) from Hugging Face by HTTP range reads,
-or loads a GGUF you pick from disk; the model stays in the browser's
-private file system for later visits. CI builds it into the book from the
-same commit.
+**[Try the live demo](https://mattneel.github.io/zllm/demo/)** in a browser
+with WebGPU, such as Chrome or Edge. Pick a pinned model from the list,
+paste a GGUF URL, or open a local file. The default is Qwen3.5-0.8B BF16
+from Hugging Face. URL loads can use the browser's private file system for
+later visits, subject to validators and storage quota.
+
+The `book` job in `.github/workflows/ci.yml` builds the book, `zllm.wasm`
+and the demo bundle from the same checkout, then uploads `docs/book` as one
+Pages artifact. Deployment runs after the CI jobs pass on a push to
+`master`. This keeps a published book and its demo on the same commit; it
+does not mean the demo has a GPU browser test in CI.
 
 ```sh
 zig build wasm            # zig-out/web/zllm.wasm
 cd web
+bun install --frozen-lockfile
 bun run dev               # demo on http://localhost:8080/, models from ../.fixtures/models
 bun run build             # dist/zllm.js and dist/zllm.wasm
 ```
+
+Use the published HTTPS demo or the localhost development server. Loading
+requires an available WebGPU adapter and enough device memory for the
+selected model's resident weights, state and context.
+Models served from another origin must permit the browser's range requests
+through CORS and expose `Content-Range`. URL caching also needs an exposed
+`ETag` or `Last-Modified`; a URL without one still loads, but is not cached.
+`urlSource` requires HTTP 206 responses and checks each returned range's
+length. A local file avoids these network requirements.
 
 ## API
 
 ```ts
 import * as zllm from "./zllm.js";
+
+const messages: zllm.ChatMessage[] = [
+  { role: "user", content: "Explain grouped-query attention." },
+];
 
 const engine = await zllm.load({
   model: "/models/Qwen3.5-0.8B-BF16.gguf", // URL (range requests), File, Blob or FileSystemFileHandle
@@ -30,7 +51,7 @@ const engine = await zllm.load({
 });
 
 for await (const chunk of engine.generate({ prompt: "Once upon a time", maxTokens: 200 })) {
-  out.textContent += chunk.text; // the last chunk carries finish and usage
+  console.log(chunk.text); // the last chunk carries finish and usage
 }
 
 for await (const chunk of engine.chat.completions.create({ messages, stream: true })) {
@@ -42,16 +63,50 @@ const reply = await engine.chat.completions.create({ messages, enable_thinking: 
 await engine.chat.completions.create({ messages, chat_template_kwargs: { date_string: "1 Nov 2026" } });
 
 // Tool calling, in the OpenAI format.
-const tools = [{ type: "function", function: { name: "get_weather", parameters: { /* JSON Schema */ } } }];
+const tools: zllm.Tool[] = [{
+  type: "function",
+  function: {
+    name: "get_weather",
+    parameters: {
+      type: "object",
+      properties: { city: { type: "string" } },
+      required: ["city"],
+    },
+  },
+}];
 const turn = await engine.chat.completions.create({ messages, tools });
-// turn.choices[0]: finish_reason "tool_calls", message.tool_calls [{ id, type, function: { name, arguments } }]
-messages.push(turn.choices[0].message, { role: "tool", tool_call_id: id, content: "18°C, clear" });
+// The app executes calls; zllm only generates and parses them.
+const call = turn.choices[0].message.tool_calls?.[0];
+if (call) {
+  messages.push(turn.choices[0].message);
+  messages.push({ role: "tool", tool_call_id: call.id, content: "18°C, clear" });
+}
 
 engine.tokenize("text"); engine.detokenize(ids);
 engine.interruptGenerate(); // or pass `signal`, or stop reading the stream
 engine.stats(); await engine.unload();
 await zllm.cacheUsage(); await zllm.clearCache();
 ```
+
+The facade's public types are exported from `web/src/zllm/index.ts`.
+It is an in-process API, not an HTTP server or the complete OpenAI API.
+
+| Area | Options and results |
+|---|---|
+| `load` | `model`: URL, `File`/`Blob`, `FileSystemFileHandle`, or a custom `ModelSource` with `size` and async `read(offset, length)` |
+| Device and memory | Optional `device`, `context` (default 8192), and `kv: "f16" \| "f32" \| "fp8"` (default f16) |
+| Loading | Optional `wasm` URL, `cache`, `tune`, and `onProgress` |
+| `generate` | `prompt` text or `tokens` ids; `maxTokens`, `sampling`, `stop`, `logprobs`, `speculate`, `signal` |
+| `sampling` | `temperature`, `topK`, `topP`, `minP`, repetition/presence/frequency penalties, `logitBias`, `seed` |
+| Chat | `messages`, `stream`, `max_tokens` or `max_completion_tokens`, snake-case sampling controls, thinking/template options, tools, logprobs, `signal` |
+| Completion | Final chunk includes finish reason and usage; raw usage includes prompt, cached and completion tokens, prefill steps, prefill and decode milliseconds |
+| `stats()` | Adapter, model metadata and sampling defaults, load time, weight-cache and tuning source, last usage, recovery count |
+
+Raw generation returns token ids and text on each chunk; text may be empty
+while UTF-8 or a possible stop string is pending. The final chunk has no
+tokens and carries `finish` and `usage`. Both generation and chat default
+to at most 4096 output tokens, subject to context capacity. Chat uses
+`max_completion_tokens` when both output-limit fields are present.
 
 - **Requests** run one at a time; a second waits for the first. What a
   request leaves unset takes the model's defaults, as `zllm chat` and
@@ -82,9 +137,11 @@ await zllm.cacheUsage(); await zllm.clearCache();
 
   A call that doesn't parse leaves the reply as text. Streamed text stops at
   the first call, and the calls arrive in one `tool_calls` delta at the end.
-  `tool_choice: "none"` leaves the tools out; forcing a call (`"required"`
-  or a named function) needs grammar-constrained decoding, which the spec
-  leaves out of v1.
+  A normally stopped reply with parsed calls reports `"tool_calls"`; a
+  length limit or abort keeps its own finish reason. `tool_choice: "none"`
+  leaves the tools out. The facade accepts `"auto"` and `"none"`, not
+  `"required"` or a named-function constraint; grammar-constrained decoding
+  is not implemented.
 - **Logprobs:** `logprobs: true` with `top_logprobs` (0 to 20) returns
   each generated token's log-probability under the model's raw logits and
   its most likely alternatives, in OpenAI's `choices[].logprobs.content`
@@ -93,8 +150,19 @@ await zllm.cacheUsage(); await zllm.clearCache();
   text is held back. Token text comes from detokenizing the single token,
   so a token that ends inside a UTF-8 character shows as U+FFFD.
 - **Cancelling** (`interruptGenerate`, the request's `AbortSignal`, or a
-  consumer that stops reading) ends the request after the GPU step in
-  flight, with finish reason `abort`.
+  consumer that stops reading) drains the work already in flight and ends
+  the request with finish reason `abort`. A signal already aborted before
+  the request starts throws instead. An early stream consumer does not
+  receive the final chunk, but the facade still drains the request before
+  releasing the next queued one.
+- **Template options:** `chat_template_kwargs` passes extra values to the
+  model's own template. For a non-streaming Granite reply,
+  `force_nonempty_content: true` returns reasoning as content if the reply
+  never reaches content and makes no tool calls.
+- **Lifetime:** `unload()` cancels active generation, waits for the queue,
+  and releases the model's buffers and core allocations. Create a new
+  engine to load another model. `cacheUsage()` counts complete model files;
+  `clearCache()` removes the `zllm` OPFS directory, including cached tuning.
 
 ## How it works
 
@@ -120,9 +188,10 @@ sequenceDiagram
 - **The core sees only the GGUF header.** The shim reads a prefix of the file
   (8 MiB, doubled until it parses). Every weight upload is a `write_file`
   command naming a range of the file. The shim reads it from the source in
-  32 MiB pieces, six at a time, and writes it straight to the GPU buffer. The
-  core holds about 70 MiB.
-- **The executor** (`gpu.ts`) is the browser twin of `host.zig`: one command
+  32 MiB pieces, six at a time, and writes it straight to the GPU buffer.
+  The original browser report recorded about 70 MiB in the core; this is
+  an observation, not a memory ceiling for every model and context.
+- **The executor** (`gpu.ts`) is the browser twin of `src/gpu/dawn_host.zig`: one command
   encoder per submit, one compute pass per run of dispatches, pipelines
   compiled with `createComputePipelineAsync` and awaited at first use.
 - **Exports** (`src/api/wasm.zig`) take and return plain numbers. Requests
@@ -130,15 +199,22 @@ sequenceDiagram
   in one fixed block of wasm memory. A negative return leaves an error
   message there.
 
+The timings below are historical hardware observations, not performance
+guarantees or new measurements of the current checkout. Source commits are
+identified where the repository records them; their dates are commit
+dates, not independently recorded benchmark execution dates. Native
+comparisons in these tables use Dawn's D3D12 host, not Velocity.
+
 ### Weight cache
 
-A model loaded from a URL is kept in the origin private file system (OPFS),
-so later loads read it from disk (`web/src/zllm/cache.ts`).
+A URL model can be kept in the origin private file system (OPFS), so later
+loads read it from disk when caching is available (`web/src/zllm/cache.ts`).
 
 - **Key:** a hash of the URL, the server's `ETag` or `Last-Modified`, and the
-  file size. A changed file has a new validator and so a new key, and an
-  entry is never stale. URLs served without a validator aren't cached, since
-  a change couldn't be detected. The probe that reads the validator bypasses
+  file size. A changed validator or size produces a new key. This relies on
+  the server updating its validator when bytes change. URLs served without
+  a validator aren't cached, since a change couldn't be detected. The probe
+  that reads the validator bypasses
   the HTTP cache, which would otherwise answer it with an old one; weight
   reads bypass it too, so the bytes aren't stored twice.
 - **Filling:** a first load writes every range it reads into the entry,
@@ -146,9 +222,9 @@ so later loads read it from disk (`web/src/zllm/cache.ts`).
   An interrupted load leaves an incomplete entry that later loads ignore and
   replace. Filling a new version of a URL removes the old one.
 - **Room:** an entry is only started when the storage estimate has room for
-  the whole file, and the page asks for persistent storage so the browser
-  doesn't evict it under pressure. Local files aren't cached: they are on
-  disk already.
+  the whole file. The page requests persistent storage, but the browser
+  decides whether to grant it. Local files aren't cached: they are on disk
+  already.
 
 | Qwen 3.5 0.8B BF16 (1.5 GB), Chrome | Load | Model requests |
 |---|---|---|
@@ -159,6 +235,9 @@ so later loads read it from disk (`web/src/zllm/cache.ts`).
 The cached load's output was identical to the native host's after each of:
 a fill, a reload, a changed file (refilled, one entry left), and a fill
 interrupted halfway.
+
+Source: `4714c18` (2026-10-29), which documented these cache measurements.
+They use localhost HTTP, not a measured Hugging Face download.
 
 ### Tuning and the plan cache
 
@@ -171,16 +250,27 @@ where it came from (`cached`, `swept` or `off`). In Chrome the Gyro-Coder's
 first load sweeps for 8 s (29.4 s in all); later loads read the tuning from
 the cache (21.8 s).
 
+Source: `7f494e0` (2026-10-30). This cache stores tuning parameters; it does
+not preserve live GPU buffers or compiled pipelines. A cache hit still
+loads weights, creates pipelines and the step program, and calibrates.
+
 ### Device lost
 
 A request in flight when the device is lost (a driver reset, a GPU hang,
-`engine.device.destroy()`) fails with `DeviceLostError`. The next request
-first loads the model again on a new device of the engine's own, from the
-same source, with the tuning from the plan cache, and then runs; the
-resident sequence is gone. `stats().recoveries` counts the rebuilds. In
-Chrome, with the 0.8B, a device destroyed in the middle of a request fails
-it with `DeviceLostError`, and the next greedy request gives the same tokens
-as before the loss; so does one after a loss between requests.
+or `engine.device.destroy()`) fails with the exported `DeviceLostError`.
+It is not replayed automatically. The next request first attempts to load
+the model again from the same source on a new device owned by the engine,
+using cached tuning when available. Even if the app supplied the original
+device, recovery creates a new one. The resident sequence is gone, so the
+new request prefills its prompt again. Recovery can itself fail if the
+source or a usable device is no longer available.
+
+`engine.device` exposes the current device; `stats().recoveries` counts
+successful rebuilds. In the Chrome 0.8B checks recorded in `7929127`
+(2026-10-30), destroying the device during a request failed that request
+with `DeviceLostError`, and the next greedy request reproduced the earlier
+tokens. Loss between requests was checked too. These are exercised
+recovery cases, not a promise that every driver failure is recoverable.
 
 ### Two steps in flight
 
@@ -205,6 +295,8 @@ file read through the `\\wsl` share. The first request after load runs its
 prefill pipelines for the first time, which costs about 130 ms more; later
 ones don't.
 
+Source: `2acacac` (2026-10-29), the browser execution and readback report.
+
 ### The 27B
 
 Qwen 3.8 27B at Q3_K_M (13.75 GB) runs in Chrome on the same GPU:
@@ -215,15 +307,15 @@ Qwen 3.8 27B at Q3_K_M (13.75 GB) runs in Chrome on the same GPU:
 | Load from a local file | 15.3 s |
 | Decode, 3,016 tokens of a chat reply | 27.3 tok/s |
 
-The spec's bar for a warm load is 40 s, from the weight cache. On this
-machine Chrome gives the origin a 12.3 GB quota, which follows the disk's
-free space (53 GB), so the 13.75 GB file doesn't fit and the cache
-declines it. Loading it uncached over localhost already takes 25.8 s.
+The design spec's warm-load target is 40 s. On the recorded machine Chrome
+gave the origin a 12.3 GB quota, with 53 GB of disk free, so the 13.75 GB
+file did not fit and the cache declined it. The uncached localhost load
+and local-file load above are different paths; neither is evidence of an
+OPFS cache hit for this model.
 
-A model picked as a local file needs no cache: its bytes are on disk
-already. Loaded that way, the 27B takes 15.3 s, the warm load the spec's
-40 s bar is about, since the API takes a `FileSystemFileHandle` an app can
-keep and reopen.
+A local file needs no weight-cache copy. An app can retain a
+`FileSystemFileHandle` and reopen it, subject to browser permissions. These
+observations were documented in `81244f5` and `a3f49e4` (2026-10-29).
 
 ### Qwen3.8-Flash-Next Gyro-Coder
 
@@ -247,6 +339,12 @@ in flight here, not two
 runtime's prompt, Chrome gives that runtime's 40 tokens; from a chat
 prompt, the same 128 tokens as `zllm generate`.
 
+The browser figures were documented in `47ec8f0` and `2a2cadf`
+(2026-10-30); cached tuning was added in `7f494e0` later that day.
+They predate subsequent native and WGSL kernel changes, so the table is a
+recorded comparison, not the latest backend ranking. See [Gyro-Coder](gyro.md)
+for the model and [Performance](performance.md) for broader context.
+
 ## Validation
 
 - **Same output as native.** In Chrome on the RTX 5090, greedy generation
@@ -264,9 +362,18 @@ prompt, the same 128 tokens as `zllm generate`.
 
 ## Not yet
 
-- **Model and template coverage:** Qwen 3.5 and 3.8 GGUFs (BF16, F16 and the
-  quantized types; the Gyro-Coder up to 32,768 tokens of context), with the
-  fixed Qwen template. Rendering a GGUF's own chat template with
-  `@huggingface/jinja` is still to come.
-- **Plan cache:** a plan cache (M4) would skip setup work that a cached
-  load still does: compiling pipelines and calibrating.
+- **Coverage is model-specific:** the engine handles the supported Qwen
+  hybrid and dense architectures, Llama, Granite and the Gyro-Coder.
+  Dense models already render their own GGUF chat templates with the
+  core's Jinja interpreter; the fixed Qwen template is not the only path.
+  A model selector entry is not evidence that every browser or device can
+  load that model. See [Backends](backends.md) and [Validation](validation.md).
+- **One resident sequence:** requests queue, rather than run as a
+  multi-user batch. Multiple GPUs and grammar-constrained output are not
+  implemented.
+- **Precision selection:** f16 is the default KV format. FP8 is available
+  by explicit request, but automatic model-quality-gated precision
+  selection is not implemented; see [Precision](precision.md).
+- **Cache scope:** the weight cache and tuning cache exist. Caching a
+  complete compiled execution plan or browser GPU pipelines is not
+  implemented.

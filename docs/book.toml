@@ -1,6 +1,6 @@
 [book]
 title = "zllm"
-description = "vLLM-class LLM inference on WebGPU from one Zig codebase"
+description = "Portable inference from one Zig core, with accuracy gates and hardware-specific backends"
 authors = ["Matt Neel"]
 language = "en"
 src = "src"

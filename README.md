@@ -1,82 +1,86 @@
 # zllm
 
 [![CI](https://github.com/mattneel/zllm/actions/workflows/ci.yml/badge.svg)](https://github.com/mattneel/zllm/actions/workflows/ci.yml)
-[![Book](https://img.shields.io/badge/book-mattneel.github.io%2Fzllm-blue)](https://mattneel.github.io/zllm/) [![Demo](https://img.shields.io/badge/demo-WebGPU%20chat-green)](https://mattneel.github.io/zllm/demo/)
 
-LLM inference on WebGPU from one Zig codebase, built to the standard of a server engine like vLLM.
+zllm is a portable inference engine. It aims to deliver tokens as fast and
+as accurately as the hardware allows, on every supported platform.
 
-- **GGUF in, tokens out.** It loads stock GGUF files directly, with no per-model compile step and no converted weight format.
-- **One core, two backends.** The same Zig core targets `wasm32-freestanding` behind a thin TypeScript shim in the browser, and Dawn natively for tests.
-- **Kernels shaped to your GPU.** WGSL is generated from templates, then autotuned, fused and cached for each GPU and model.
-- **Hybrid models first.** The first targets are Qwen 3.5, 3.6 and 3.8 (Gated DeltaNet plus full attention), from 0.8B to 27B.
-- **OpenAI-style streaming API.** `chat.completions.create` in the browser, with the model cached on disk after the first load.
+**[Try the live browser demo](https://mattneel.github.io/zllm/demo/)** ·
+**[Read the book](https://mattneel.github.io/zllm/)**
 
-> **Status: M3 done, so Qwen 3.5 0.8B runs in the browser on WebGPU, at native speed.** M0 delivered the GGUF reader, the Qwen tokenizer and a CPU f32 reference forward pass, checked against llama.cpp and Hugging Face. M1 put the forward pass on the GPU through Dawn, matching the reference on all 818 eval positions. M2 added generation:
->
-> - an engine that schedules steps under a 150 ms budget;
-> - KV-cache and DeltaNet-state reuse, bitwise exact against fresh runs;
-> - a GPU sampler with vLLM's semantics;
-> - the fixed Qwen chat template.
->
-> M3 builds the core to `zllm.wasm` behind the `zllm.js` shim: Chrome generates the same tokens as the native host at 252–295 tok/s on an RTX 5090 Laptop, through `generate` and OpenAI-style `chat.completions.create`, and reloads the cached model in about a second.
->
-> M6 is done: Qwen 3.8 27B at Q3_K_M runs on the GPU, matching the CPU reference and, up to its activation rounding, llama.cpp. On an RTX 5090 Laptop it decodes at about 30 tok/s (bar: 20), prefills at about 320 tok/s (bar: 300), loads in Chrome from a local file in 15.3 s (bar: 40 s), and soaks for 10 minutes with no submission over 250 ms. M7 has started: speculative decoding with the model's MTP block takes the 27B's native decode to 37–41 tok/s, bitwise the same output.
->
-> Qwen3.8-Flash-Next Gyro-Coder, a 125B mixture-of-experts model in AgentionAI's Gyro trellis formats (75.8 GB), runs natively and in Chrome with up to 32,768 tokens of context (its sparse attention included): about 21 GB of weights on the GPU, its 50.7 GiB per-layer embedding table read from the file per token. Greedy, it reproduces its reference runtime's tokens, natively and in Chrome, where it loads from the picked file in about 20 s; on an RTX 5090 Laptop it decodes at 35–38 tok/s natively and 21–22 in Chrome.
->
-> Dense transformers run too: Qwen 3, Llama 3 and Granite 4 (`qwen3`, `llama`, `granite`), with their tokenizers. Their CPU reference matches llama.cpp, and the GPU matches the reference, on Qwen3-0.6B, Llama-3.2-1B and Granite 4.2 3B. They chat in their own GGUF templates, rendered by zllm's Jinja interpreter exactly as transformers renders them. Granite 4.2 30B at Q4_K_M matches the CPU reference and, up to its activation rounding, llama.cpp; on an RTX 5090 Laptop it prefills at 209 tok/s and decodes at 25 tok/s. See [Dense transformers](https://mattneel.github.io/zllm/dense.html).
->
-> M4's decode kernels and M5's fusion rules have started: generation runs at about 285 tok/s and prefill at about 2,890 tok/s, up from 25–34 and 1,560 at M2. See [Browser](https://mattneel.github.io/zllm/browser.html), [Generation](https://mattneel.github.io/zllm/generation.html), [Validation](https://mattneel.github.io/zllm/validation.html) and the [roadmap](https://mattneel.github.io/zllm/introduction.html#status).
+- **One Zig core:** GGUF loading, graphs, execution plans, fusion, tuning,
+  plan caching, scheduling, GPU sampling, tokenizers and chat templates.
+- **Platform backends:** WebGPU through Dawn natively and wasm in the
+  browser; Velocity for native D3D12 with Agility SDK and DirectStorage
+  integration. CUDA is planned, not implemented.
+- **Models:** Qwen 3.5/3.6/3.8 hybrid; Qwen 3, Llama 3 and Granite 4 dense;
+  Qwen3.8-Flash-Next Gyro-Coder with MoE, hyper-connections, sparse attention
+  and per-layer embeddings.
+- **Accuracy gates:** GPU kernels are checked against CPU references;
+  model gates compare with the reference and pinned upstream runtimes.
+  Available lower-precision formats are not a blanket quality guarantee.
+- **Shared browser API:** streaming `generate` and OpenAI-style
+  `chat.completions.create`. CI builds the published demo and book from the
+  same checkout.
 
-## Building
+See the [status](https://mattneel.github.io/zllm/introduction.html#status),
+[backend capability matrix](https://mattneel.github.io/zllm/backends.html),
+[precision guide](https://mattneel.github.io/zllm/precision.html), and
+[dated performance results](https://mattneel.github.io/zllm/performance.html).
+Coverage is fixture- and device-specific; the documentation distinguishes
+implemented paths, validated configurations and roadmap goals.
 
-The Zig version is pinned in `build.zig.zon` as `minimum_zig_version`. [anyzig](https://github.com/marler8997/anyzig) selects it automatically.
+## Quick start
 
-```sh
-zig build test        # unit tests
-zig fmt --check .     # formatting
-```
-
-The parity checks need the pinned fixtures (GGUF, Hugging Face tokenizer, llama.cpp, Dawn), each verified by SHA-256 or commit hash, plus [uv](https://docs.astral.sh/uv/):
+The Zig version is pinned by `minimum_zig_version` in `build.zig.zon`.
+[anyzig](https://github.com/marler8997/anyzig) selects it automatically.
+Build the CLI and fetch the pinned model and Dawn runtime:
 
 ```sh
-scripts/fixtures.sh          # downloads into .fixtures/ (gitignored)
-zig build check-gguf         # GGUF reader vs llama.cpp gguf-dump
-zig build check-tokenizer    # tokenizer vs Hugging Face
-zig build check-chat         # chat prompts vs the pinned Jinja chat template
-zig build check-forward      # CPU reference vs llama.cpp
-zig build gpu-check          # every GPU kernel vs a CPU computation
-zig build check-gpu          # GPU forward pass vs the CPU reference, step splits, engine
+zig build -Doptimize=ReleaseSafe
+scripts/fixtures.sh model
+scripts/fixtures.sh dawn
+ZLLM_DAWN=.fixtures/dawn/libwebgpu_dawn.so \
+  zig-out/bin/zllm chat .fixtures/models/Qwen3.5-0.8B-BF16.gguf
 ```
 
-To chat (after `scripts/fixtures.sh model` and `scripts/fixtures.sh dawn`):
+The command above uses Linux Dawn. For Windows/WSL and Velocity, see
+[Getting started](https://mattneel.github.io/zllm/getting-started.html).
+`ZLLM_BACKEND=webgpu` is the native default; `ZLLM_BACKEND=velocity`
+requires a Windows build with Velocity enabled and its SDK/runtime files.
+
+For the local browser demo, with [Bun](https://bun.sh):
 
 ```sh
-ZLLM_DAWN=.fixtures/dawn/libwebgpu_dawn.so zig-out/bin/zllm chat .fixtures/models/Qwen3.5-0.8B-BF16.gguf
-scripts/d3d12.sh chat "$(wslpath -w .fixtures/models/Qwen3.5-0.8B-BF16.gguf)"   # WSL, Windows GPU
+zig build wasm
+(cd web && bun install --frozen-lockfile && bun run dev)
 ```
 
-In the browser (Chrome or another browser with WebGPU, after `scripts/fixtures.sh model`), with [Bun](https://bun.sh):
+Open `http://localhost:8080/`. Load a local GGUF or use the demo's model
+URLs. See [Browser](https://mattneel.github.io/zllm/browser.html) for the
+API, weight cache and device-lost recovery.
+
+## Documentation and development
+
+The [book](https://mattneel.github.io/zllm/) covers
+[architecture](https://mattneel.github.io/zllm/architecture.html),
+[models](https://mattneel.github.io/zllm/models.html),
+[generation](https://mattneel.github.io/zllm/generation.html),
+[validation](https://mattneel.github.io/zllm/validation.html), and the
+[roadmap](https://mattneel.github.io/zllm/roadmap.html), including planned
+CUDA, model families, Z-Image and MiniMax-H3 work.
+
+To build the book locally:
 
 ```sh
-zig build wasm                   # zig-out/web/zllm.wasm
-cd web && bun install && bun run dev   # chat demo on http://localhost:8080/
+(cd web && bun install --frozen-lockfile && bun run build:book)
+mdbook build docs
 ```
 
-Add `-Dgpu-host=d3d12` to the GPU checks to run them on a Windows GPU from WSL (see [GPU backend](https://mattneel.github.io/zllm/gpu.html)).
-
-zllm runs on more than one GPU backend: WebGPU (Dawn natively, and the browser), and Velocity, a native Direct3D 12 backend with its own HLSL kernels, LinAlg wave matrices and DirectStorage (see [Velocity](https://mattneel.github.io/zllm/velocity.html)). `ZLLM_BACKEND=velocity` selects it.
-
-## Documentation
-
-The book is at **[mattneel.github.io/zllm](https://mattneel.github.io/zllm/)** and contains the spec, the architecture, the GGUF tensor semantics for each model, and the validation contract. To build it locally:
-
-```sh
-(cd web && bun install && bun run build:book)   # bundles the book's TypeScript
-mdbook serve docs
-```
-
-See [Contributing](https://mattneel.github.io/zllm/contributing.html) for the toolchain, the checks and the commit conventions.
+Read [Contributing](https://mattneel.github.io/zllm/contributing.html) for
+the toolchain, checks and commit conventions. The CPU reference is a
+correctness oracle, not a CPU inference backend. GPU performance changes
+must pass their accuracy gates.
 
 ## Funding
 
@@ -84,4 +88,4 @@ If zllm is useful to you, consider [sponsoring @mattneel](https://github.com/spo
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Model weights retain their own licenses.

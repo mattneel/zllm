@@ -1,26 +1,33 @@
 # GPU backend
 
-The GPU path has three layers. The core records a **command stream**, a
-**host** executes it on WebGPU, and **kernels** are WGSL compute shaders the
-stream launches. M1 provides all three, with Dawn as the host, and runs the
-full Qwen 3.5 forward pass on the GPU at parity with the CPU reference. M2
-turns the forward pass into a **step program**: prebuilt launches that
-process any number of tokens against a KV cache and the DeltaNet state, and
-sample the next token on the GPU ([Generation](generation.md)).
+The GPU path has three layers: the shared Zig core records a **command
+stream**, a backend **host** executes it, and backend-specific **kernels**
+perform the work. WebGPU uses WGSL in the browser and through native Dawn;
+[Velocity](velocity.md) uses hand-written HLSL on native D3D12. Both run the
+same model plans, scheduler, sampler, tuner and fusion legality rules.
+
+The plans are **step programs**: buffers, bindings and launch lists built
+once, then replayed for prefill or decode against KV caches and recurrent
+state. They cover Qwen 3.5, the supported dense models and
+Qwen3.8-Flash-Next. See [Architecture](architecture.md),
+[Generation](generation.md) and the [backend matrix](backends.md).
 
 ## Hosts
 
-| Host | WebGPU | Adapter here | Used for |
-|---|---|---|---|
-| Native Linux | Dawn → Vulkan | llvmpipe (Mesa's software renderer) | CI, kernel correctness |
-| Windows, run from WSL | Dawn → D3D12 | RTX 5090 Laptop | Local parity and timing |
-| Browser | Chrome's Dawn → D3D12/Metal/Vulkan | RTX 5090 Laptop (D3D12) | The product ([Browser](browser.md)) |
+The existing documentation records these exercised host paths:
 
-The spec targets D3D12, Metal and Vulkan. D3D12 runs on the 5090 and
-Vulkan on llvmpipe in CI; Metal and hardware Vulkan haven't been run, for
-want of the hardware. The kernels use only core WebGPU plus `shader-f16`
-where available and the packed 4×8 integer builtins, which all three
-backends offer.
+| Host | GPU API path | Recorded adapter | Use |
+|---|---|---|---|
+| Native Linux | Dawn → Vulkan | llvmpipe (Mesa's software renderer) | Kernel and forward-pass correctness |
+| Windows, run from WSL | Dawn → D3D12 | RTX 5090 Laptop | Native parity and timing |
+| Browser | Chrome WebGPU → D3D12 | RTX 5090 Laptop | Browser inference and parity |
+| Native Windows | Velocity → D3D12 | RTX 5090 Laptop | HLSL parity, DirectStorage and native optimization |
+
+WebGPU also provides Metal and hardware Vulkan paths, but the existing
+validation record does not establish runs on those adapters. The current
+WGSL kernels use portable compute and packed integer operations, not native
+tensor-core or matrix intrinsics. Velocity's capabilities and remaining
+matrix-kernel work are described separately in [Velocity](velocity.md).
 
 Dawn comes from the pinned prebuilt release. Its static archive is wrapped
 into a shared library (`libwebgpu_dawn.so`, `webgpu_dawn.dll`) that exports
@@ -44,9 +51,10 @@ native Linux host falls back to llvmpipe.
 
 ## Command stream
 
-The core never calls WebGPU. It appends commands to a `Recorder`
+The core never calls a GPU API. It appends commands to a `Recorder`
 (`src/gpu/cmd.zig`), a host executes the batch, and the core consumes one
-completion per `submit` and per `read_buffer`. The browser host
+completion per `submit` and per `read_buffer`. The native platform interface
+(`src/gpu/host.zig`) selects Dawn or Velocity. The browser host
 (`web/src/zllm/gpu.ts`) interprets the same words, crossing the wasm/JS
 boundary once per batch rather than once per dispatch.
 
@@ -86,16 +94,21 @@ counts as shared GPU memory, on top of 22 GB of dedicated memory.
 
 ## Kernels
 
-Kernels live in `src/kernels/*.wgsl`, each with a uniform `Params` struct
-mirrored in `kernels.zig`. Weights stay in their GGUF format on the GPU,
-BF16, F16 or quantized, and are decoded in the shader; activations and
-accumulation are f32, except that the quantized prefill multiplies round
-their input to 8 bits as llama.cpp does (below). Two changes to the
-format, made at load: Q6_K blocks (210 bytes) are padded to 224, so every
-K-quant block starts on a 16-byte boundary and is read in 16-byte vectors;
-and Q3_K blocks (110 bytes) are repacked into eight 16-byte units of 32
-weights, each holding its 2-bit values, high bits, two scales and d, so a
-unit decodes from one load (128 bytes per block).
+The WebGPU implementations live in `src/kernels/*.wgsl`. Kernel identities,
+uniform parameter structs and binding contracts are in `kernels.zig`;
+Velocity supplies the corresponding HLSL artifacts. Weights retain their
+BF16, F16 or supported quantized values and are decoded in the shader.
+Activations and accumulation are f32, except that quantized prefill
+multiplies round their input to 8 bits as llama.cpp does (below).
+
+Three weight layouts change at load:
+
+- Q6_K blocks grow from 210 to 224 bytes, keeping 16-byte vector loads aligned.
+- Q3_K blocks are repacked from 110 to 128 bytes: eight self-contained
+  16-byte units with values, high bits, scales and `d`.
+- Q8_0 matrix rows put their i8 values first, then their f16 scales, padded
+  to 16 bytes. Decode tasks read 16 values in one aligned load. PLE rows
+  read directly from the file keep the original 34-byte blocks.
 
 | Kernel | Work | Notes |
 |---|---|---|
@@ -104,34 +117,51 @@ unit decodes from one load (128 bytes per block).
 | `matmul_bf16`, `matmul_f16` | x · Wᵀ, prefill | 16 tokens × 64 outputs per workgroup; tiles staged in workgroup memory. Optionally adds into the output (the residual) |
 | `matvec_bf16`, `matvec_f16` | x · Wᵀ, decode | The half-precision kernels are `matvec_half.wgsl`, `matmul_half.wgsl` and `embed_half.wgsl`, composed with `half/bf16.wgsl` or `half/f16.wgsl`, which widen a word's two values. 8 rows per workgroup, each row's dot product over 32 lanes reading 16-byte weight vectors, then a fixed tree. Optionally RMSNorms the staged input first, adds into the output, or computes SiLU(gate) · up over stacked gate and up rows |
 | `silu_mul` | SwiGLU over the stacked gate and up projection, prefill | Elementwise |
-| `rope_append` | Q/K RMSNorm (optional), partial RoPE (NeoX pairs, or the dense models' normal pairs) at positions pos0 + t, and the K/V cache write | One workgroup per (head, token) of the stacked Q, K, V projection, whose query heads are interleaved with output gates (Qwen 3.5) or not (the dense models). Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π]. The cache holds f16 pairs (`pack2x16float`) or f32 |
+| `rope_append` | Q/K RMSNorm (optional), partial RoPE (NeoX pairs, or the dense models' normal pairs) at positions pos0 + t, and the K/V cache write | One workgroup per (head, token) of the stacked Q, K, V projection, whose query heads are interleaved with output gates (Qwen 3.5) or not (the dense models). Reads a host-built (cos, sin) table: WGSL trig is only accurate near [−π, π]. The cache holds f32, f16 pairs, or scaled E4M3FN FP8 |
 | `attn_split`, `attn_combine` | Causal GQA over the cache, with the sigmoid output gate where the model has one (flash-decoding) | One workgroup per (KV head, 64 cache positions, token) scores the block for the whole GQA group and takes a local softmax (groups of up to 8 query heads; `attn_split_wide` takes up to 12, whose queries fill WebGPU's 16 KB of workgroup memory, which costs the 27B's prefill 2% if used for its groups of 6); the combine merges the blocks. Prefill steps run them in chunks of 32 tokens, so the partials hold one chunk; a token's result depends only on its position. The 27B's prefill attention at position 5,000 dropped from 96 to 61 ms a step when this replaced a kernel with one workgroup per (head, query) |
 | `qsa_keys`, `qsa_pool`, `qsa_score`, `qsa_select`, `attn_split_sparse` | Qwen3.8-Flash-Next's sparse attention: the indexer's queries (norm, RoPE) and keys (an f16 cache), each block of `ratio` keys pooled (mean, norm, RoPE at its start), every block's score Σ_heads relu(q · block), the top blocks, and attention over the selected cells | Exact selection: the scores are never negative, so their bits order as their values; one workgroup per row finds the K-th largest bit by bit and breaks ties by index with a scan. `attn_split_sparse` is `attn_split_wide` with an inclusion test composed in (`attn_sparse.wgsl`; `attn_dense.wgsl` for the others). An excluded key weighs 0, even where a whole 64-key block is excluded |
 | `delta_prep` | DeltaNet front end: causal conv and SiLU, L2 norm of q and k, β and decay gates | One workgroup per (head of channels, token); inputs before the step come from the conv history |
 | `delta_rule` | Gated delta rule | Each thread keeps 16 rows of one state column in registers for the whole step; a head spans 4 workgroups. Also advances the conv history, and can keep the state and history as after one row of the step (for rolling back a rejected speculative token) |
 | `gated_norm` | The SiLU(z)-gated RMSNorm after it; sigmoid(z)-gated for Qwen4Exp | One workgroup per (head, token); z read from the stacked projection |
-| `matvec_<q>`, `matmul_<q>`, `embed_<q>` | The multiplies and embedding gather on quantized weights: `q8_0`, `q3_k`, `q4_k`, `q5_k`, `q6_k` | `matvec_quant.wgsl.hbs`, `matmul_quant.wgsl` and `embed_quant.wgsl`, composed at compile time with `quant/<q>.wgsl`. The decode multiply is a template (`src/tmpl`): its threads, threads per row and rows per lane group are parameters (`MatvecVariant`), 12 candidates, which gpu-check runs all of; the defaults render the kernel as it was. That file decodes a row's 32-weight units as ggml's `dequantize_row_*` does, value for value, 16 weights from 16-byte loads at a time. The decode multiply keeps `matvec_bf16`'s fusions, stages x in 2,048-float tiles, and splits each block among 4–8 lanes (`quant/<q>_dot.wgsl`), consecutive lanes on consecutive vectors. A step of several tokens takes them in pairs: both tokens' x in 1,024-float tiles, each decoded weight vector dotted with both (`block_dot2`), so two tokens cost much less than two steps; each token's sums are bitwise those of a step of one. The prefill multiply takes x rounded to 8-bit blocks and sums each weight sub-block's products exactly in integers (`dot4I8Packed`), then scales them, as llama.cpp's `vec_dot` does: 32 tokens × 128 outputs per workgroup, 4 × 8 per thread, the next unit fetched and decoded while the current one computes |
+| `matvec_<q>`, `matmul_<q>`, `embed_<q>` | The multiplies and embedding gather on quantized weights: `q8_0`, `q3_k`, `q4_k`, `q5_k`, `q6_k` | `matvec_quant.wgsl.hbs`, `matmul_quant.wgsl` and `embed_quant.wgsl`, composed with their type's decoder. The decode template's threads, threads per row and rows per lane group are `MatvecVariant` parameters, with 12 candidates. It decodes the stored quantized values, stages x in 2,048-float tiles and keeps the norm, SiLU and residual fusions. Q8_0 splits each 32-weight block between two lanes with one aligned 16-byte value load each; K-quants use their own `quant/<q>_dot.wgsl` decomposition. Multi-token steps pair inputs in 1,024-float tiles and dot decoded weights with both (`block_dot2`), preserving each token's one-step sums. The prefill multiply uses 8-bit activation blocks and exact integer sub-block sums (`dot4I8Packed`), then applies scales: 32 tokens × 128 outputs per workgroup, 4 × 8 per thread, with the next unit fetched and decoded while the current one computes |
 | `quantize_q8` | Rounds a quantized prefill multiply's input to 8-bit blocks, computing it first where it is an RMSNorm or the SiLU pair, so those kernels don't run | As llama.cpp's CPU backend does for the weight type: Q8_K blocks of 256 for the K-quants, Q8_0 blocks of 32 for Q8_0. Bitwise as the reference's `--llama-activations` mode |
 | `matmul_reduce` | Adds up a quantized prefill multiply split over k | A matrix with too few column tiles to fill the GPU (a 5,120-row projection has 40) splits k into slices, aiming at 256 workgroups; each slice writes partial sums, and this adds them into the output |
 | `repad`, `repack_q3_k`, `repack_q8_0` | Lay out Q6_K (padded) and Q3_K (repacked) blocks, and Q8_0 split rows (the row's values as i8, then its scales as f16, padded to 16 bytes), at load | Each chunk's rows go to a staging buffer, freed after the chunk's own submit |
 | `mark_tokens` | The prompt's token set, for the repetition penalty | |
 | `sample` | Bias, penalties, temperature, min-p, top-k, top-p, draw | In phases, one dispatch each; see [Generation](generation.md#sampling). One more phase undoes the last draw's output count (a rejected speculative round's second sample) |
 | `draft` | The speculative draft: the first index of the maximum of a row of logits, into the next step's token input | One workgroup |
-| `gyro_matvec` | Routed-expert products on Gyro TQ2_T weights (Gyro-Coder) | Lifted from gyro-dx: the expert comes from a GPU buffer the router wrote, no readback; a lane per trellis step decodes four weights from the 2,048-pair codebook; gate and up in one dispatch |
-| `moe_logits`, `moe_route` | Expert routing: router · x (f32) and the shared expert's gate logit, then a token per workgroup: softmax, top-k (ties to the lower index), normalized weights | Router rows read coalesced, a lane group per row, 8 rows per workgroup. Computed in `moe_route`'s one workgroup per token, the product took 1.08 ms a layer, 52 of the 87 ms of a decode step |
+| `gyro_matvec` | Routed-expert products on Gyro TQ2_T weights (Gyro-Coder) | The expert comes from the router's GPU buffer, with no readback. A workgroup computes 32 rows; a lane per trellis step decodes four weights from the 2,048-pair codebook; gate and up share a dispatch. Velocity stages the codebook and uses lane exchange and wave sums; WGSL reads the codebook from storage to stay within the guaranteed workgroup-memory limit |
+| `moe_logits`, `moe_route` | Expert routing: router · x (f32) and the shared expert's gate logit, then softmax, top-k (ties to the lower index) and normalized weights | `moe_logits` assigns a workgroup per router row with vector loads, then reduces with a tree in WGSL or wave sums in HLSL. `moe_route` performs selection in one workgroup per token |
 | `rotate128` | H₁₂₈ · (signs · x) per 128-value block: the basis Gyro expert weights are stored in. Optionally of silu(gate) · up | 64 butterflies a stage in workgroup memory |
 | `moe_combine` | The expert block's output: the routed experts' weighted sum plus the gated shared expert | |
 | `hc_act`, `hc_mix`, `hc_combine` | The hyper-connection mixer around Q8_0 down, up and inject products: silu(lo / hc); the streams' gated mean into a block's input; a block's output added to each stream, weighted 2·sigmoid(inject / hc) | The streams' norms are `rmsnorm` with a weight row per stream. `hc_act` runs fused, as the up multiply's staging prologue (`MatvecVariant.act_div`), where the up weights are quantized: one dispatch and one buffer fewer per mix, 97 per decode step (Gyro-Coder: 29.5 → 28.4 ms) |
 | `ple_mix`, `ple_conv` | The PLE block: per stream, the signed-root sigmoid gate of normed key · query, the gated value and its norm; then the causal dilated convolution (4 taps, dilation 3) into the residual streams | The convolution runs a step's tokens in order against a 9-row history, which it advances as `delta_rule` does the conv history |
 
-These are plain WGSL. M4 makes them templates tuned per GPU; the decode
-kernels above are its first part, measured with `zllm bench`
+The quantized decode multiplies are hand-written templates rendered by
+`src/tmpl`, not generated shader algorithms. Load-time tuning selects their
+launch variants; the rest of the catalog is not yet generally autotuned.
+`zllm bench` measures step throughput
 ([Generation](generation.md#performance)).
+
+### Kernel identities and contracts
+
+`create_kernel` names a `kernels.Kernel` and its variant, carries the binding
+write set, and supplies the backend artifact. `Kernel.contract()` derives
+the binding count and writes from WGSL declarations. Every implementation
+keeps the same parameter layout and binding order; a native implementation
+may use a different reduction strategy within the checks' tolerances.
+
+Velocity's catalog has implementations for every current kernel. Missing
+implementations are represented by `kernels.Set.missing`, not replaced by
+another backend: dispatch fails with `error.UnsupportedKernel`, and the
+native model loader calls `requireAll()` before loading. Contract tests
+check that HLSL writes only bindings declared writable. See
+[Velocity's ordering rules](velocity.md#the-native-layer).
 
 ## Tuning
 
 After the weights are on the GPU and before the step program is built,
-`src/tune` sweeps the quantized decode multiply's variants (spec §5) for
+`src/tune` sweeps the quantized decode multiply's variants for
 each weight shape in the model, the MTP block's included:
 
 - **Candidates:** the 12 `MatvecVariant`s, less those past the device's
@@ -145,42 +175,58 @@ each weight shape in the model, the MTP block's included:
   dispatch to last about a millisecond each.
 - **Steps:** two tokens where the engine speculates by default, else one.
 
-The winners go into the step program's `Tuning`. On the RTX 5090 Laptop, all
-16 of the 27B's shapes take another variant: the K-quants 8 or 16 threads
-per row instead of 32, Q8_0 two rows per lane group. Decoding speculatively
-goes from 40.7–41.5 tok/s to 47.0–47.3, one token per step from 30.0–30.4 to
-31.3–31.9; tuned, the 27B's decode logits stay as close to the CPU reference
-(6.4e-6 relative L2 at most, against 6.2e-6). The sweep takes 13 s;
-`--no-tune` skips it.
+The winners go into the step program's `Tuning`. This is a sweep of
+quantized decode matvecs, not a search over all operators or precisions.
+The program then selects the tuned variant while building launches,
+including launches with fused prologues. There is no post-fusion sweep.
+
+The following measurements are the earlier WebGPU tuning record on the
+RTX 5090 Laptop, not a benchmark of the current revision: all 16 of the
+27B's shapes took another variant, the K-quants 8 or 16 threads per row
+instead of 32 and Q8_0 two rows per lane group. Speculative decode went
+from 40.7–41.5 tok/s to 47.0–47.3; one token per step went from 30.0–30.4
+to 31.3–31.9. Tuned logits remained close to the CPU reference (6.4e-6
+relative L2 at most, against 6.2e-6). That sweep took 13 s. `--no-tune`
+skips the sweep and native tuning-cache lookup.
 
 ### Device lost
 
 A lost device (a driver reset, a GPU hang, a removed adapter) fails the
-request in flight with `error.DeviceLost` (spec §8). The native runtime then
-rebuilds itself before returning: a new Dawn device, the weights read again
-from the file mapping, the tuning from the plan cache, a fresh engine with
-no resident sequence (`Runtime.recover`). `zllm chat` reports it and takes
-the message again. On the RTX 5090 Laptop the 0.8B rebuilds in 2.2 s.
-`engine-check` forces a loss through Dawn's `wgpuDeviceForceLoss` and checks
-the typed error, a rebuild from the plan cache, and the same prompt's
-tokens and logits, bitwise, after it. The browser does the same
-([Browser](browser.md#device-lost)).
+request in flight with `error.DeviceLost`. The shared native runtime then
+rebuilds before returning: a new device on the selected backend, uploaded
+weights, tuning from the plan cache when available, and a fresh engine with
+no resident sequence (`Runtime.recover`). This applies to Dawn and
+Velocity; Velocity maps D3D12 removed/hung/reset errors to the typed error
+and allows teardown of a removed device. An unavailable cache means a new
+sweep, not preserved tuning in GPU memory.
+
+`zllm chat` reports the loss and asks for the message again. The existing
+Dawn measurement rebuilt the 0.8B on the RTX 5090 Laptop in 2.2 s.
+`engine-check` forces device loss and checks the typed error, cached rebuild,
+and bitwise tokens and logits after recovery. The browser rejects the lost
+request and rebuilds before the next request, using the same model source
+and cached tuning ([Browser](browser.md#device-lost)).
 
 ### Plan cache
 
-The CLI keeps what a sweep found in the plan cache (spec §7,
-`src/plan/cache.zig`): one JSON file of the variants that differ from the
-default, named by its key, in `%LOCALAPPDATA%\zllm\plans` on Windows and
-`$XDG_CACHE_HOME/zllm/plans` (or `~/.cache/zllm/plans`) elsewhere;
-`ZLLM_PLAN_CACHE` names another directory, or none when empty. The key is a
-SHA-256 over everything that could change the result: the adapter (vendor,
-architecture, device, description, which carries the driver version on most
-backends, and backend), the runtime, the device limits the plan uses, the
-model's GGUF header and tensor index, the zllm version, and every kernel's
-source. A load that finds its key's file uses it instead of sweeping; a file
-under another key, or one naming an unknown variant or type, is ignored, and
-the sweep's result replaces it. On the Gyro-Coder the cached load skips
-2.5 s of tuning and decodes as fast, with the same output.
+The CLI keeps the sweep's non-default variants in the plan cache
+(`src/plan/cache.zig`): one JSON file named by its key, in
+`%LOCALAPPDATA%\zllm\plans` on Windows and `$XDG_CACHE_HOME/zllm/plans`
+(or `~/.cache/zllm/plans`) elsewhere. `ZLLM_PLAN_CACHE` names another
+directory, or disables the native cache when empty.
+
+The SHA-256 key covers the adapter strings and API, the runtime (`dawn` or
+`velocity` natively), plan binding limits, the model's GGUF header and
+tensor index, the zllm version, and every `Kernel.source()` WGSL/template
+source. It does not hash tensor payloads or Velocity's HLSL sources. Thus
+an HLSL-only change with an unchanged zllm version can leave a Velocity
+cache valid under the current key.
+
+A valid hit skips tuning. A different key or malformed/unknown variant is
+ignored and a fresh sweep replaces it. The cache is not compiled pipelines
+or a serialized step program; it holds no precision decisions. Loads still
+create pipelines and upload weights. The earlier Gyro-Coder cache record
+skipped 2.5 s of tuning with the same decode output and rate.
 
 The browser tunes at load too, through the same sweep, between the
 weights and the step program. The shim gets the key from the core
@@ -191,8 +237,10 @@ sweep adds 8 s to its first load and none to later ones.
 
 ## Step program
 
-`src/plan/qwen35.zig` builds everything a step needs once, as the spec's
-execution plan asks:
+`src/plan/qwen35.zig` builds the Qwen 3.5 and supported dense models'
+steps once; `src/plan/qwen4exp.zig` builds Qwen3.8-Flash-Next's. The shared
+`plan.Program` interface lets the scheduler drive either. The Qwen 3.5
+program includes:
 
 - **Buffers:** activations sized for the largest step (512 tokens), a KV
   cache per attention layer sized for the context, every DeltaNet layer's
@@ -228,10 +276,11 @@ before the submission they precede.
 ### Two kernel paths
 
 Steps of at most 4 tokens, decoding, run the **decode kernels**:
-`matvec_bf16` for every multiply, fused with what surrounds it, and split
-attention. Longer steps run the **prefill kernels**. The plan prebuilds the
-launches that differ both ways (`plan.Fork`), and a step picks one
-(`plan.Path`).
+the half-precision or quantized `matvec` kernels for each weight chunk,
+with supported fusions, and split attention. Longer steps run the
+**prefill kernels**. The plan prebuilds the
+launches that differ both ways (`plan.qwen35.Fork`), and a step picks one
+(`plan.qwen35.Path`).
 
 Within a path, every row's arithmetic is the same whatever the step's size.
 A query walks the same key tiles from position 0, and each multiply output
@@ -259,9 +308,9 @@ Every storage binding must fit `maxStorageBufferBindingSize`, which is
 
 ### Fusion
 
-The plan applies the spec's fusion rules by hand. Weights that share an
-input are stacked by rows when uploaded, so each set runs as one multiply,
-and later kernels read their part of the output at a row stride:
+The plans construct several fusions directly. Weights that share an input
+are stacked by rows when uploaded, so each set runs as one multiply, and
+later kernels read their part of the output at a row stride:
 
 - Q (with its output gates), K and V
 - the DeltaNet projections: qkv, z, β and α
@@ -269,12 +318,12 @@ and later kernels read their part of the output at a row stride:
 
 | Rule | Decode kernels | Prefill kernels |
 |---|---|---|
-| RMSNorm into the next multiply | In `matvec_bf16`'s prologue: each workgroup reduces the row's sum of squares itself | A separate `rmsnorm`, which every tile reads |
-| Gate, up and SiLU-multiply | One `matvec_bf16` over row pairs | One multiply, then `silu_mul` |
+| RMSNorm into the next multiply | In the decode multiply's prologue: each workgroup reduces the row's sum of squares itself | Half-precision: separate `rmsnorm`; quantized: can be folded into `quantize_q8` |
+| Gate, up and SiLU-multiply | One decode multiply over row pairs | One multiply, then `silu_mul`, or SiLU folded into `quantize_q8` for the next quantized multiply |
 | Residual add into the output and down projections | The multiply adds into the residual stream | The same |
 | RoPE and the cache write after QKV | `rope_append` | The same |
 | DeltaNet conv, gates and L2 norm before the scan | `delta_prep` | The same |
-| Final norm and the vocabulary projection | Norm in the projection's prologue | A separate `rmsnorm` |
+| Final norm and the vocabulary projection | Norm in the projection's prologue | Half-precision: separate `rmsnorm`; quantized: norm can be folded into activation quantization |
 
 A fusion that needs workgroups to synchronize is not legal, which rules out
 three more:
@@ -285,7 +334,25 @@ three more:
 - **Top-k inside the vocabulary projection:** the sampler's selection runs
   over the whole vocabulary.
 
-A decode layer is 7 dispatches. A decode step is 182, down from 441.
+The existing Qwen3.5-0.8B fusion record reduced a decode layer to 7
+dispatches and a step from 441 to 182. Those counts are model-specific,
+not counts for every supported architecture.
+
+There is also an implemented fusion pass in `src/fuse/fuse.zig`. The
+Gyro-Coder hyper-connection mixer describes `hc_act` and its following
+decode multiply as buffer operations. `fuse.lower` folds
+`silu(x / hc)` into the quantized matvec's staged-input prologue only when:
+
+- the activation output has one reader, with no external `live_out` reader;
+- that reader is a later decode multiply over full vector rows;
+- every weight chunk has the quantized prologue (half-precision chunks
+  prevent this fusion);
+- the multiply has no competing norm/activation prologue.
+
+Unfused operations lower to ordinary launches. `plan.Config.fuse` and
+`gpu-forward --no-fuse` select the comparison path; `check-gyro` compares
+fused and unfused records bitwise. This is a focused pass, not arbitrary
+cross-workgroup fusion or a complete implementation of every planned rule.
 
 ## Qwen3.8-Flash-Next
 
@@ -323,12 +390,16 @@ cache and its pooled blocks; the rows' scores and selections are shared.
   experts, `rotate128` of their SiLU pair, the down experts, the shared
   expert, `moe_combine`, `hc_combine`.
 
-On the RTX 5090 Laptop, `zllm generate` loads it warm in 16 to 24 s
-(weights 11 to 15 s, tuning 5 to 7 s), prefills at 73 to 77 tok/s and
-decodes at 35 to 37 tok/s, one step per batch. The model takes about 21 of
-the card's 24 GB: with another 20 GB process on the GPU (a second copy of
-the model in a browser), Windows moved buffers into shared system memory
-and decoding fell to 6 tok/s.
+The earlier WebGPU measurement on the RTX 5090 Laptop recorded a warm
+`zllm generate` load of 16 to 24 s (weights 11 to 15 s, tuning 5 to 7 s),
+prefill at 73 to 77 tok/s and decode at 35 to 37 tok/s, one step per batch.
+These are historical results, before subsequent Q8_0 and routed-expert
+optimizations, not current backend comparisons. The model occupied about
+21 of the card's 24 GB. With another 20 GB process on the GPU, Windows
+moved buffers into shared system memory and decode fell to 6 tok/s.
+
+See [Gyro-Coder](gyro.md) for the model's data path and
+[Velocity](velocity.md#kernels) for later native-kernel changes.
 
 Each hyper-connection mixer's down projection carries the stream weights'
 (inject) rows: 324 rows in one multiply instead of 320, then 4 rows of

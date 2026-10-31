@@ -1,9 +1,9 @@
 # Generation
 
-M2 turns the GPU forward pass into text generation: an engine that schedules
-steps under a time budget, keeps the model's state between requests, samples
-on the GPU, and streams text. `zllm chat` and `zllm generate` drive it on the
-Dawn host.
+The generation engine turns a loaded GGUF model into streamed text. It
+schedules GPU work under a time budget, keeps model state between requests,
+and samples on the GPU. The same scheduler drives the native CLI through
+Dawn or Velocity and the [browser API](browser.md) through WebGPU.
 
 ```sh
 zllm chat model.gguf                        # thinking on; --no-think to skip it
@@ -12,9 +12,31 @@ zllm generate model.gguf "Once upon a time" --max-tokens 200 --seed 1
 scripts/d3d12.sh chat 'C:\path\to\model.gguf'   # on the Windows GPU, from WSL
 ```
 
+Use `chat` for a conversation rendered with the model's chat template, and
+`generate` for a raw continuation. Both keep one sequence resident:
+
+| Option | Purpose |
+|---|---|
+| `--max-tokens N` | Limit the generated tokens per turn; default 4096 |
+| `--ctx N` | Allocate context capacity; default 8192 tokens |
+| `--kv f16\|f32\|fp8` | Select the attention cache format; default f16 |
+| `--temperature`, `--top-k`, `--top-p`, `--min-p` | Override the model's sampling defaults |
+| `--repetition-penalty`, `--presence-penalty`, `--frequency-penalty` | Control repetition |
+| `--seed N` | Set the sampler's random seed |
+| `--stop S` | Stop before this string; repeatable |
+| `--system S`, `--no-think` | Set the chat system prompt or disable thinking |
+| `--no-tune` | Skip the load-time decode-multiply tuning sweep |
+| `--speculate`, `--no-speculate` | Override the MTP speculation default |
+
+Context capacity includes both the prompt and the generated reply. A request
+finishes with `length` when either its output limit or context capacity is
+reached. FP8 is an explicit precision tradeoff, not an automatic quality-safe
+upgrade; see [Precision](precision.md).
+
 ## Engine
 
-`src/sched/sched.zig` is a state machine that never blocks. Its host calls
+`src/sched/sched.zig` is a nonblocking state machine: it records commands,
+but the host executes the GPU work and reports its completion. Its host calls
 `start` with a request, then repeatedly `next`, which returns one of four
 events:
 
@@ -24,13 +46,13 @@ events:
 - **`done`:** the finish reason (`stop`, `length` or `abort`) and usage.
 
 The native host executes and completes each batch before calling `next`
-again, so it never sees `wait`. The browser host executes asynchronously
-and keeps two batches in flight: decoding records the next step before the
-previous step's token is read back, since the sampler hands each token to
-the next step on the GPU. The resident sequence holds a placeholder until
-the token arrives. When a step ends the request, the step after it has
-already processed the final token, which stays resident; that step's own
-sample is discarded. This hides Chrome's readback latency
+again, so it never sees `wait`. The browser host executes asynchronously.
+For a program that can chain sampled tokens on the GPU, it keeps two batches
+in flight: decoding records the next step before the previous step's token
+is read back. The resident sequence holds a placeholder until the token
+arrives. When a step ends the request, the step after it has already
+processed the final token, which stays resident; that step's own sample is
+discarded. This hides Chrome's readback latency
 ([Browser](browser.md#two-steps-in-flight)).
 
 `cancel` ends a request after the batch in flight: `done` reports `abort`,
@@ -50,8 +72,10 @@ stateDiagram-v2
 
 ## Scheduling
 
-Every submission is one step, and every step aims for the spec's 150 ms
-budget:
+Every submission is one step. The scheduler targets 150 ms and sizes
+prefill chunks against a predicted cost; the safety limit is 250 ms.
+These are scheduling targets and check criteria, not a guarantee that an
+arbitrary GPU or driver will complete every batch within the limit:
 
 - **Prefill:** a chunk is the largest token count whose predicted cost fits
   90% of the budget, at most 512. The prediction is linear,
@@ -121,9 +145,11 @@ i's final hidden state and token i + 1, it drafts token i + 2
 The draft is accepted when the first sample equals it. Then both samples
 are emitted; otherwise only the first, and the second's draw goes to the
 next sample. Every emitted token is the model's own sample with the draw it
-would get without speculation, and the decode kernels give each row the
-same result in a step of two as in a step of one, so the output is
-bitwise the same, for any sampling settings, penalties included
+would get without speculation. The decode kernels are designed to give
+each row the same result in a step of two as in a step of one, preserving
+the non-speculative output rather than trading accuracy for speed.
+`engine-check` requires the same tokens and bitwise identical logits in
+its greedy, sampled and penalty scenarios
 ([Validation](validation.md#engine)). Prefill also runs the MTP block over
 each chunk, so drafts see the whole prompt.
 
@@ -174,13 +200,25 @@ identical to processing the whole prompt from scratch whenever both runs put
 each position through the same kernels. That covers checkpoint restores, a
 repeated prompt and a reset. One case differs: a prompt that extends a turn
 reuses the reply's tokens, which went through the decode kernels, while a
-fresh run would prefill them. There the logits agree within 1e-4 relative
-L2, and 3e-5 is measured ([Validation](validation.md#engine)).
+fresh run would prefill them. That case has a 1e-4 relative L2 gate; the
+recorded hardware results and a software-renderer exception are in
+[Validation](validation.md#engine).
 
-KV is one contiguous f16 cache per attention layer, sized for the context
-(8192 tokens by default, 12 KiB per token for the 0.8B model). The spec's
-256-token pages matter once several sequences share a pool, which a
-single-sequence engine doesn't need.
+KV is one contiguous cache per attention layer, sized for the context
+(8192 tokens by default). The default f16 cache uses 12 KiB per token for
+the 0.8B model; f32 and FP8 are explicit alternatives. The spec's 256-token
+pages describe a shared sequence pool, not this single-sequence allocation.
+
+### Device recovery
+
+Device loss fails the affected request; it does not silently retry or
+continue a partially generated reply. The native runtime rebuilds the
+device, model, program and scheduler, reusing tuning from the plan cache
+when available. A successful rebuild leaves it ready for another request,
+but the resident sequence and checkpoints are gone, so that request must
+prefill its prompt again. A failed rebuild leaves the runtime safe to
+destroy. The browser rebuilds before the next request instead
+([Browser](browser.md#device-lost)).
 
 ## Sampling
 
@@ -289,9 +327,14 @@ string itself is not output, as in vLLM by default.
 
 ## Performance
 
-Measured with `zllm generate` on an RTX 5090 Laptop (D3D12), f16 KV:
+The following are recorded measurements, not a claim about every supported
+GPU or the current checkout. They use Qwen 3.5 0.8B BF16 with `zllm generate`
+on an RTX 5090 Laptop through Dawn's D3D12 host, with f16 KV. The initial
+results were documented in `77786df` (2026-10-29); the optimized decode and
+fusion results were documented in `8f5c68f`, `cfb2335` and `eea4f84` that day.
+These are source-history dates, not separately recorded execution dates.
 
-| Phase | M2 | Now |
+| Phase | Initial native implementation | Recorded optimized result |
 |---|---|---|
 | Prefill, a 2,457-token prompt | 1,562–1,567 tok/s | 2,882–2,896 tok/s, in 12 steps |
 | Decode, greedy, short context | 34 tok/s | 285–295 tok/s |
@@ -304,7 +347,7 @@ fusion, step by step, at position 1,056:
 
 | Change | ms per decode step |
 |---|---|
-| M2 kernels | 42.6 |
+| Initial kernels | 42.6 |
 | Matrix-vector multiplies for decode (23.7 → 2.0 ms) | 18.9 |
 | Sampler in phases across the GPU (10.6 → 0.2 ms) | 8.1 |
 | Decode attention split over cache blocks (3.0 → 0.45 ms) | 5.7 |
@@ -313,12 +356,12 @@ fusion, step by step, at position 1,056:
 | Decode attention reads V once per GQA group (0.66 → 0.34–0.40 ms) | 4.7 |
 | Fusion: 441 → 182 dispatches per step ([GPU backend](gpu.md#fusion)) | 3.9 |
 
-What remains, of about 3.9 ms per step:
+The recorded breakdown of the remaining 3.9 ms per step was:
 
 - **Weights:** a decode step streams 1.5 GB of BF16 weights, about 1.7 ms
   at this GPU's bandwidth. The vocabulary projection runs at that floor
-  (0.5 GB in 0.54 ms). The body's projections reach about 60% of it (1.0 GB
-  in 1.7 ms), so they are the next lever.
+  (0.5 GB in 0.54 ms). The body's projections reached about 60% of it
+  (1.0 GB in 1.7 ms), identifying room for further work.
 - **Dispatches:** each dependent dispatch costs 2.4–3.8 µs on this GPU
   through D3D12, depending on its work, so the 182 cost 0.4–0.7 ms.
 - **Attention and the sampler:** about 0.3 and 0.2 ms.
@@ -329,7 +372,7 @@ Synchronizing a submission costs 0.1–0.2 ms.
 
 Qwen 3.8 27B at Q3_K_M (13.75 GB) on the same GPU, `zllm generate`, greedy:
 
-| Phase | First run | Now | Spec bar |
+| Phase | First recorded run | Recorded optimized result | Spec target |
 |---|---|---|---|
 | Prefill, a 901-token prompt | 25 tok/s, in 114 steps | 288–300 tok/s, in 31 steps | 300 tok/s |
 | Decode | 6 tok/s | 29–31 tok/s | 20 tok/s |
@@ -345,6 +388,11 @@ Speculation, on 256 tokens continuing a code prompt, interleaved runs:
 
 A round costs about 1.4 steps (`zllm profile`): the two-position step
 about 1.3 (two tokens decode each weight once), the draft the rest.
+
+The prefill results were recorded in `1bea429` (2026-10-29); the
+speculative comparison and its code prompt were recorded in `bfa5353`
+(2026-10-29). These snapshots predate Velocity and later kernel changes.
+The spec targets are acceptance goals, not additional measurements.
 
 `zllm bench` at position 288 measured the steps:
 
@@ -382,10 +430,10 @@ cost 1.9 times one, since each token decoded every weight again; decoding
 each weight vector once for both tokens brought that to about 1.3 (the
 speculative step, [Speculative decoding](#speculative-decoding)).
 
-`zllm profile` (below) shows where a step goes now: of about 88 ms of GPU
-time, the Q3_K multiplies take 43 ms and the Q4_K ones 29 ms, both at about
-185 GB/s of weights; the gated delta rule takes 7 ms, attention 3 ms, and
-rounding the inputs and adding up split multiplies 4 ms. Each multiply
+The recorded `zllm profile` breakdown (see below) accounts for about 88 ms
+of GPU time: Q3_K multiplies took 43 ms and Q4_K took 29 ms, both at about
+185 GB/s of weights; the gated delta rule took 7 ms, attention 3 ms, and
+rounding inputs and adding split multiplies 4 ms. Each multiply
 issues about three instructions per four products: the integer dot
 product, a separate add (WGSL's `dot4I8Packed` has no accumulator operand)
 and the sub-block scaling.

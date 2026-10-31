@@ -1,7 +1,10 @@
 # Dense transformers
 
-Qwen 3, Llama 3 and Granite 4 (GGUF `general.architecture` `qwen3`, `llama`
-and `granite`) are dense decoder-only transformers. Every layer is
+Qwen 3, Llama 3 and Granite 4 use the GGUF architectures `qwen3`, `llama`
+and `granite`. These are dense decoder-only transformers: every layer uses
+full causal attention, not the recurrent/attention schedule of the
+[Qwen 3.5 hybrid family](qwen35.md), and not
+[Gyro-Coder's mixture of experts](gyro.md). Every layer is
 
     x += attn(rmsnorm(x) · attn_norm)        GQA softmax attention
     x += ffn(rmsnorm(x) · ffn_norm)          SwiGLU: down(silu(gate(h)) · up(h))
@@ -19,9 +22,32 @@ reads what differs between the three from the GGUF metadata; llama.cpp's
 | K·Q scale | 1/√head_dim | 1/√head_dim | `attention.scale` |
 | Multipliers | none | none | embeddings × `embedding_scale`; each branch × `residual_scale` before its add; logits ÷ `logit_scale` |
 
-A Granite multiplier of 0 or absent means none, as in llama.cpp. llama.cpp
-also accepts projection biases in these graphs; none of the supported
-models has them, and zllm refuses a file that does rather than ignore them.
+For Granite, absent or zero attention, embedding and residual scales mean
+no extra multiplier. The current parser requires a nonzero `logit_scale`
+and uses its reciprocal. The equations above show the unscaled case.
+
+Projection biases are outside the supported dense-model subset. The CPU
+reference checks for them in the first layer and refuses that file rather
+than implementing the biased graph. The pinned GPU fixtures have no such
+biases; do not treat the architecture name as a promise of arbitrary
+checkpoint compatibility.
+
+## Supported files and evidence
+
+The pinned small-model coverage is BF16 Qwen3-0.6B,
+Llama-3.2-1B-Instruct and Granite 4.2 3B. Granite 4.2 30B also has a
+recorded Q4_K_M validation. These fixture results establish particular
+graphs and tensor formats, not every model in those families.
+
+- [Dense-model validation](validation.md#dense-models) records CPU
+  comparisons with llama.cpp and GPU comparisons with the CPU reference.
+- [Granite 4.2 30B](validation.md#granite-42-30b) covers the large mixed
+  quantization file and its activation-rounding differences.
+- [Tokenizer validation](validation.md#tokenizer) covers the different
+  Qwen, Llama and Granite pre-tokenizers; a shared attention graph does not
+  imply a shared tokenizer.
+- [Weight formats](precision.md#weight-formats) distinguishes executable
+  tensor types from types the GGUF reader can only index.
 
 ## On the GPU
 
@@ -45,10 +71,19 @@ The program has no embedding, residual or logit multiplier. Granite 4.2's
 are all 1; a model with others (Granite 3) is refused on the GPU. The CPU
 reference runs them.
 
+The same dense plan runs through WebGPU (browser or native Dawn) and
+Velocity's native D3D12 implementation. It has the shared plan's prefill
+and decode paths, sampler, prefix reuse and device recovery, but no MTP
+block. KV storage can be f32, f16 or FP8 E4M3; f16 remains the generation
+default. The lower FP8 diagnostic bounds are not authorization to change
+that default; see [precision](precision.md#quality-gated-precision-ladder)
+and [GPU forward validation](validation.md#gpu-forward-pass).
+
 ## Performance
 
-Granite 4.2 30B at Q4_K_M (17.7 GB) on the RTX 5090 Laptop (D3D12), from
-`zllm benchmark`: prefill 209 tok/s over 1,024 tokens, decode 25.1 tok/s.
+The recorded `zllm benchmark` result for Granite 4.2 30B at Q4_K_M
+(17.7 GB), on the RTX 5090 Laptop through Dawn D3D12, is prefill
+209 tok/s over 1,024 tokens and decode 25.1 tok/s.
 A decode step takes 40.7 ms, 82% of it in the Q4_K and Q6_K matrix-vector
 multiplies (about 560 GB/s over 13 GB of weights). Loading took 106 s, nearly
 all of it reading the file from the WSL disk through `\\wsl.localhost`.

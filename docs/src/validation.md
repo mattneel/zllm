@@ -1,7 +1,39 @@
 # Validation
 
-Each layer of zllm is checked against an independent reference. All
-references are pinned, and every check is a command that exits 0 on success.
+zllm aims to generate tokens as fast and accurately as the supported
+hardware allows. Speed changes must preserve the intended computation, or
+make a precision tradeoff explicit and measure its effect. Validation
+therefore has several layers: file and text parity, individual kernels
+against CPU computations, whole models against the CPU reference and an
+external runtime, and stateful generation checks.
+
+The commands below exit 0 when their gates pass. Results in this chapter
+are recorded observations on the named models, inputs and backends, not
+new runs of the current checkout or proof for all prompts and GPUs.
+Fixture pins make comparisons reproducible; they do not make finite
+coverage universal.
+
+## Reading the accuracy results
+
+- **Exact parity:** tokenization, prompt bytes, dequantization, selected
+  cache encodings, and within-path step splits have exact-equality gates.
+- **Numerical parity:** floating-point reductions can round differently.
+  Kernel and model checks bound the resulting error instead of treating
+  every different bit as a bug.
+- **Model behavior:** top-1 agreement reports whether teacher-forced
+  positions choose the same next token. Cosine, norm error and relative
+  L2 also examine the activations, catching errors that argmax alone misses.
+  The Gyro-Coder additionally requires identical expert choices.
+- **Quality versus speed:** quantized weights, 8-bit prefill operands and
+  FP8 KV are different tradeoffs. Comparisons use the same stored weights
+  and, where necessary, emulate activation rounding to separate that
+  tradeoff from an implementation error. These checks are not a general
+  task-quality benchmark or proof of equivalent generated answers.
+
+The automatic model-quality-gated [precision ladder](precision.md) is a
+design target, not a completed load-time selector. f16 KV remains the
+default; explicit FP8 support does not mean that FP8 has passed a model's
+default-quality gate.
 
 ## Pins
 
@@ -28,7 +60,7 @@ names `2fc0636…`.
 ## Running the checks
 
 ```sh
-scripts/fixtures.sh          # everything; or: vocab | model | llama | dawn
+scripts/fixtures.sh          # default fixtures, including dense models; model27b is separate
 zig build test               # unit tests, no fixtures needed
 zig build check-gguf         # GGUF reader vs llama.cpp gguf-dump
 zig build check-tokenizer    # tokenizer vs Hugging Face
@@ -41,11 +73,23 @@ zig build check-quant        # the quantized 27B: GPU vs reference vs llama.cpp
 zig build check-gyro -Dgyro-model=<gguf>   # the Gyro-Coder: GPU vs reference vs its runtime
 ```
 
-Add `-Dgpu-host=d3d12` (WebGPU on Dawn's D3D12) or `-Dgpu-host=velocity` to
-any GPU check (`gpu-check`, `check-gpu`, `check-quant`, `check-gyro`) to run
-it on the Windows GPU from WSL; see [GPU backend](gpu.md). The host is the
-checks' one parameter: a new backend adds a value, and every gate runs on it
-unchanged.
+The Gyro-Coder is read in place from the supplied path; `fixtures.sh` has
+no Gyro-Coder download target. The 27B fixture is optional and fetched with
+`scripts/fixtures.sh model27b`.
+
+Add `-Dgpu-host=d3d12` (Dawn WebGPU on D3D12) or
+`-Dgpu-host=velocity` (native D3D12/HLSL) to any GPU check
+(`gpu-check`, `check-gpu`, `check-quant`, `check-gyro`, `check-fast`) to run
+it on the Windows GPU from WSL; see [Backends](backends.md). The default
+`native` host uses this build and Dawn's available adapter.
+
+The backend is a test parameter, not a reason to weaken the reference or
+tolerances. Every backend's kernel implementation is checked against CPU
+reference computations through the same `gpu-check` cases; whole-model
+gates run on the selected host as well. A missing kernel is reported as
+`MISSING` and fails the kernel suite, rather than silently skipping it.
+This is the validation contract for a backend, not evidence that every
+available driver or adapter has already run every gate.
 
 The checks need [uv](https://docs.astral.sh/uv/). It runs the harness in
 `tools/` from its lockfile. `-Dfixtures=<dir>` points the checks at another
@@ -70,18 +114,62 @@ Two things keep the checks fast. Neither changes what they compare.
   logits rows, hundreds of MB a run) next to the Windows stage, because a
   Windows process writes WSL's filesystem slowly.
 
-With both, `check-gpu` on the RTX 5090 (D3D12) went from 28 minutes to 2.5
-once the references are cached.
+The reference-cache and batching change was recorded in `a8abca4`
+(2026-10-31): `check-gpu` on the RTX 5090 (D3D12) went from 28 minutes to
+2.5 with the references cached. That is a harness-runtime measurement,
+not an inference-speed result.
 
 There are two tiers:
 
 | Tier | What it runs | When |
 |---|---|---|
 | Fast: `zig build check-fast` | `gpu-check`; `check-gpu` on the first eval text (both kernel paths, step splits, every KV format) with engine-check; `check-gyro` on its short sequence (step splits and fusion bitwise) with `-Dgyro-model` | every iteration; about a minute on Velocity once the references are cached |
-| Full: every check | every eval text and model, the long prompts, `check-quant`, each backend | before each commit |
+| Full: every check | every eval text and model, the long prompts, `check-quant`, each backend | hardware validation before a commit; not all run in hosted CI |
 
 `check-gpu` and `check-gyro` take `--fast` themselves; `check-fast` runs
 them one after another, since the GPU runs one job at a time.
+
+`-Dengine-check=false` skips the engine scenarios in `check-gpu` and
+`check-fast`; the harness equivalent is `--no-engine-check`. The default
+remains to run them. Hosted llvmpipe CI uses this opt-out, while the real
+GPU checks on `d3d12` and `velocity` keep the engine gate enabled.
+
+The fast tier's approximate runtime was recorded in `c316cfc`
+(2026-10-31). It is a shorter input set, not a replacement for the full
+model gates.
+
+### CI and hardware coverage
+
+`.github/workflows/ci.yml` currently runs:
+
+- Zig formatting and unit tests, and the wasm build;
+- tokenizer and chat-template parity with pinned vocabulary fixtures;
+- `zig build check-fast -Dengine-check=false` through Dawn on Mesa
+  llvmpipe: `gpu-check`, then the first eval text through both model kernel
+  paths, step splits and all KV formats against the CPU reference;
+- TypeScript/Biome checks and the browser facade's unit tests;
+- the mdBook and browser demo builds.
+
+The GPU job restores the pinned model and vocabulary fixtures with
+`actions/cache`, and separately restores `.fixtures/cache` for CPU
+reference outputs. Its reference-cache key hashes `src/ref`, `src/gguf`,
+`src/graph`, `src/main.zig`, the build files and `tools/corpus`; individual
+reference entries also use the model and token ids as described above.
+
+The hosted workflow skips `engine-check` on llvmpipe because of CPU cost
+and the documented prefix-reuse rounding drift beyond its bound
+([Engine](#engine)). It also does not run the full multi-model checks,
+large-model forward checks, hardware soaks, Velocity, or browser WebGPU
+inference. Those need the corresponding fixtures and device. A green CI
+run is therefore not a claim that every model/backend combination passed.
+
+The detailed tables below mostly record Dawn D3D12 results on the RTX
+5090 Laptop and selected llvmpipe results. Later backend evidence includes
+`01b247e` (2026-10-30), which records every Velocity kernel check and
+engine scenario passing, and `823d6de` (2026-10-31), which records
+`gpu-check` and Gyro-Coder split/fusion gates passing on both native
+backends. These commits do not turn a Dawn-only table into a universal
+cross-backend result.
 
 ## GGUF reader
 
@@ -215,9 +303,20 @@ attention output gate scores 2.4% top-1 and fails every position.
 
 ## GPU kernels
 
-`zig build gpu-check` runs every kernel on seeded random inputs. It compares
-each against a float64 CPU computation of the same formula, with shapes that
-hit every tile and chunk remainder:
+`zig build gpu-check` (`src/kernels/check.zig`) runs the kernel suite on
+seeded random inputs. It compares each implementation against a float64
+CPU computation of the same formula, or the sampler's CPU reference, with
+shapes that hit tile and chunk remainders. The same suite selects WGSL
+through Dawn or HLSL through Velocity; passing against the other GPU
+implementation alone is not the reference criterion.
+
+Load-time tuning is a separate check: `src/tune/tune.zig` compares each
+candidate quantized decode multiply against the default GPU variant on
+real model weights before timing it, and drops diverging candidates.
+It does not rerun the entire CPU-reference suite during each browser load
+or substitute for model-quality validation.
+
+Kernel cases include:
 
 - **Stateful kernels** run as steps that carry state between them. The
   DeltaNet front end runs in steps of 5, 2, 1 and 4 tokens, with the delta
@@ -255,8 +354,9 @@ hit every tile and chunk remainder:
 - **Fused multiplies** start from a random output, so an accumulate that
   overwrites fails.
 
-The rows below are the RTX 5090 (D3D12) results. llvmpipe gives the same
-errors to within a factor of 2.
+The rows below are recorded RTX 5090 (Dawn D3D12) results. The documented
+llvmpipe runs gave the same errors to within a factor of 2; neither row set
+asserts coverage of every device.
 
 | Kernel | Max relative error | Tolerance |
 |---|---|---|
@@ -403,8 +503,9 @@ medians over positions:
 | Gap to the f32 reference over its own gap to the rounded one, worst layer | 1.10 | 1.08 | 1.5 |
 | Top-1 against the rounded reference (reported) | 805/818 | | |
 
-Each kernel on that path, the rounding included, is checked exactly by
-`gpu-check`.
+Each kernel on that path, including the rounding, has its own CPU-reference
+check in `gpu-check`: rounding is held exact, while multiplies have
+floating-point error bounds.
 
 **Reference against llama.cpp.** llama.cpp rounds each quantized
 multiply's input to 8-bit blocks (Q8_K for the K-quants, Q8_0 for Q8_0);
@@ -433,6 +534,12 @@ breaks them: the reference against its own rounded run agrees on 143 of 148
 tokens of the prose sequence. Against llama.cpp it agrees on 800 of 818
 (97.8%), with a worst final-state cosine of 0.342 at one position.
 
+These are explicit exceptions to the draft spec's single model threshold,
+not evidence that the spec's top-1 and cosine bars passed. The implemented
+gate asks whether the numerical difference is explained by the measured
+rounding path. It does not establish that rounding has no effect on
+downstream task quality.
+
 ## GPU forward pass
 
 `zig build check-gpu` runs `zllm forward` (the CPU reference) and
@@ -450,13 +557,21 @@ therefore tight:
 | Prefill kernels, 7-token steps | bitwise identical to 512-token steps | everything |
 | Decode kernels, 1-token steps (as decoding runs), first 40 positions | the same bounds as 512-token steps | the same |
 | Decode kernels, 3-token steps | bitwise identical to 1-token steps | everything |
-| f16 cache (the default) | ≥ 99% top-1 agreement; cosine ≥ 0.99998 | every layer output, final norm and logits, every position, every eval text and each dense model's first |
-| FP8 cache (E4M3) | ≥ 95% top-1 agreement; cosine ≥ 0.975 | the same |
+| f16 cache (the default) | ≥ 99% top-1 agreement; cosine ≥ 0.99998 | top-1 aggregated over the texts/models selected for this invocation; cosine over every compared record and position in each run |
+| FP8 cache (E4M3) | ≥ 95% top-1 agreement; cosine ≥ 0.975 | the same aggregation and per-run cosine scope |
 
-With a model that has an MTP block (the 0.8B fixture does), every run also
-runs the block over each step's final hidden states, and its draft logits
-(`mtp_logits`, one row per position but the last) are held to the same
-bounds as the logits, plus 100% top-1 agreement with the reference's drafts.
+A full invocation includes every eval text and each dense model's first
+text; `--fast` uses only the first eval text and no dense models. KV top-1
+is not gated separately per model or text. For example, the Qwen3 FP8 row
+below is under 95% on its own, while the full aggregate passes. This is
+another reason not to treat the aggregate path check as a model-specific
+quality gate.
+
+With a model that has an MTP block (the 0.8B fixture does), the f32-cache
+runs also check the block's draft logits (`mtp_logits`, one row per
+position but the last) to the same numerical bounds as the logits and
+require 100% draft top-1 agreement. KV-format runs include these records
+in their cosine check, but do not add a separate draft-top-1 gate.
 On llvmpipe they agree to 7.5e-6 relative L2 on both kernel paths, and the
 step splits stay bitwise identical. On the 27B in 64-token steps, the
 quantized prefill puts them 2.3% (median) from the f32 reference, as it does
@@ -484,17 +599,22 @@ the dense models' first:
 | Llama-3.2-1B | 149/149 | 144/149 | 0.982 |
 | Granite 4.2 3B | 149/149 | 142/149 | 0.984 |
 
-The FP8 bounds catch a broken cache path, not the quality a model needs:
-whether a model may default to FP8 is the precision ladder's gate (spec §9).
-These small dense models stay on f16.
+The FP8 bounds catch a broken cache path, not the quality a model needs.
+`ecec4af` (2026-10-31) records 1,231/1,264 top-1 agreement on Dawn and
+1,233/1,264 on Velocity for this model/input set. These small models stay
+on f16 by default; automatic selection under the spec's precision ladder
+is not implemented. Choosing FP8 explicitly accepts a different accuracy
+profile, even when its encoding and attention kernels pass their tests.
 
 `gpu-check` holds the FP8 encoding itself exact: `rope_append`'s FP8 bytes
 and power-of-two scales match `ref/fp8.zig`'s encoding of its f32 output
 bit for bit, on every backend.
 
-At M2, before the decode kernels, llvmpipe gave the same results (818/818,
-1.0e-5). `check-gpu` now runs on real GPUs only: on llvmpipe it takes about
-half an hour.
+Earlier recorded llvmpipe model runs gave 818/818 top-1 and 1.0e-5
+relative L2 before the decode kernels were added. The current workflow
+uses the cached-reference fast tier to keep model-path coverage on
+llvmpipe, rather than limiting CI to individual kernels. Full multi-model
+and engine validation remain separate from that hosted subset.
 
 Top-1 agreement alone is a weak check. Halving the RoPE base on the GPU
 still agrees on 814 of 818 tokens, which would pass the 99% bar used against
@@ -503,7 +623,8 @@ llama.cpp, but it drives the per-layer relative L2 error to 6.3e-2, and
 
 ## Engine
 
-`check-gpu` also runs `zllm engine-check`. It sends requests through the
+By default, `check-gpu` also runs `zllm engine-check`; the llvmpipe CI
+invocation disables it explicitly. It sends requests through the
 real engine after earlier requests left state behind. With an MTP block
 (the 0.8B has one), they speculate, except the pipelined and cancelled
 ones, so the reuse scenarios start from states that speculative rounds
@@ -540,14 +661,16 @@ resident. The cancelled
 decode's follow-up sits closest to the cross-path bound, at 8.8e-5 of 1e-4:
 two of its reused positions went through the decode kernels.
 
-These are RTX 5090 results; at M2 the first five also passed bitwise on
-llvmpipe. Later, on llvmpipe, the fresh prompt differed from its fresh rerun
-and the diverging prompt failed on some runs: the chunk just before a
-prompt's last token can be a tail of fewer than 8 tokens, and whether it ran
-alone (through the decode kernels) or inside a longer chunk depended on step
-timings, which are noisy on a software renderer. Prefill chunks now always
-run the prefill kernels. On llvmpipe the extended turn still lands at
-1.4e-4, past the 1e-4 bound (4.5e-5 on the RTX 5090).
+These are recorded RTX 5090 results; the first five scenarios also passed
+bitwise in earlier llvmpipe runs. Later, llvmpipe exposed a scheduling
+dependency: the chunk just before a prompt's last token could be a tail of
+fewer than 8 tokens, and timing noise decided whether it ran alone through
+decode kernels or inside a longer prefill chunk. Prefill chunks now always
+run the prefill kernels. The documented llvmpipe extended-turn result is
+still 1.4e-4, past the 1e-4 bound; the historical RTX table above records
+4.5e-5. This failed software-renderer gate, together with its CPU cost,
+is why CI skips engine-check rather than loosening the bound. Engine
+validation remains enabled on the real GPU backends.
 
 Skipping the checkpoint restore fails both checkpoint scenarios, and an
 earlier bug that left the state dirty after dropping the sequence
@@ -673,20 +796,24 @@ runtime's, kept in `tools/corpus/gyro_*.json`. It requires:
 The bounds leave room for another backend's summation order, but not for a
 wrong kernel: a routing flip moves a row by about 1e-2.
 
-The row against the runtime's dumps reflects the runtime's own rounding: it computes its
-multiplies from activations rounded to 8-bit blocks, and through 48 layers
-of hyper-connected streams the difference grows, as it did for the 27B
-before the reference learned that rounding ([The 27B](#the-27b)). The
-routing and the greedy tokens are unaffected.
+The gap against the runtime's dumps is consistent with activation
+rounding: that runtime computes multiplies from activations rounded to
+8-bit blocks, and the difference grows through the hyper-connected
+streams. Unlike the rounded-reference comparison for the
+[27B](#the-27b), this chapter does not report a matching rounded
+Gyro-Coder reference that isolates the cause. The recorded routing and
+greedy-token matches are narrower evidence than layer-by-layer numerical
+equivalence to the external runtime.
 
 ## GPU safety
 
-The spec allows no submission over 250 ms and no device hang in a soak
-test. `zllm soak <model.gguf> [minutes]` runs requests of every shape
-through the engine: prompts of 1 to 3,000 random tokens, about half
+The spec's safety target is no submission over 250 ms and no device hang
+in a soak test. `zllm soak <model.gguf> [minutes]` runs requests of varied
+shapes through the engine: prompts of 1 to 3,000 random tokens, about half
 extending the previous one (prefix reuse, checkpoint restores), greedy and
 sampled, replies of 1 to 256 tokens, and cancellations. It times every
-submission and fails on a device error or one past the cap.
+submission and fails on a device error or one past the cap. A finite soak
+establishes behavior for that run, not immunity to hangs on every driver.
 
 | Model, RTX 5090 Laptop (D3D12) | Minutes | Submissions | Max | p99 | Over 250 ms | Device errors |
 |---|---|---|---|---|---|---|

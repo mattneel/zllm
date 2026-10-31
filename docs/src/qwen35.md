@@ -1,5 +1,19 @@
 # Qwen 3.5 hybrid: GGUF semantics
 
+The `qwen35` path covers the Qwen 3.5, 3.6 and 3.8 hybrid family: Gated
+DeltaNet layers alternate with full softmax attention, with a dense SwiGLU
+FFN after either mixer. The loader selects this path by GGUF
+`general.architecture`, not the model's display name. Qwen3.8-Flash-Next
+Gyro-Coder is a different architecture, `qwen4exp`; see
+[Gyro-Coder](gyro.md). Qwen 3's all-attention graph is described in
+[Dense transformers](dense.md).
+
+The pinned evidence covers Qwen3.5-0.8B BF16 and the Qwen3.8-27B mixed
+Q3_K_M file. This is not a claim that every checkpoint carrying a Qwen
+family name or every GGUF quantization is supported. See
+[precision](precision.md#weight-formats) for accepted weight types and
+[validation pins](validation.md#pins) for the exact files.
+
 This page fixes what the `qwen35` GGUF tensors mean, as written by the pinned
 llama.cpp converter (`conversion/qwen.py`, classes `Qwen3NextModel`,
 `_LinearAttentionVReorderBase` and `Qwen3_5TextModel`) and consumed by its
@@ -8,12 +22,16 @@ some weights relative to the Hugging Face checkpoint. Implementing the Hugging
 Face equations directly on GGUF weights applies those changes twice, and two
 implementations that share the mistake still agree with each other. That's
 why the reference is checked against llama.cpp itself
-([Validation](validation.md)).
+([reference-forward validation](validation.md#reference-forward-pass)).
 
-The code is `src/graph/qwen35.zig` (hyperparameters) and `src/ref/qwen35.zig`
-(the f32 reference).
+The implementation is `src/graph/qwen35.zig` (hyperparameters),
+`src/ref/qwen35.zig` (the f32 reference) and `src/plan/qwen35.zig` (the
+GPU step program shared by WebGPU and Velocity).
 
 ## Metadata
+
+The values below describe the pinned 0.8B fixture, not constants for every
+model in the family. Dimensions and the layer schedule come from metadata.
 
 | Key (`qwen35.` prefix) | 0.8B | Meaning |
 |---|---|---|
@@ -35,9 +53,10 @@ The code is `src/graph/qwen35.zig` (hyperparameters) and `src/ref/qwen35.zig`
 | `full_attention_interval` | 4 | Layer *i* is full attention iff (*i* + 1) mod 4 = 0 |
 | `attention.recurrent_layers` | absent | Optional per-layer bool array; overrides the interval rule |
 
-The tokenizer is `tokenizer.ggml.model = gpt2` with `pre = qwen35`,
-`add_bos_token = false` and EOS `<|im_end|>` (248046). The LM head is tied:
-there is no `output.weight`, so logits use `token_embd.weight`.
+For the 0.8B fixture, the tokenizer is `tokenizer.ggml.model = gpt2` with
+`pre = qwen35`, `add_bos_token = false` and EOS `<|im_end|>` (248046).
+Its LM head is tied: there is no `output.weight`, so logits use
+`token_embd.weight`. The loader also accepts a separate `output.weight`.
 
 ## Converter transforms
 
@@ -74,7 +93,8 @@ $$
 
 with $\text{rms}(x) = x / \sqrt{\text{mean}(x^2) + \varepsilon}$. The mixer is
 full attention or Gated DeltaNet, according to the layer schedule. After the
-last layer comes $\text{rms}(x) \odot w_\text{output\_norm}$, then the tied LM head.
+last layer comes $\text{rms}(x) \odot w_\text{output\_norm}$, then the LM head
+(tied for the 0.8B fixture).
 
 ### Full attention (layers 3, 7, 11, …)
 
@@ -125,6 +145,53 @@ $$
 
 ## Verified against llama.cpp
 
-These semantics are what `zig build check-forward` checks. Breaking any one of
-them, for example dropping the sigmoid output gate, drops top-1 agreement from
-99.8% to about 2%.
+These semantics are checked by `zig build check-forward`. For the pinned
+0.8B, the recorded result is 816/818 top-1 agreement with llama.cpp
+(99.76%). Deliberately dropping the sigmoid attention output gate reduces
+it to 2.4%, demonstrating that agreement is sensitive to the graph rather
+than just the file format. See the
+[reference forward pass](validation.md#reference-forward-pass) for the
+per-layer and final-state criteria.
+
+The quantized 27B needs a separate comparison: its GPU prefill path rounds
+multiply operands to 8-bit blocks, while the ordinary CPU reference keeps
+f32 activations. The rounded reference separates that difference from a
+semantic error; the generic llama.cpp model thresholds do not hold for this
+file. See [the 27B validation](validation.md#the-27b), not just the small
+BF16 model's result.
+
+## GPU execution and state
+
+The GPU program has distinct prefill and decode multiply paths. Both run
+the same attention and recurrence semantics, with weights decoded in the
+shader and f32 accumulation. Full-attention layers keep a KV cache;
+DeltaNet layers keep an f32 recurrent matrix and causal convolution
+history. Changing the KV format does not quantize the DeltaNet state.
+
+Generation defaults to an f16 KV cache. f32 and FP8 E4M3 caches are
+explicit choices; FP8 support is not an automatic model-quality approval
+or a default change. See [precision](precision.md#kv-cache-formats) and
+[GPU forward validation](validation.md#gpu-forward-pass).
+
+The engine checkpoints recurrent state for prefix reuse and recomputes
+from a valid checkpoint when needed. It does not rewind DeltaNet by merely
+discarding attention cache positions. See
+[generation state](generation.md#state-and-prefix-reuse).
+
+## Multi-token prediction
+
+Trailing `nextn` layers are excluded from the main decoder layer count.
+When the file carries the supported single MTP block, the loader binds it
+separately: the final hidden state at a position and the next token's
+embedding produce a draft for the following token. The engine can verify
+that draft against the main model rather than treating it as an unchecked
+output.
+
+MTP support and default speculation are separate decisions. The block must
+be present and the device's storage-offset alignment must allow its
+verification layout. The engine enables speculation by default only when
+the draft's weight cost is small enough relative to the main model;
+`--speculate` and `--no-speculate` control it explicitly. A small model can
+have a valid MTP block without benefiting from using it. See
+[speculative decoding](generation.md#speculative-decoding) and
+[engine validation](validation.md#engine).

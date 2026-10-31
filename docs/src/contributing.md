@@ -14,41 +14,73 @@
 
 | Path | Contents |
 |---|---|
-| `src/` | The Zig core: one directory per module in the spec's component table, plus `ref/` (CPU reference). Modules not started yet hold only a `README.md`. |
+| `src/` | Shared Zig core, CPU reference, platform layer and backend implementations |
 | `tools/` | Parity harness, reference dumper (`llama-dump`), corpora, table generators |
-| `web/` | Browser-side TypeScript: the book's scripts now, the wasm shim and `zllm.js` from M3 |
+| `web/` | Browser WebGPU host, `zllm.js` facade, demo and book scripts |
 | `docs/` | This book; GitHub Pages serves it from `master` |
 | `scripts/fixtures.sh` | Pinned fixture downloads |
 | `scripts/d3d12.sh` | Builds the Windows binary and runs it on the D3D12 host from WSL |
 | `third_party/dawn` | The vendored `webgpu.h` matching the pinned Dawn release |
+| `src/velocity/` | Native D3D12 host, HLSL kernels and Windows SDK interface |
+| `benchmarks/` | Committed per-device benchmark records |
 
 ## Checks
 
-Run these before every commit; CI runs the same:
+CI runs formatting, unit tests, wasm compilation, tokenizer/chat parity,
+the fast GPU tier on Dawn/llvmpipe, TypeScript checks/tests and the book
+build. The full model gates need their fixtures and run separately. For a
+change that touches all these areas, the corresponding commands are:
 
 ```sh
 zig fmt --check . && zig build test
 (cd web && bun run check)
+(cd web && bun run test)
 scripts/fixtures.sh vocab && zig build check-tokenizer && zig build check-chat
-scripts/fixtures.sh dawn && zig build gpu-check
+scripts/fixtures.sh dawn && scripts/fixtures.sh model
+zig build check-fast -Dengine-check=false   # CI's llvmpipe tier
 (cd web && bun run build:book) && mdbook build docs
 ```
 
 For changes to `gguf`, `graph` or `ref`, also run the fixture-backed checks
-`zig build check-gguf` and `zig build check-forward`. For changes to `gpu`,
-`kernels`, `plan`, `sampler`, `state` or `sched`, run `zig build check-gpu`.
-These need the 1.5 GB model and a llama.cpp build (`scripts/fixtures.sh`), so
-CI does not run them.
+`zig build check-gguf`, `zig build check-dequant` and
+`zig build check-forward`. For changes to execution or kernels, run
+`zig build check-gpu`, plus the affected quantized and Gyro-Coder model
+gates. See [Validation](validation.md) for fixtures, options and thresholds.
 
-Run `check-gpu` on a real GPU: natively on Linux, or with
-`-Dgpu-host=d3d12` on WSL. On llvmpipe it is correct but takes about half an
-hour. llvmpipe is there for `gpu-check`, which takes seconds and is what CI
-runs.
+`zig build check-fast` is an iteration tier: kernel checks followed by the
+first eval text through both kernel paths, step splits and every KV format,
+plus a short Gyro-Coder check when `-Dgyro-model` is set. It does not replace
+the full gates.
+
+CI caches the model and vocabulary fixtures and `.fixtures/cache`, the CPU
+reference outputs. The reference cache is keyed by the reference, GGUF and
+graph source, CLI source, build files and eval corpus; changing those
+inputs recomputes the reference.
+
+CI passes `-Dengine-check=false` on llvmpipe. The software renderer makes
+engine-check expensive and its prefix-reuse rounding can exceed the
+bound. This is an explicit coverage gap, not a relaxed bound.
+Engine-check still runs on real GPUs with `d3d12` and `velocity`.
+
+Run GPU work one job at a time. Use `-Dgpu-host=d3d12` for Dawn on a Windows
+GPU from WSL, or `-Dgpu-host=velocity` for Velocity. The default native host
+uses Dawn; llvmpipe model/reference checks are not real-GPU performance
+evidence. Backend-specific gates matter even when hosts share the core.
 
 For kernel performance, `zllm profile <model.gguf> [tokens]` (or
 `scripts/d3d12.sh profile ...`) gives each kernel's GPU time from timestamp
 queries, for prefill and decode steps. `zllm bench` times whole decode
 steps, and each kernel class's share by leaving it out.
+
+Keep performance evidence separate from targets. Record the backend,
+adapter, model revision, context, precision and commit alongside results.
+See [Performance](performance.md). New kernels need a CPU reference and
+checks on each executing backend; fusion and precision changes need their
+own model gates.
+
+For documentation-only changes, build the book and check local page and
+fragment links. Preserve existing linked headings when reorganizing
+chapters. The demo is bundled separately by CI after the book build.
 
 ## TypeScript
 
