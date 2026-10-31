@@ -1,5 +1,8 @@
 // Quantized weight reads and packed-byte helpers from quant/common.wgsl.
 // Weights occupy binding 2; all offsets below are relative to its view.
+// Rows are row_stride(k) bytes apart; kernels set row_k to their rows'
+// weight count before decoding (0: rows laid out as in the GGUF file).
+static uint row_k;
 uint wword(uint q) { return ldw(2, q); }
 uint4 wvec(uint q) { return ro(2).Load4(base(2) + 16u * q); }
 uint wbyte(uint i) { return (wword(i >> 2u) >> ((i & 3u) * 8u)) & 0xffu; }

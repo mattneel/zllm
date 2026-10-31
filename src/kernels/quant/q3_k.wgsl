@@ -11,6 +11,10 @@
 const BLOCK_ELEMS: u32 = 256u;
 const BLOCK_BYTES: u32 = 128u;
 
+fn row_stride(k: u32) -> u32 {
+    return (k / BLOCK_ELEMS) * BLOCK_BYTES;
+}
+
 const ACT_BLOCK: u32 = 256u;
 const HAS_MIN: bool = false;
 

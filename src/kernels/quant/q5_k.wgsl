@@ -3,6 +3,10 @@
 const BLOCK_ELEMS: u32 = 256u;
 const BLOCK_BYTES: u32 = 176u;
 
+fn row_stride(k: u32) -> u32 {
+    return (k / BLOCK_ELEMS) * BLOCK_BYTES;
+}
+
 // scale_min_k4, as for Q4_K.
 fn scale_min_words(sw: vec3u, j: u32) -> vec2u {
     if (j < 4u) {

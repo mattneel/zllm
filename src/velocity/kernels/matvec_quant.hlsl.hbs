@@ -69,7 +69,8 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
     uint xr = param(7) != 0u ? param(7) : k4;
     bool norm = (param(5) & NORM) != 0u;
     bool pair = (param(5) & SILU_PAIR) != 0u;
-    uint row_bytes = (param(1) / BLOCK_ELEMS) * BLOCK_BYTES;
+    row_k = param(1);
+    uint row_bytes = row_stride(param(1));
     uint tile = m > 1u ? TILE_PAIR : TILE_ONE;
     for (uint t = 0u; t < m; t += 2u) {
         bool two = t + 1u < m;

@@ -11,6 +11,12 @@
 // defines ACT_BLOCK, the activation block the prefill multiply rounds to
 // (llama.cpp's vec_dot_type: Q8_K or Q8_0), and HAS_MIN (m ≠ 0). The decode
 // multiply also takes the type's block_dot (<type>_dot.wgsl).
+//
+// Rows are row_stride(k) bytes apart (kernels.rowBytes). The type's decoders
+// may need the row's length: kernels set row_k to it (the weight count k of
+// the rows they read) before decoding, or to 0 for rows laid out as in the
+// GGUF file (Q8_0's per-layer embedding rows, read straight from the file).
+var<private> row_k: u32;
 
 // Word q (4-byte index) of the buffer.
 fn wword(q: u32) -> u32 {

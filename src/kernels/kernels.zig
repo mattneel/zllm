@@ -64,6 +64,7 @@ pub const Kernel = enum {
     ple_conv,
     repad,
     repack_q3_k,
+    repack_q8_0,
     quantize_q8,
     // Quantized weights: matvec_quant.wgsl.hbs (a template, MatvecVariant),
     // matmul_quant.wgsl and embed_quant.wgsl, each composed with its type's
@@ -133,14 +134,28 @@ pub const QuantOp = enum { matvec, matmul, embed };
 /// block size, padded to a multiple of 16 where it is not one already
 /// (`repad` lays the blocks out), so blocks take 16-byte loads. Q3_K is
 /// repacked instead, into eight self-contained 16-byte units
-/// (repack_q3_k.wgsl). Q8_0 keeps its 34 bytes: padding would cost 41%, and
-/// its kernels read words.
+/// (repack_q3_k.wgsl). Q8_0 rows are split instead (rowBytes).
 pub fn blockStride(t: gguf.TensorType) u32 {
     return switch (t) {
         .q3_k => 128,
         .q6_k => 224,
         else => t.layout().?.block_bytes,
     };
+}
+
+/// Bytes per row of `k` weights of quantized type `t` as the kernels read
+/// it (each type's row_stride): blocks at blockStride, or for Q8_0 split
+/// rows (repack_q8_0.wgsl), the k values as i8 then the k/32 scales as f16,
+/// padded to 16 bytes (exact when k is a multiple of 256).
+pub fn rowBytes(t: gguf.TensorType, k: u64) u64 {
+    if (t == .q8_0) return std.mem.alignForward(u64, k + k / 16, 16);
+    return k / t.layout().?.block_elems * blockStride(t);
+}
+
+/// Whether type `t`'s rows need laying out (Launcher.layout) on the GPU,
+/// rather than reading as they are in the file.
+pub fn needsLayout(t: gguf.TensorType) bool {
+    return t == .q8_0 or blockStride(t) != t.layout().?.block_bytes;
 }
 
 /// Whether weights of type `t` take the half-precision kernels, which read
@@ -440,6 +455,7 @@ pub const params = struct {
         mode: u32 = 0,
         eps: f32 = 0,
     };
+    pub const RepackQ80 = extern struct { rows: u32, k: u32, _pad: [2]u32 = @splat(0) };
     pub const RepackQ3K = extern struct { blocks: u32, _pad: [3]u32 = @splat(0) };
     pub const Repad = extern struct { blocks: u32, src_bytes: u32, dst_bytes: u32, _pad: u32 = 0 };
     pub const SiluMul = extern struct { count: u32, width: u32, _pad: [2]u32 = @splat(0) };
@@ -793,13 +809,16 @@ pub const Launcher = struct {
         try l.rec.dispatch(l.gpa, pipeline, groups, &.{bg});
     }
 
-    /// Lays out `blocks` raw GGUF blocks of type `t` from `src` in `dst` as
-    /// the quantized kernels read them (blockStride): Q3_K repacked, other
-    /// types padded.
-    pub fn layout(l: Launcher, t: gguf.TensorType, src: Arg, dst: Arg, blocks: u64) Allocator.Error!void {
+    /// Lays out `rows` raw GGUF rows of `k` weights of type `t` from `src`
+    /// in `dst` as the quantized kernels read them (rowBytes): Q3_K
+    /// repacked, Q8_0 split, other types padded.
+    pub fn layout(l: Launcher, t: gguf.TensorType, src: Arg, dst: Arg, rows: u64, k: u64) Allocator.Error!void {
         const bytes = t.layout().?.block_bytes;
         const stride = blockStride(t);
-        if (t == .q3_k) {
+        const blocks = rows * k / t.layout().?.block_elems;
+        if (t == .q8_0) {
+            try l.launch(.repack_q8_0, params.RepackQ80{ .rows = @intCast(rows), .k = @intCast(k) }, &.{ src, dst }, elementwise(@intCast(rows * rowBytes(t, k) / 4)));
+        } else if (t == .q3_k) {
             try l.launch(.repack_q3_k, params.RepackQ3K{ .blocks = @intCast(blocks) }, &.{ src, dst }, elementwise(@intCast(blocks * 8)));
         } else {
             try l.launch(.repad, params.Repad{ .blocks = @intCast(blocks), .src_bytes = bytes, .dst_bytes = stride }, &.{ src, dst }, elementwise(@intCast(blocks * stride / 4)));

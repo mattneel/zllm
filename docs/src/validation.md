@@ -313,7 +313,7 @@ up to it:
   norm prologue and accumulate epilogue, the prefill multiply accumulating
   (70 tokens × 150 outputs, whole and split over k through
   `matmul_reduce`), and the embedding gather against float64 over those
-  decoders. Weights go through `repad` as the loader's do. The prefill
+  decoders. Weights go through `Launcher.layout` (`repad`, `repack_q3_k`, `repack_q8_0`) as the loader's do. The prefill
   multiply's input is rounded by `quantize_q8`, and the float64 sum runs
   over the reference's rounding of it. Further checks run x over two
   staged tiles (k = 4,096) and the SiLU pair on Q3_K, the 27B's gate and

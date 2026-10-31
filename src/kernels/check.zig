@@ -422,20 +422,19 @@ fn quantRows(c: *Ctx, t: gguf.TensorType, rows: usize, k: usize) !struct { bytes
     return .{ .bytes = bytes, .values = values };
 }
 
-/// Uploads raw GGUF blocks of type `t` in the layout the quantized kernels
-/// read: as they are, or padded or repacked by Launcher.layout, as the
-/// model loader does.
-fn gpuWeights(c: *Ctx, t: gguf.TensorType, raw: []const u8) !kernels.Arg {
+/// Uploads raw GGUF rows of `k` weights of type `t` in the layout the
+/// quantized kernels read: as they are, or laid out by Launcher.layout, as
+/// the model loader does.
+fn gpuWeights(c: *Ctx, t: gguf.TensorType, raw: []const u8, k: usize) !kernels.Arg {
     const l = t.layout().?;
-    const stride = kernels.blockStride(t);
-    const blocks = raw.len / l.block_bytes;
+    const rows = raw.len / (k / l.block_elems * l.block_bytes);
     const padded = try c.arena.alloc(u8, std.mem.alignForward(usize, raw.len, 16));
     @memset(padded, 0);
     @memcpy(padded[0..raw.len], raw);
     const src = try c.upload(padded);
-    if (stride == l.block_bytes) return src;
-    const out = try c.output(std.mem.alignForward(usize, blocks * stride, 16) / 4);
-    try c.launcher().layout(t, src, out, blocks);
+    if (!kernels.needsLayout(t)) return src;
+    const out = try c.output(std.mem.alignForward(usize, rows * kernels.rowBytes(t, k), 16) / 4);
+    try c.launcher().layout(t, src, out, rows, k);
     return out;
 }
 
@@ -553,7 +552,7 @@ fn Quant(comptime t: gguf.TensorType) type {
             for (0..rows) |r| ref_matmul.roundLikeLlama(t, xs[r * k ..][0..k]);
             const act = try quantizeX(c, t, x, rows, k);
             const w = try quantRows(c, t, n, k);
-            const wa = try gpuWeights(c, t, w.bytes);
+            const wa = try gpuWeights(c, t, w.bytes, k);
             const init = try c.random(rows * n, 4);
             const whole = try c.upload(init);
             const split = try c.upload(init);
@@ -586,7 +585,7 @@ fn Quant(comptime t: gguf.TensorType) type {
             const ta = try c.upload(&tokens);
             for ([_][2]u32{ .{ 0, split }, .{ split, vocab - split } }) |chunk| {
                 const bytes = table.bytes[chunk[0] * row_bytes ..][0 .. chunk[1] * row_bytes];
-                try c.launcher().launch(kernels.Kernel.quant(.embed, t).?, P.EmbedBf16{ .dim = dim, .row0 = chunk[0], .chunk_rows = chunk[1] }, &.{ ta, try gpuWeights(c, t, bytes), out }, .{ tokens.len, 1, 1 });
+                try c.launcher().launch(kernels.Kernel.quant(.embed, t).?, P.EmbedBf16{ .dim = dim, .row0 = chunk[0], .chunk_rows = chunk[1] }, &.{ ta, try gpuWeights(c, t, bytes, dim), out }, .{ tokens.len, 1, 1 });
             }
             const got = try c.read(out);
             const want = try c.arena.alloc(f64, tokens.len * dim);
@@ -634,7 +633,7 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
     const init = try c.random(rows * n, if (pair) 0 else 4);
     const kernel = kernels.Kernel.quant(.matvec, t).?;
     const xa = try c.upload(x);
-    const wa = try gpuWeights(c, t, w.bytes);
+    const wa = try gpuWeights(c, t, w.bytes, k);
     const na = try c.upload(nw);
     var got: [kernels.MatvecVariant.candidates.len][]f32 = undefined;
     for (kernels.MatvecVariant.candidates, &got) |v, *g| {
@@ -682,7 +681,7 @@ fn checkQuantAct(c: *Ctx) !Result {
     const x = try c.random(rows * stride, 3);
     const w = try quantRows(c, .q8_0, n, k);
     const xa = try c.upload(x);
-    const wa = try gpuWeights(c, .q8_0, w.bytes);
+    const wa = try gpuWeights(c, .q8_0, w.bytes, k);
     var worst: f64 = 0;
     const want = try c.arena.alloc(f64, rows * n);
     for (0..rows) |tk| for (0..n) |j| {

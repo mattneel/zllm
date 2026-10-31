@@ -6,6 +6,10 @@ const BLOCK_ELEMS: u32 = 256u;
 // ql, qh, scales and d each start on a 16-byte boundary.
 const BLOCK_BYTES: u32 = 224u;
 
+fn row_stride(k: u32) -> u32 {
+    return (k / BLOCK_ELEMS) * BLOCK_BYTES;
+}
+
 struct Head {
     ql: u32,
     qh: u32,

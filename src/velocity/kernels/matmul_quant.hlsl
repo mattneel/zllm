@@ -32,7 +32,8 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
     uint kb = wg.z * param(6), ke = min(param(2), kb + param(6));
     uint n0 = wg.x * TN, t0 = wg.y * TM;
     uint tg = li % (TM / 4u), ng = li / (TM / 4u);
-    uint row_bytes = (param(2) / BLOCK_ELEMS) * BLOCK_BYTES;
+    row_k = param(2);
+    uint row_bytes = row_stride(param(2));
     uint wj = n0 + li;
     precise float4 acc[8] = (float4[8])0;
     uint2 nx = fetch_x(t0, kb, li);

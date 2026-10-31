@@ -191,18 +191,17 @@ pub const Upload = struct {
     }
 
     /// Chunks of a run of parts of type `t` covering matrix rows
-    /// [run_row0, run_row0 + run_rows). Quantized blocks whose size is not a
-    /// multiple of 16 (Q3_K, Q6_K) are laid out padded
-    /// (kernels.blockStride): the rows go to a staging buffer first, then
-    /// `repad` places each block, and the staging buffer is dropped after
-    /// its own submit, so at most one chunk's worth is ever extra.
+    /// [run_row0, run_row0 + run_rows). Types the kernels read in another
+    /// layout (kernels.needsLayout: Q8_0 split rows, Q3_K repacked, Q6_K
+    /// padded) go to a staging buffer first, then Launcher.layout places
+    /// them, and the staging buffer is dropped after its own submit, so at
+    /// most one chunk's worth is ever extra.
     fn chunkRun(u: *Upload, chunks: *std.ArrayList(Matrix.Chunk), k: u64, t: gguf.TensorType, spans: anytype, run_row0: u64, run_rows: u64) !void {
         const l = t.layout().?;
         const blocks_per_row = k / l.block_elems;
         const file_row = blocks_per_row * l.block_bytes;
-        const stride: u64 = kernels.blockStride(t);
-        const gpu_row = blocks_per_row * stride;
-        const repad = stride != l.block_bytes;
+        const gpu_row = kernels.rowBytes(t, k);
+        const repad = kernels.needsLayout(t);
         const rows_per_chunk = @min(run_rows, u.limits.max_binding / gpu_row);
         if (rows_per_chunk == 0) return error.TensorTooLarge;
         var row0: u64 = 0;
@@ -225,9 +224,8 @@ pub const Upload = struct {
                 part_row0 += span.rows;
             }
             if (repad) {
-                const blocks = rows * blocks_per_row;
                 const launcher: kernels.Launcher = .{ .gpa = u.gpa, .arena = u.arena, .rec = u.rec, .set = u.set };
-                try launcher.layout(t, .{ .buffer = staging, .size = raw_size }, .{ .buffer = buf, .size = size }, blocks);
+                try launcher.layout(t, .{ .buffer = staging, .size = raw_size }, .{ .buffer = buf, .size = size }, rows, k);
                 try u.rec.submit(u.gpa, 0);
                 try u.rec.destroy(u.gpa, .buffer, @backingInt(staging));
             }

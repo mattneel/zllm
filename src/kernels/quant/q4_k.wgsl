@@ -4,6 +4,10 @@
 const BLOCK_ELEMS: u32 = 256u;
 const BLOCK_BYTES: u32 = 144u;
 
+fn row_stride(k: u32) -> u32 {
+    return (k / BLOCK_ELEMS) * BLOCK_BYTES;
+}
+
 // scale_min_k4: the 6-bit scale and min of sub-block j, from the 12 scale
 // bytes held as three words.
 fn scale_min_words(sw: vec3u, j: u32) -> vec2u {

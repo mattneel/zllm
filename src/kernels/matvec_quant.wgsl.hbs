@@ -14,7 +14,7 @@
 // of one. Each token's arithmetic is the same whatever m is: its x tile and
 // its partial sums, in the same order. A lone token stages tiles of 2048
 // floats, pairs 1024 each, in the same workgroup memory; both hold a
-// multiple of the 32 lanes in tasks (32 or 64 for the K-quants, 256 or 512
+// multiple of the 32 lanes in tasks (32 or 64 for the K-quants, 64 or 128
 // for Q8_0), so each lane accumulates the same tasks in the same order.
 //
 // Fused before it, by template parameter: with act_div > 0, each input is
@@ -141,7 +141,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @
     let xr = select(k4, p.x_stride, p.x_stride != 0u);
     let norm = (p.flags & NORM) != 0u;
     let pair = (p.flags & SILU_PAIR) != 0u;
-    let row_bytes = (p.k / BLOCK_ELEMS) * BLOCK_BYTES;
+    row_k = p.k;
+    let row_bytes = row_stride(p.k);
     let tile = select(TILE_ONE, TILE_PAIR, m > 1u);
 
     // Tokens in pairs (a lone one last), each pair's sums in registers.

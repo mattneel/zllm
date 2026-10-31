@@ -1,7 +1,8 @@
 // out[t] = table[tokens[t] - row0] decoded to f32 (the type file before
 // this one decodes it), for tokens whose row lies in this table chunk
 // [row0, row0 + chunk_rows). One workgroup per token; a thread per unit.
-// Rows are `stride` bytes apart, or packed when it is 0 (rows read from a
+// Rows are packed as uploaded (row_stride) when `stride` is 0; else they are
+// `stride` bytes apart and laid out as in the GGUF file (rows read from a
 // file in pieces the GPU can take, multiples of 4 bytes, sit further apart).
 
 struct Params {
@@ -23,7 +24,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
     if (tok < p.row0 || tok >= p.row0 + p.chunk_rows) {
         return;
     }
-    let row_bytes = select((p.dim / BLOCK_ELEMS) * BLOCK_BYTES, p.stride, p.stride != 0u);
+    row_k = select(p.dim, 0u, p.stride != 0u);
+    let row_bytes = select(row_stride(p.dim), p.stride, p.stride != 0u);
     for (var u = lid.x; u < p.dim / 32u; u += 256u) {
         let h = head((tok - p.row0) * row_bytes, u);
         for (var i0 = 0u; i0 < 8u; i0 += 4u) {

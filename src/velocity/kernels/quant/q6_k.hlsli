@@ -1,6 +1,7 @@
 // Padded Q6_K units and scales from quant/q6_k.wgsl.
 static const uint BLOCK_ELEMS = 256u;
 static const uint BLOCK_BYTES = 224u;
+uint row_stride(uint k) { return (k / BLOCK_ELEMS) * BLOCK_BYTES; }
 static const uint ACT_BLOCK = 256u;
 static const bool HAS_MIN = false;
 struct Head { uint ql; uint qh; uint low_shift; uint high_shift; float ds0; float ds1; };

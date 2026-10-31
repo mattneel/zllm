@@ -17,7 +17,8 @@ void main(uint3 wg : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     uint t = wg.x, tok = ldu(1, t);
     uint dim = param(0), row0 = param(1);
     if (tok < row0 || tok >= row0 + param(2)) return;
-    uint row_bytes = param(3) != 0u ? param(3) : (dim / BLOCK_ELEMS) * BLOCK_BYTES;
+    row_k = param(3) != 0u ? 0u : dim;
+    uint row_bytes = param(3) != 0u ? param(3) : row_stride(dim);
     for (uint u = lid.x; u < dim / 32u; u += 256u) {
         Head h = head((tok - row0) * row_bytes, u);
         for (uint i0 = 0u; i0 < 8u; i0 += 4u) {

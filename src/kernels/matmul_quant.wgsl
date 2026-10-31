@@ -93,7 +93,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
     // This thread's tokens t0 + 4·tg + a and outputs n0 + 8·ng + c.
     let tg = li % (TM / 4u);
     let ng = li / (TM / 4u);
-    let row_bytes = (p.k / BLOCK_ELEMS) * BLOCK_BYTES;
+    row_k = p.k;
+    let row_bytes = row_stride(p.k);
     let k4 = p.k / 4u;
     let blocks = p.k / ACT_BLOCK;
     // The weight row this thread decodes.

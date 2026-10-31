@@ -1,6 +1,7 @@
 // Q4_K units and scales from quant/q4_k.wgsl.
 static const uint BLOCK_ELEMS = 256u;
 static const uint BLOCK_BYTES = 144u;
+uint row_stride(uint k) { return (k / BLOCK_ELEMS) * BLOCK_BYTES; }
 static const uint ACT_BLOCK = 256u;
 static const bool HAS_MIN = true;
 uint2 scale_min_words(uint3 sw, uint j) {

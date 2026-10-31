@@ -65,6 +65,7 @@ const implemented = [_]Kernel{
     .embed_q6_k,
     .quantize_q8,
     .repack_q3_k,
+    .repack_q8_0,
 };
 
 /// Kernel `k`'s HLSL (for a template, kernels.Kernel.isTemplate, the
