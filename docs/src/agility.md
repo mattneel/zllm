@@ -4,12 +4,12 @@ Agility is zllm's native Direct3D 12 backend. It runs the same Zig plans
 and command stream as the WebGPU backend ([GPU backend](gpu.md)), with
 hand-written HLSL kernels compiled by DXC.
 
-DirectStorage model-file reads are implemented. The host also queries
-LinAlg wave and matrix capabilities through the preview Agility SDK, but
-the current inference kernels do not use LinAlg matrix intrinsics or
-tensor-core compute. Native wave reductions and lane exchange are already
-used in the routed-expert and router kernels. See the
-[backend matrix](backends.md) for implemented features and remaining gaps.
+DirectStorage model-file reads are implemented. On adapters supporting
+native LinAlg wave-matrix multiplication, dense float-activation Q8_0
+and grouped TQ2_T expert prefill GEMMs use tensor-core matrix operations.
+Other adapters retain the scalar HLSL implementations. Native wave
+reductions and lane exchange also serve the decode expert and router
+kernels. See the [backend matrix](backends.md).
 
 ## Platform layer
 
@@ -100,9 +100,9 @@ The load-time tuner renders the same twelve `MatvecVariant` candidates
 from the HLSL template. The shared fuser can fold `hc_act` into the
 quantized multiply's prologue under its single-reader and layout rules.
 Native tuning is cached through the same JSON cache as Dawn, with
-`agility` as the runtime identity. The current key hashes the WGSL
-catalog, not the HLSL catalog: an HLSL-only change with an unchanged
-version can reuse an old tuning entry. See [Plan cache](gpu.md#plan-cache).
+`agility` as the runtime identity. The key hashes both the scalar and LinAlg
+HLSL implementations, so either variant's source change invalidates its
+tuning entry. See [Plan cache](gpu.md#plan-cache).
 
 ### Native optimizations
 
@@ -121,10 +121,27 @@ Agility is no longer only a translation of the initial WGSL algorithms:
 - Kernel contracts let the host omit barriers between independent accesses;
   profiling deliberately serializes operations for isolated timings.
 
-LinAlg wave/cooperative matrix kernels remain future work, not a property
-of these wave reductions. `host.cpp` queries Shader Model 6.10, the
-LinAlg tier and matrix-operation support flags. `host.zig` can target
-`cs_6_10` when a shader requests it; the current catalog uses `cs_6_6`.
+The prefill variants use wave32 16×16×16 FP16-input/FP32-accumulate
+matrices, compiled as `cs_6_10`. `host.cpp` queries that exact operation;
+`host.zig` selects variants only with experimental shader support, Shader
+Model 6.10, LinAlg tier 1.0 and native (not emulated) input/output support.
+Otherwise it compiles the scalar catalog as `cs_6_6`. Selection changes
+neither the plan nor its kernel contract, and decode still uses matvecs.
+
+Activations are staged as FP16 high and residual components. Two matrix
+products accumulate high×weight and residual×weight in f32. Q8_0 signed
+bytes and TQ2_T codebook values are exact FP16 operands; each block's
+scale is applied to its dot product using register-local matrix element
+access. No model weights are expanded persistently. Grouped experts
+preserve each token's reduction order independently of tile occupancy,
+including empty and partial expert groups. The GPU checks compare original
+f32 operands at their unchanged
+1e-5 bounds and require whole/split-token results to match bitwise within
+each path. The full Gyro gates retain their existing bounds.
+
+The pinned DXC HLSL matrix headers are staged by
+`scripts/fixtures.sh agility` under `agility/include` beside its compiler
+DLL; the host supplies that absolute include directory at load-time compilation.
 
 ### Recorded validation and timing
 

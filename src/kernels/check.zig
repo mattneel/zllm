@@ -598,6 +598,8 @@ fn checkMatmulQ80Float(c: *Ctx) !Result {
             for (0..rows) |r| for (0..n) |j| {
                 compact[r * n + j] = @bitCast(got[r * stride + 3 + j]);
             };
+            const numeric_error = relErr(compact, want);
+            if (numeric_error > 1e-5) std.log.err("float Q8_0 matmul rel L2 {e} exceeds unchanged 1e-5 bound (slices {d}, weight chunks {d})", .{ numeric_error, slices, chunked });
             pass = floatQ8Accurate(compact, want) and pass;
             for (0..rows) |r| for (0..stride) |j| {
                 if (j >= 3 and j < 3 + n) continue;
@@ -1920,19 +1922,23 @@ test "grouped Gyro checker rejects grouping and output mutations" {
     try std.testing.expect(!groupedExact(&ids, &counts, &slots, 5, &got, &want));
 }
 
-/// Repeated routes (7, 4, 3, 0 slots), partial four-token and 32-row tiles,
-/// token- and slot-indexed inputs, padded strides, and stale capacity rows.
+/// Repeated routes (19, 12, 7, 0 slots), partial four-/16-token and
+/// 32-row tiles, token-/slot-indexed inputs, padding, and stale capacity.
 /// Whole versus split token chunks is bitwise on both backends. WGSL also
 /// compares bitwise to gyro_matvec; HLSL's old WaveActiveSum is unspecified.
 fn checkGyroMatmul(c: *Ctx) !Result {
     const q4 = @import("../ref/qwen4exp/kernels.zig");
     const book = try c.upload(@import("../ref/gyro/gyro.zig").codebook_bytes);
     const rows = 37;
-    const tokens = 7;
+    const tokens = 19;
     const used = 2;
     const n_expert = 4;
-    const max_slots = 22;
-    const active_ids = [_]u32{ 0, 1, 0, 2, 0, 1, 0, 2, 0, 1, 0, 2, 0, 1 };
+    const max_slots = 46;
+    const active_ids = [_]u32{
+        0, 1, 0, 2, 0, 1, 0, 2, 0, 1, 0, 2, 0, 1,
+        0, 1, 0, 2, 0, 1, 0, 2, 0, 1, 0, 2, 0, 1,
+        0, 1, 0, 2, 0, 1, 0, 1, 0, 1,
+    };
     var ids: [max_slots]u32 = @splat(0);
     @memcpy(ids[0..active_ids.len], &active_ids);
     var pass = true;
@@ -1968,7 +1974,7 @@ fn checkGyroMatmul(c: *Ctx) !Result {
         const whole_counts = try c.readWords(counts);
         const whole_slots = try c.readWords(slots);
         const split = try c.arena.dupe(u32, init);
-        for ([_][2]u32{ .{ 0, 2 }, .{ 2, 1 }, .{ 3, 4 } }) |chunk| {
+        for ([_][2]u32{ .{ 0, 2 }, .{ 2, 1 }, .{ 3, 16 } }) |chunk| {
             const start = chunk[0];
             const len = chunk[1];
             const first_slot = start * used;
@@ -1995,7 +2001,9 @@ fn checkGyroMatmul(c: *Ctx) !Result {
             cpu[compact] = q4.dotRow(.tq2_t, w[z][off..][0..row_bytes], x[xr..][0..cols]);
             gpu[compact] = @bitCast(got[slot * out_stride + z * out_z + j]);
         };
-        pass = relErr(gpu, cpu) <= 1e-5 and pass;
+        const numeric_error = relErr(gpu, cpu);
+        if (numeric_error > 1e-5) std.log.err("grouped Gyro matmul rel L2 {e} exceeds unchanged 1e-5 bound ({d} columns)", .{ numeric_error, cols });
+        pass = numeric_error <= 1e-5 and pass;
         for (0..tokens * used) |slot| for (0..out_stride) |j| {
             if (j / out_z < projections and j % out_z < rows) continue;
             pass = (got[slot * out_stride + j] == init[slot * out_stride + j]) and pass;

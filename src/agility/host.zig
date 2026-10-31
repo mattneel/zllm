@@ -303,7 +303,19 @@ pub const Host = struct {
             .create_kernel => {
                 try need(a, 7);
                 if (a[6] == 0) return put(Pipeline, h.gpa, &h.pipelines, a[0], .{ .missing = a[1] });
-                const source = command.ptrAt([*]const u8, 4)[0..a[6]];
+                const original = command.ptrAt([*]const u8, 4)[0..a[6]];
+                const native_kernels = @import("kernels.zig");
+                const caps: native_kernels.LinAlgCaps = .{
+                    .shader_model = h.d.caps.shader_model,
+                    .tier = h.d.caps.linalg_tier,
+                    .wave_flags = h.d.caps.wave16_fp16_fp32_flags,
+                    .experimental = h.d.caps.experimental_features_enabled != 0,
+                };
+                const selected = if (caps.supported())
+                    native_kernels.linAlgSource(std.enums.fromInt(Kernel, a[1]) orelse return error.BadCommand)
+                else
+                    null;
+                const source = selected orelse original;
                 var p: ?*c.vel_pipeline = null;
                 h.d.check(c.vel_compile_pipeline(h.d.ctx, source.ptr, source.len, target(source), &p)) catch |err| {
                     std.log.err("agility: kernel {d} (variant {d}) does not compile: {s}", .{ a[1], a[2], h.d.errorMessage() });

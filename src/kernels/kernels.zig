@@ -807,7 +807,7 @@ fn artifact(backend: Backend, arena: Allocator, k: Kernel, v: MatvecVariant) (Se
 pub fn backendSource(backend: Backend, k: Kernel) []const u8 {
     return switch (backend) {
         .webgpu => k.source(),
-        .agility => agility_kernels.source(k) orelse "",
+        .agility => agility_kernels.cacheSource(k),
     };
 }
 

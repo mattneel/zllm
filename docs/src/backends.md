@@ -30,7 +30,7 @@ available backend, option or performance claim.
 | Persistent tuning cache | OPFS under `zllm/plans/` | Native JSON cache directory | Same native cache, separate runtime identity | No cache integration |
 | f32 / f16 / FP8 KV | All implemented; f16 default | All implemented; f16 default | All implemented; f16 default | Not available |
 | Automatic precision ladder | Not implemented; cache format is explicit | Same | Same | Not available |
-| Native tensor-core / matrix-intrinsic kernels | Not implemented in current WGSL kernels | Not implemented in current WGSL kernels | Not implemented in current HLSL inference kernels; host queries LinAlg capabilities | No implementation |
+| Native tensor-core / matrix-intrinsic kernels | Not implemented in current WGSL kernels | Not implemented in current WGSL kernels | LinAlg wave-matrix Q8_0 float-activation and grouped TQ2_T prefill GEMMs, capability-gated with scalar HLSL fallback | No implementation |
 | Native wave optimizations | Current WGSL kernels do not use subgroup operations | Same WGSL path | Implemented in `gyro_matvec` and `moe_logits` | No implementation |
 | Model-file uploads | HTTP ranges or a local `File`, served by the shim | Ranges from a file mapping | DirectStorage range reads into GPU buffers | No file-upload path |
 | DirectStorage | No: browser has no native DirectStorage interface | No: Dawn host uses mapped bytes and queue writes | Implemented in `write_file` | Not integrated |
@@ -92,11 +92,14 @@ f32 arithmetic. f16 remains the default, and `--kv fp8` is an explicit
 native option. See [Precision](precision.md) for the implemented formats
 and the distinction from the planned quality-gated ladder.
 
-Agility queries Shader Model 6.10 and LinAlg matrix capabilities and can
-compile a shader that asks for `cs_6_10`. The current inference catalog does
-not use LinAlg wave/cooperative matrix intrinsics. Its native optimizations
-use wave reductions, lane exchange and a staged Gyro codebook instead. SDK
-and capability plumbing should not be read as completed tensor-core kernels.
+Agility selects LinAlg prefill implementations at pipeline creation when
+experimental Shader Model 6.10, LinAlg tier 1.0 and native wave32
+16×16×16 FP16-input/FP32-accumulate multiplication are supported. Dense
+float-activation Q8_0 and grouped TQ2_T expert GEMMs keep their existing
+identity, bindings, write set and dispatch grid. Unsupported adapters run
+the existing scalar HLSL; Dawn and browser WGSL are unchanged. FP16
+high/residual operands preserve the unchanged f32-reference error bounds,
+not a new lower-precision tolerance. See [Precision](precision.md).
 
 CUDA is a planned backend, not an alternative spelling of Agility. The
 current backend enum, build integration and artifact selector contain no

@@ -80,6 +80,67 @@ pub fn source(k: Kernel) ?[]const u8 {
     return null;
 }
 
+/// The queried wave32, 16×16×16 FP16-input/FP32-accumulate operation.
+/// Emulated operands are not a native tensor-core implementation.
+pub const LinAlgCaps = struct {
+    shader_model: u32,
+    tier: u32,
+    wave_flags: u32,
+    experimental: bool,
+
+    pub fn supported(caps: LinAlgCaps) bool {
+        return caps.experimental and caps.shader_model >= 0x6a and
+            caps.tier >= 0x10 and caps.wave_flags & 0x7 == 0x1;
+    }
+};
+
+/// A device-selected implementation of the same identity, grid and contract.
+/// Selection happens at pipeline creation, after the native capability query.
+pub fn linAlgSource(k: Kernel) ?[]const u8 {
+    return switch (k) {
+        .matmul_q8_0_float => common ++ @embedFile("kernels/matmul_q8_0_float_linalg.hlsl"),
+        .gyro_matmul => common ++ @embedFile("kernels/gyro_matmul_linalg.hlsl"),
+        else => null,
+    };
+}
+
+/// Hash both possible implementations: capability selection must not hide a
+/// shader change from the persistent tuning cache.
+pub fn cacheSource(k: Kernel) []const u8 {
+    inline for (implemented) |i| {
+        if (k == i) return comptime (source(i).? ++ (linAlgSource(i) orelse ""));
+    }
+    return "";
+}
+
+test "LinAlg selection requires every native operation capability" {
+    const supported: LinAlgCaps = .{ .shader_model = 0x6a, .tier = 0x10, .wave_flags = 1, .experimental = true };
+    try std.testing.expect(supported.supported());
+    var mutated = supported;
+    mutated.shader_model = 0x69;
+    try std.testing.expect(!mutated.supported());
+    mutated = supported;
+    mutated.tier = 0;
+    try std.testing.expect(!mutated.supported());
+    mutated = supported;
+    mutated.experimental = false;
+    try std.testing.expect(!mutated.supported());
+    for ([_]u32{ 0, 2, 3, 5, 7, 8 }) |flags| {
+        mutated = supported;
+        mutated.wave_flags = flags;
+        try std.testing.expect(!mutated.supported());
+    }
+}
+
+test "LinAlg variants preserve the complete WGSL write set" {
+    for (std.enums.values(Kernel)) |k| {
+        if (linAlgSource(k)) |code| {
+            try std.testing.expectEqual(k.contract().writes, hlslWrites(code[common.len..]));
+            try std.testing.expect(std.mem.indexOf(u8, code, "\n// agility: cs_6_10\n") != null);
+        }
+    }
+}
+
 /// A kernel's parts, as kernels.zig's `composed` for the WGSL:
 ///   <op>_bf16, <op>_f16   half/<h>.hlsli, <op>_half.hlsl
 ///   <op>_q<type>          quant/common.hlsli, quant/<type>.hlsli, for

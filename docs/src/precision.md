@@ -18,6 +18,7 @@ quality-gated selection policy described in [spec §9](spec.md#9-state-and-prefi
 | Dense and hybrid decode multiplies | Decode stored weights and multiply with f32 activations, accumulating in f32 | Weight-specific kernel, with load-time tuning of quantized decode variants |
 | BF16/F16 prefill multiplies | Widen stored weights and use f32 operands and accumulation | Weight-specific kernel |
 | Quantized prefill multiplies | Round operands to Q8_K blocks for K-quants or Q8_0 blocks for Q8_0 weights; accumulate in f32 | Part of the existing quantized prefill path, not an adaptive precision choice |
+| Gyro-Coder float-activation Q8_0 and grouped TQ2_T prefill | Original f32 values on scalar paths; FP16 activation high/residual parts, exact FP16 weight operands, and two f32-accumulating matrix products on supported Agility devices | Native LinAlg operation support selects the matrix variant, otherwise scalar HLSL; unchanged reference bounds and per-path bitwise split-step gates |
 | Attention KV | f32, f16, FP8 E4M3FN | f16 for generation and browser loading; `gpu-forward` defaults to f32 for comparisons |
 | DeltaNet recurrent state and convolution history | f32 | Not changed by `--kv` |
 | Gyro sparse indexer keys / pooled blocks | f16 / f32 | Separate from the attention KV choice |
@@ -69,6 +70,16 @@ supports `TQ2_T`, `TQK6`, `TQK7`, `TQP5`, `TQP6`, `TQP7`, `TQK5` and
 `TQK4`. Its GPU routed-expert kernel currently requires `TQ2_T`, including
 the codebook and rotation signs. The PLE table requires Q8_0 rows. A
 `TQ2_0` file name does not override these per-tensor checks.
+
+Agility's LinAlg prefill variants decode weights into bounded shared-memory
+tiles, not persistent dense FP16 matrices. Activations are split into a
+rounded FP16 high part and an FP16 residual. Weight operands are exact
+signed-byte integers for Q8_0 or exact FP16 codebook entries for TQ2_T.
+Two matrix products accumulate high×weight and residual×weight in f32;
+each original quantization block's scale is applied after its dot product.
+This avoids rounding scaled weights to FP16. It is not an automatic
+precision ladder or permission to relax a quality gate. Scalar HLSL and
+WGSL retain their existing arithmetic.
 
 ## KV cache formats
 

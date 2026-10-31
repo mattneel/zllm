@@ -289,6 +289,8 @@ agility() {
 	# Agility's HLSL compiler, apart from the DXC Dawn uses.
 	mkdir -p "$stage/agility"
 	cp "$v/dxc/bin/x64/dxcompiler.dll" "$v/dxc/bin/x64/dxil.dll" "$stage/agility/"
+	mkdir -p "$stage/agility/include"
+	cp -R "$v/dxc/inc/hlsl" "$stage/agility/include/"
 	log "Agility runtime staged in $(cat "$dir/dawn/win_stage")"
 }
 

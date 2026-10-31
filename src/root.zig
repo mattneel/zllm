@@ -41,5 +41,6 @@ test {
     _ = @import("agility/kernels.zig");
     _ = @import("kernels/check.zig");
     _ = @import("agility/hazards.zig");
+    _ = @import("agility/linalg_test.zig");
     _ = @import("ref/fp8.zig");
 }

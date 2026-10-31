@@ -120,11 +120,14 @@ struct vel_context {
     HMODULE dxc_module = nullptr;
     Com<IDxcUtils> dxc_utils;
     Com<IDxcCompiler3> dxc;
+    Com<IDxcIncludeHandler> dxc_includes;
+    std::wstring dxc_include_path;
     std::string last_error;
     ~vel_context() {
         for (auto *p : pipelines) delete p;
         for (auto *b : buffers) delete b;
         for (auto *f : files) delete f;
+        dxc_includes = {};
         dxc = {};
         dxc_utils = {};
         if (dxc_module) FreeLibrary(dxc_module);
@@ -682,6 +685,7 @@ static HRESULT load_dxc(vel_context *c) {
     if (!n || n >= MAX_PATH) return HRESULT_FROM_WIN32(GetLastError());
     std::wstring dll(path, n);
     dll.resize(dll.find_last_of(L'\\') + 1);
+    c->dxc_include_path = dll + L"agility\\include";
     dll += L"agility\\dxcompiler.dll";
     c->dxc_module = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!c->dxc_module) {
@@ -692,6 +696,7 @@ static HRESULT load_dxc(vel_context *c) {
         reinterpret_cast<void*>(GetProcAddress(c->dxc_module, "DxcCreateInstance")));
     if (!create) return HRESULT_FROM_WIN32(GetLastError());
     VEL_TRY(create(CLSID_DxcUtils, IID_PPV_ARGS(c->dxc_utils.put())));
+    VEL_TRY(c->dxc_utils->CreateDefaultIncludeHandler(c->dxc_includes.put()));
     return create(CLSID_DxcCompiler, IID_PPV_ARGS(c->dxc.put()));
 }
 
@@ -704,10 +709,11 @@ extern "C" vel_result vel_compile_pipeline(vel_context *c, const char *source, s
         VEL_TRY(load_dxc(c));
         std::wstring wtarget(target, target + std::strlen(target));
         const wchar_t *args[] = {L"-E", L"main", L"-T", wtarget.c_str(), L"-HV", L"2021", L"-O3",
-            L"-enable-16bit-types", L"-Qstrip_debug", L"-Qstrip_reflect"};
+            L"-enable-16bit-types", L"-Qstrip_debug", L"-Qstrip_reflect",
+            L"-I", c->dxc_include_path.c_str()};
         DxcBuffer buffer{source, bytes, DXC_CP_UTF8};
         Com<IDxcResult> result;
-        VEL_TRY(c->dxc->Compile(&buffer, args, sizeof(args) / sizeof(args[0]), nullptr,
+        VEL_TRY(c->dxc->Compile(&buffer, args, sizeof(args) / sizeof(args[0]), c->dxc_includes.p,
             IID_PPV_ARGS(result.put())));
         HRESULT status;
         VEL_TRY(result->GetStatus(&status));
