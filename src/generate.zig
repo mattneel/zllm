@@ -20,7 +20,8 @@ pub const usage =
     \\generation options:
     \\  --max-tokens N        tokens to generate per turn (default 4096)
     \\  --ctx N               context capacity in tokens (default 8192)
-    \\  --kv f16|f32          KV cache format (default f16)
+    \\  --kv f16|f32|fp8      KV cache format (default f16; fp8: E4M3 with a
+    \\                       power-of-two scale per position and KV head)
     \\  --temperature F --top-k N --top-p F --min-p F
     \\  --repetition-penalty F --presence-penalty F --frequency-penalty F
     \\                        sampling, as in vLLM; unset, the model's defaults: the

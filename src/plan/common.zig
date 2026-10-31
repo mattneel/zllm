@@ -31,7 +31,30 @@ pub const Matrix = struct {
     pub const Chunk = struct { arg: Arg, row0: u32, rows: u32, type: gguf.TensorType };
 };
 
-pub const KvFormat = enum(u32) { f32 = 0, f16 = 1 };
+/// The attention cache's format (kernels' `kv` params word): f32, f16, or
+/// FP8 E4M3 with an f32 scale per position and KV head (fp8.wgsl).
+pub const KvFormat = enum(u32) {
+    f32 = 0,
+    f16 = 1,
+    fp8 = 2,
+
+    /// Bytes of one layer's K (or V) cache for `context` positions of
+    /// `kv_heads` heads of `head_dim`.
+    pub fn layerBytes(f: KvFormat, context: u64, kv_heads: u64, head_dim: u64) u64 {
+        const values = context * kv_heads * head_dim;
+        return switch (f) {
+            .f32 => 4 * values,
+            .f16 => 2 * values,
+            .fp8 => values + 4 * context * kv_heads,
+        };
+    }
+
+    /// The word where an FP8 cache's scales start (Params.scales); 0
+    /// otherwise.
+    pub fn scales(f: KvFormat, context: u64, kv_heads: u64, head_dim: u64) u32 {
+        return if (f == .fp8) @intCast(context * kv_heads * head_dim / 4) else 0;
+    }
+};
 
 /// The decode-multiply variant chosen for each weight shape.
 pub const Tuning = struct {

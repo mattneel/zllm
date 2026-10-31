@@ -21,8 +21,8 @@ Pass criteria (docs/src/validation.md):
     1-token steps, as decoding runs, over the first DECODE_TOKENS positions:
     the same bounds and top-1 agreement as the 512-token run; and in 3-token
     steps, bitwise identical to the 1-token run.
-  * f16 KV cache (the default): top-1 agreement >= F16_TOP1_MIN, and cosine
-    >= F16_COSINE_MIN at every position.
+  * f16 and FP8 KV caches (KV_GATES: their top-1 agreement and min cosine
+    at every position), on every eval text and each dense model's first.
   * `zllm engine-check`: requests that reuse the resident sequence or a
     checkpoint give the logits of fresh runs (bitwise where both runs use the
     same kernels for each position).
@@ -55,8 +55,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 COSINE_MIN = 0.999999
 REL_L2_MAX = 1e-4
-F16_TOP1_MIN = 0.99
-F16_COSINE_MIN = 0.99998
+# KV cache format -> (top-1 agreement min, cosine min at every position),
+# against the f32 reference. FP8 (E4M3, 3 mantissa bits) measured 97.4%
+# top-1 and a 0.982 worst cosine over these texts and models on the RTX
+# 5090: its bounds catch a broken path; whether a model may default to it
+# is the precision ladder's gate (docs/src/spec.md §9).
+KV_GATES = {"f16": (0.99, 0.99998), "fp8": (0.95, 0.975)}
 # (tokens per step, token limit) for the runs that must match bitwise.
 # Positions checked through the decode kernels (one step per token).
 DECODE_TOKENS = 40
@@ -99,9 +103,9 @@ def main() -> int:
     evals = [json.loads(line) for line in EVAL.read_text(encoding="utf-8").split("\n") if line]
 
     fail = Failures()
-    total = agree = agree16 = total16 = decode_total = decode_agree = 0
+    total = agree = decode_total = decode_agree = 0
     worst = {"prefill": [1.0, 0.0], "decode": [1.0, 0.0]}
-    worst_cos16 = 1.0
+    kv_stats = {fmt: {"agree": 0, "total": 0, "cos": 1.0} for fmt in KV_GATES}
 
     def compare(label: str, path: str, gpu: dict, ref: dict, rows: int) -> int:
         """Bounds against the reference for the first `rows` positions; returns top-1 agreement."""
@@ -126,6 +130,21 @@ def main() -> int:
             print(f"  MTP top-1 agreement {top_mtp}/{len(draft)}")
             fail.expect(f"{label}: MTP top-1 agreement", top_mtp == len(draft), f"{top_mtp}/{len(draft)}")
         return top
+
+    def kv_formats(label: str, gguf: Path, tok: Path, ref: dict, rows: int, *opts: str) -> None:
+        """The 512-token prefill run with each KV_GATES cache format, against the reference."""
+        for fmt, (_, cos_min) in KV_GATES.items():
+            out = Path(tmp) / f"{fmt}.bin"
+            timing = run_gpu(args, paths, gguf, tok, out, "--chunk", "512", "--kv", fmt, "--path", "prefill", *opts)
+            got = read_records(out)
+            cos = min(float(row_stats(got[n], ref[n])[0].min()) for n in ref)
+            top = int((got["result_output"].argmax(axis=1) == ref["result_output"][:rows].argmax(axis=1)).sum())
+            s = kv_stats[fmt]
+            s["agree"] += top
+            s["total"] += rows
+            s["cos"] = min(s["cos"], cos)
+            print(f"  {fmt} KV: top-1 agreement {top}/{rows}, min cosine {cos:.7f}  [{timing}]")
+            fail.expect(f"{label}: {fmt} KV cosine", cos >= cos_min, f"{cos:.7f} < {cos_min}")
 
     def bitwise(a: dict, b: dict, rows: int) -> bool:
         return all(np.array_equal(a[n].view(np.uint32), b[n][: len(a[n])].view(np.uint32)) for n in b)
@@ -165,16 +184,7 @@ def main() -> int:
             print(f"  decode kernels, steps of 3: {'bitwise identical' if same else 'DIFFERENT'}  [{timing}]")
             fail.expect(f"{ev['name']}: decode steps of 3 bitwise", same, "outputs differ from 1-token steps")
 
-            f16_path = Path(tmp) / "f16.bin"
-            timing = run_gpu(args, paths, paths.gguf, tok, f16_path, "--chunk", "512", "--kv", "f16", "--path", "prefill", *mtp)
-            f16 = read_records(f16_path)
-            cos16 = min(float(row_stats(f16[n], ref[n])[0].min()) for n in ref)
-            top16 = int((f16["result_output"].argmax(axis=1) == ref["result_output"].argmax(axis=1)).sum())
-            agree16 += top16
-            total16 += len(ids)
-            worst_cos16 = min(worst_cos16, cos16)
-            print(f"  f16 KV: top-1 agreement {top16}/{len(ids)}, min cosine {cos16:.7f}  [{timing}]")
-            fail.expect(f"{ev['name']}: f16 KV cosine", cos16 >= F16_COSINE_MIN, f"{cos16:.7f} < {F16_COSINE_MIN}")
+            kv_formats(ev["name"], paths.gguf, tok, ref, len(ids), *mtp)
 
         # The dense models (graph/dense.zig) run the same program with
         # attention layers only: the first eval sequence on each kernel path.
@@ -198,11 +208,15 @@ def main() -> int:
             print(f"  decode kernels, steps of 1, first {DECODE_TOKENS} tokens  [{timing}]")
             decode_agree += compare(f"{model.name} {evals[0]['name']} (decode)", "decode", read_records(gpu_path), ref, DECODE_TOKENS)
             decode_total += DECODE_TOKENS
+            kv_formats(f"{model.name} {evals[0]['name']}", gguf, tok, ref, len(ids))
 
     for path, n, a in (("prefill", total, agree), ("decode", decode_total, decode_agree)):
         print(f"\n{args.host}, f32 KV, {path} kernels: top-1 agreement {a}/{n}; min cosine {worst[path][0]:.7f} (min {COSINE_MIN}); max rel L2 {worst[path][1]:.2e} (max {REL_L2_MAX})", end="")
     print()
-    print(f"{args.host}, f16 KV: top-1 agreement {agree16}/{total16} (min {F16_TOP1_MIN:.0%}); min cosine {worst_cos16:.7f} (min {F16_COSINE_MIN})")
+    for fmt, (top_min, cos_min) in KV_GATES.items():
+        s = kv_stats[fmt]
+        print(f"{args.host}, {fmt} KV: top-1 agreement {s['agree']}/{s['total']} (min {top_min:.0%}); min cosine {s['cos']:.7f} (min {cos_min})")
+        fail.expect(f"{fmt} KV top-1 agreement", s["agree"] >= top_min * s["total"], f"{s['agree']}/{s['total']}")
     proc = zllm_on_host(args, paths, "engine-check", paths.gguf)
     print(f"\n{args.host}, engine-check:")
     sys.stdout.write("".join(line + "\n" for line in proc.stdout.replace("\r", "").splitlines() if line.startswith(("PASS", "FAIL"))))
@@ -211,7 +225,6 @@ def main() -> int:
     fail.expect("engine-check", proc.returncode == 0, f"exit code {proc.returncode}")
     fail.expect("top-1 agreement", agree == total, f"{agree}/{total}")
     fail.expect("decode top-1 agreement", decode_agree == decode_total, f"{decode_agree}/{decode_total}")
-    fail.expect("f16 KV top-1 agreement", agree16 >= F16_TOP1_MIN * total16, f"{agree16}/{total16}")
     return fail.report()
 
 

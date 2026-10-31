@@ -9,8 +9,16 @@ groupshared precise float qs[MAX_GROUP * MAX_HEAD_DIM];
 groupshared precise float red[WG];
 groupshared precise float sc[MAX_GROUP * BLOCK];
 
+// Cache value i's FP8 scale is scale i / head_dim (param 2), from word
+// param 9 on.
 float2 k_pair(uint i) {
-    if (param(3) != 0u) {
+    if (param(3) == 2u) {
+        const float s = asfloat(ldu(2, param(9) + 2u * i / param(2)));
+        const uint w = ldu(2, i / 2u);
+        const uint o = 2u * (i & 1u);
+        return float2(fp8_at(w, o), fp8_at(w, o + 1u)) * s;
+    }
+    if (param(3) == 1u) {
         const uint bits = ldu(2, i);
         return float2(f16tof32(bits & 0xffffu), f16tof32(bits >> 16u));
     }
@@ -18,7 +26,8 @@ float2 k_pair(uint i) {
 }
 
 float v_at(uint i) {
-    if (param(3) != 0u) {
+    if (param(3) == 2u) return fp8_at(ldu(3, i / 4u), i) * asfloat(ldu(3, param(9) + i / param(2)));
+    if (param(3) == 1u) {
         const uint bits = ldu(3, i / 2u);
         const float2 pair = float2(f16tof32(bits & 0xffffu), f16tof32(bits >> 16u));
         return (i & 1u) == 1u ? pair.y : pair.x;

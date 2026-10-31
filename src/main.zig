@@ -47,7 +47,7 @@ const usage =
     \\                                       fails on a device error or a submission past 250 ms
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
-    \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
+    \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16|fp8]
     \\              [--path prefill|decode] [--mtp] [--tune] [--no-fuse]
     \\                                       as `forward`, on the GPU through Dawn, in
     \\                                       steps of N tokens (default 512; f32 KV;

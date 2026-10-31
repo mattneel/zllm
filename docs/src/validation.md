@@ -418,7 +418,8 @@ therefore tight:
 | Prefill kernels, 7-token steps | bitwise identical to 512-token steps | everything |
 | Decode kernels, 1-token steps (as decoding runs), first 40 positions | the same bounds as 512-token steps | the same |
 | Decode kernels, 3-token steps | bitwise identical to 1-token steps | everything |
-| f16 cache (the default) | ≥ 99% top-1 agreement; cosine ≥ 0.99998 | every layer output, final norm and logits, every position |
+| f16 cache (the default) | ≥ 99% top-1 agreement; cosine ≥ 0.99998 | every layer output, final norm and logits, every position, every eval text and each dense model's first |
+| FP8 cache (E4M3) | ≥ 95% top-1 agreement; cosine ≥ 0.975 | the same |
 
 With a model that has an MTP block (the 0.8B fixture does), every run also
 runs the block over each step's final hidden states, and its draft logits
@@ -438,6 +439,26 @@ RTX 5090 (D3D12):
 | Prefill, f16 cache | 818/818 | min cosine 0.9999984 | |
 
 Each fusion commit passed this check on its own.
+
+The FP8 cache stores E4M3 (3 mantissa bits): each cached value carries up to
+2^-4 relative rounding error. On the RTX 5090 (D3D12) it agrees on top-1
+with the f32 reference on 1,231 of 1,264 positions over the eval texts and
+the dense models' first:
+
+| Model | f16 cache | FP8 cache | FP8 min cosine |
+|---|---|---|---|
+| Qwen3.5-0.8B (5 texts) | 818/818 | 806/818 | 0.984 |
+| Qwen3-0.6B | 148/148 | 139/148 | 0.991 |
+| Llama-3.2-1B | 149/149 | 144/149 | 0.982 |
+| Granite 4.2 3B | 149/149 | 142/149 | 0.984 |
+
+The FP8 bounds catch a broken cache path, not the quality a model needs:
+whether a model may default to FP8 is the precision ladder's gate (spec §9).
+These small dense models stay on f16.
+
+`gpu-check` holds the FP8 encoding itself exact: `rope_append`'s FP8 bytes
+and power-of-two scales match `ref/fp8.zig`'s encoding of its f32 output
+bit for bit, on every backend.
 
 At M2, before the decode kernels, llvmpipe gave the same results (818/818,
 1.0e-5). `check-gpu` now runs on real GPUs only: on llvmpipe it takes about

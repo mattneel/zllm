@@ -26,8 +26,8 @@ export interface LoadOptions {
   wasm?: string | URL;
   /** Context capacity in tokens (default 8192). */
   context?: number;
-  /** KV cache format (default f16). */
-  kv?: "f16" | "f32";
+  /** KV cache format (default f16; fp8: E4M3 with a scale per position and KV head). */
+  kv?: "f16" | "f32" | "fp8";
   /**
    * Keep the model in the browser's origin private file system, so later
    * loads read it from disk (default true; URLs only, see cache.ts).

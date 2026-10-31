@@ -10,15 +10,15 @@ struct Params {
     heads: u32,
     kv_heads: u32,
     head_dim: u32,
-    f16: u32,
+    kv: u32,
     scale: f32,
     max_blocks: u32,
     q_row: u32,
     row0: u32,
     gated: u32,
+    scales: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 struct Step {

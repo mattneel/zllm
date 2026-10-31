@@ -15,6 +15,8 @@ const P = kernels.params;
 const gguf = @import("../gguf/gguf.zig");
 const ref_tensor = @import("../ref/tensor.zig");
 const ref_matmul = @import("../ref/matmul.zig");
+const fp8 = @import("../ref/fp8.zig");
+const KvFormat = @import("../plan/common.zig").KvFormat;
 
 pub const Result = struct {
     name: []const u8,
@@ -38,20 +40,21 @@ pub fn run(gpa: Allocator, device: platform.Device, host: *Host, out: *std.Io.Wr
 
     var ok = true;
     inline for (.{
-        checkRmsNorm,          checkMatmul,          checkMatmulChunked,  checkMatvec,            checkMatvecNorm,
-        checkMatvecSiluPair,   checkMatmulF16,       checkMatvecNormF16,  checkMatvecSiluPairF16, checkEmbedF16,
-        checkSiluMul,          checkEmbed,           checkRopeAppendF32,  checkRopeAppendF16,     checkRopeAppendRounding,
-        checkRopeAppendDense,  checkRopeAppendQwen3, checkAttentionF32,   checkAttentionF16,      checkAttentionWide,
-        checkAttentionUngated, checkAttnDecode,      checkAttnDecodeWide, checkAttnDecodeUngated, checkAttnSparse,
-        checkQsaIndexer,       checkDeltaPrep,       checkDeltaKeep,      checkDeltaRule,         checkGatedNormSigmoid,
-        checkDraft,            checkGyroMatvec,      checkMoeRoute,       checkRotate128,         checkMoeCombine,
-        checkHc,               checkPle,             checkSampleGreedy,   checkSampleTopKTopP,    checkSampleMinP,
-        checkSampleTopP,       checkSamplePlain,     checkSampleTopK1,    checkSampleLargeTopK,   checkSampleTopKSkipped,
-        checkSampleVocab,      Quant(.q8_0).matvec,  Quant(.q8_0).matmul, Quant(.q8_0).embed,     checkEmbedStride,
-        Quant(.q3_k).matvec,   Quant(.q3_k).matmul,  Quant(.q3_k).embed,  Quant(.q4_k).matvec,    Quant(.q4_k).matmul,
-        Quant(.q4_k).embed,    Quant(.q5_k).matvec,  Quant(.q5_k).matmul, Quant(.q5_k).embed,     Quant(.q6_k).matvec,
-        Quant(.q6_k).matmul,   Quant(.q6_k).embed,   checkQuantTiles,     checkQuantSiluPair,     checkQuantAct,
-        checkQuantizeQ8K,      checkQuantizeQ80,     checkQuantizeNorm,   checkQuantizeSilu,
+        checkRmsNorm,         checkMatmul,            checkMatmulChunked,       checkMatvec,            checkMatvecNorm,
+        checkMatvecSiluPair,  checkMatmulF16,         checkMatvecNormF16,       checkMatvecSiluPairF16, checkEmbedF16,
+        checkSiluMul,         checkEmbed,             checkRopeAppendF32,       checkRopeAppendF16,     checkRopeAppendRounding,
+        checkRopeAppendDense, checkRopeAppendQwen3,   checkRopeAppendFp8Values, checkRopeAppendFp8,     checkAttentionF32,
+        checkAttentionF16,    checkAttentionFp8,      checkAttentionWide,       checkAttentionUngated,  checkAttnDecode,
+        checkAttnDecodeWide,  checkAttnDecodeUngated, checkAttnSparse,          checkQsaIndexer,        checkDeltaPrep,
+        checkDeltaKeep,       checkDeltaRule,         checkGatedNormSigmoid,    checkDraft,             checkGyroMatvec,
+        checkMoeRoute,        checkRotate128,         checkMoeCombine,          checkHc,                checkPle,
+        checkSampleGreedy,    checkSampleTopKTopP,    checkSampleMinP,          checkSampleTopP,        checkSamplePlain,
+        checkSampleTopK1,     checkSampleLargeTopK,   checkSampleTopKSkipped,   checkSampleVocab,       Quant(.q8_0).matvec,
+        Quant(.q8_0).matmul,  Quant(.q8_0).embed,     checkEmbedStride,         Quant(.q3_k).matvec,    Quant(.q3_k).matmul,
+        Quant(.q3_k).embed,   Quant(.q4_k).matvec,    Quant(.q4_k).matmul,      Quant(.q4_k).embed,     Quant(.q5_k).matvec,
+        Quant(.q5_k).matmul,  Quant(.q5_k).embed,     Quant(.q6_k).matvec,      Quant(.q6_k).matmul,    Quant(.q6_k).embed,
+        checkQuantTiles,      checkQuantSiluPair,     checkQuantAct,            checkQuantizeQ8K,       checkQuantizeQ80,
+        checkQuantizeNorm,    checkQuantizeSilu,
     }) |f| {
         ok = try report(&ctx, f, out) and ok;
         _ = arena_state.reset(.retain_capacity);
@@ -788,7 +791,7 @@ fn normRopeMode(head: []f64, w: []const f32, pos: usize, n_rot: u32, base: f64, 
 /// rotation over the first n_rot dims, rows padded past V. Checks the whole
 /// projection (Q heads rotated in place, gates, K and V untouched) and the
 /// cache (K normalized and rotated, V copied, earlier positions untouched).
-fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool, n_rot: u32, mode: RopeMode) !Result {
+fn ropeAppendCase(c: *Ctx, name: []const u8, format: KvFormat, n_rot: u32, mode: RopeMode) !Result {
     const tokens = 5;
     const heads = 3;
     const kv = 2;
@@ -806,9 +809,9 @@ fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool, n_rot: u32, mode: RopeM
     const kw = try c.random(hd, 1);
     const table = try kernels.ropeTableScaled(c.arena, pos0 + tokens, n_rot, base, mode.factors);
     const xa = try c.upload(x);
-    const words: u32 = if (half) width / 2 else width;
-    const kc = try c.output((pos0 + tokens) * words);
-    const vc = try c.output((pos0 + tokens) * words);
+    const words: u32 = @intCast(format.layerBytes(pos0 + tokens, kv, hd) / 4);
+    const kc = try c.output(words);
+    const vc = try c.output(words);
     try c.launcher().launch(.rope_append, P.RopeAppend{
         .heads = heads,
         .kv_heads = kv,
@@ -817,14 +820,15 @@ fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool, n_rot: u32, mode: RopeM
         .row = row,
         .k_off = k_off,
         .v_off = v_off,
-        .f16 = @intFromBool(half),
+        .kv = @backingInt(format),
         .eps = eps,
         .gated = @intFromBool(mode.gated),
         .qk_norm = @intFromBool(mode.norm),
         .normal = @intFromBool(mode.normal),
+        .scales = format.scales(pos0 + tokens, kv, hd),
     }, &.{ xa, try c.upload(qw), try c.upload(kw), try c.upload(table), kc, vc, try c.step(tokens, pos0, 0) }, .{ heads + kv, tokens, 1 });
-    const ck = try decodeCache(c, try c.readWords(kc), half);
-    const cv = try decodeCache(c, try c.readWords(vc), half);
+    const ck = try decodeCache(c, try c.readWords(kc), format, (pos0 + tokens) * width, hd);
+    const cv = try decodeCache(c, try c.readWords(vc), format, (pos0 + tokens) * width, hd);
     for (ck[0 .. pos0 * width], cv[0 .. pos0 * width]) |a, b| if (a != 0 or b != 0) return .{ .name = name, .err = 1, .tolerance = 0 };
     const cached = tokens * width;
     const got = try c.arena.alloc(f32, x.len + 2 * cached);
@@ -846,16 +850,25 @@ fn ropeAppendCase(c: *Ctx, name: []const u8, half: bool, n_rot: u32, mode: RopeM
     }
     // The table is f32 from the reference formula, so angles carry f32
     // error; the f16 cache rounds to nearest, half a step: at most 2^-11
-    // relative.
-    return .{ .name = name, .err = relErr(got, want), .tolerance = if (half) 5e-4 else 1e-5 };
+    // relative; FP8 half a step of 3 mantissa bits, 2^-4 of a value, at
+    // most a row's maximum (the exact encoding is checkRopeAppendFp8's).
+    return .{ .name = name, .err = relErr(got, want), .tolerance = switch (format) {
+        .f32 => 1e-5,
+        .f16 => 5e-4,
+        .fp8 => 0.0625 + 5e-4,
+    } };
 }
 
 fn checkRopeAppendF32(c: *Ctx) !Result {
-    return ropeAppendCase(c, "rope_append (f32 cache)", false, 16, .{});
+    return ropeAppendCase(c, "rope_append (f32 cache)", .f32, 16, .{});
 }
 
 fn checkRopeAppendF16(c: *Ctx) !Result {
-    return ropeAppendCase(c, "rope_append (f16 cache)", true, 16, .{});
+    return ropeAppendCase(c, "rope_append (f16 cache)", .f16, 16, .{});
+}
+
+fn checkRopeAppendFp8Values(c: *Ctx) !Result {
+    return ropeAppendCase(c, "rope_append (FP8 cache)", .fp8, 16, .{});
 }
 
 /// A dense model's prologue (Llama 3, Granite): Q heads not interleaved with
@@ -864,12 +877,12 @@ fn checkRopeAppendF16(c: *Ctx) !Result {
 fn checkRopeAppendDense(c: *Ctx) !Result {
     const factors = try c.random(16, 1);
     for (factors) |*f| f.* = 1 + 4 * @abs(f.*);
-    return ropeAppendCase(c, "rope_append (dense, normal)", true, 32, .{ .gated = false, .norm = false, .normal = true, .factors = factors });
+    return ropeAppendCase(c, "rope_append (dense, normal)", .f16, 32, .{ .gated = false, .norm = false, .normal = true, .factors = factors });
 }
 
 /// Qwen 3's prologue: Q heads not interleaved, Q/K norm, NeoX RoPE.
 fn checkRopeAppendQwen3(c: *Ctx) !Result {
-    return ropeAppendCase(c, "rope_append (dense, NeoX)", true, 32, .{ .gated = false });
+    return ropeAppendCase(c, "rope_append (dense, NeoX)", .f16, 32, .{ .gated = false });
 }
 
 /// The f16 cache must hold the f32 cache's values rounded to nearest, ties
@@ -897,11 +910,11 @@ fn checkRopeAppendRounding(c: *Ctx) !Result {
     const ones = try c.arena.alloc(f32, hd);
     @memset(ones, 1);
     const table = try kernels.ropeTable(c.arena, tokens, 64, 1e7);
-    const params: P.RopeAppend = .{ .heads = 1, .kv_heads = kv, .head_dim = hd, .n_rot = 64, .row = row, .k_off = 2 * hd, .v_off = 2 * hd + width, .f16 = 0, .eps = 1e-6 };
+    const params: P.RopeAppend = .{ .heads = 1, .kv_heads = kv, .head_dim = hd, .n_rot = 64, .row = row, .k_off = 2 * hd, .v_off = 2 * hd + width, .kv = 0, .eps = 1e-6 };
     var words: [2][]const u32 = undefined;
     for (&words, [_]u32{ 0, 1 }) |*out, half| {
         var p = params;
-        p.f16 = half;
+        p.kv = half;
         const n: u32 = if (half == 1) width / 2 else width;
         const kc = try c.output(tokens * n);
         const vc = try c.output(tokens * n);
@@ -923,10 +936,84 @@ fn checkRopeAppendRounding(c: *Ctx) !Result {
     return .{ .name = "rope_append f16 rounds to nearest", .err = @as(f64, @floatFromInt(differ)) / @as(f64, @floatFromInt(exact.len)), .tolerance = 0 };
 }
 
-/// A cache of random values for `total` positions, as the kernels store it:
-/// f16 pairs or f32 bits. `values` are rounded to what the cache holds.
-fn cacheWords(c: *Ctx, values: []f32, half: bool) ![]u32 {
-    if (!half) return @constCast(std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(values)));
+/// The FP8 cache must hold the f32 cache's values encoded exactly as
+/// ref/fp8.zig encodes them, with each (position, KV head) row's
+/// power-of-two scale. Both caches from one input over 40 positions; err is
+/// the fraction of values or scales that differ.
+fn checkRopeAppendFp8(c: *Ctx) !Result {
+    const tokens = 40;
+    const kv = 2;
+    const hd = 128;
+    const width = kv * hd;
+    const row = 2 * width + 2 * hd;
+    const x = try c.random(tokens * row, 3);
+    // Rows of mixed magnitudes, so values span the subnormals; every other
+    // position's first V row peaks at exactly 1.75 · 2^7 = 448 · 2^-1, the
+    // boundary between two scales.
+    for (x, 0..) |*v, i| v.* = std.math.ldexp(v.*, @as(i32, @intCast(i % 13)) - 8);
+    for (0..tokens / 2) |t| x[2 * t * row + 2 * hd + width] = 224;
+    const ones = try c.arena.alloc(f32, hd);
+    @memset(ones, 1);
+    const table = try kernels.ropeTable(c.arena, tokens, 64, 1e7);
+    var caches: [2][]const u32 = undefined;
+    for (&caches, [_]KvFormat{ .f32, .fp8 }) |*out, format| {
+        const n: u32 = @intCast(format.layerBytes(tokens, kv, hd) / 4);
+        const kc = try c.output(n);
+        const vc = try c.output(n);
+        try c.launcher().launch(.rope_append, P.RopeAppend{
+            .heads = 1,
+            .kv_heads = kv,
+            .head_dim = hd,
+            .n_rot = 64,
+            .row = row,
+            .k_off = 2 * hd,
+            .v_off = 2 * hd + width,
+            .kv = @backingInt(format),
+            .eps = 1e-6,
+            .scales = format.scales(tokens, kv, hd),
+        }, &.{ try c.upload(x), try c.upload(ones), try c.upload(ones), try c.upload(table), kc, vc, try c.step(tokens, 0, 0) }, .{ 1 + kv, tokens, 1 });
+        out.* = try std.mem.concat(c.arena, u32, &.{ try c.readWords(kc), try c.readWords(vc) });
+    }
+    const n_values = tokens * width;
+    const n_words = n_values / 4 + tokens * kv;
+    var differ: usize = 0;
+    for (0..2) |half| {
+        const exact: []const f32 = @ptrCast(caches[0][half * n_values ..][0..n_values]);
+        const got = caches[1][half * n_words ..][0..n_words];
+        const bytes = std.mem.sliceAsBytes(got[0 .. n_values / 4]);
+        for (0..tokens * kv) |r| {
+            const values = exact[r * hd ..][0..hd];
+            const s = fp8.rowScale(values);
+            differ += @intFromBool(@as(f32, @bitCast(got[n_values / 4 + r])) != s);
+            for (values, bytes[r * hd ..][0..hd]) |v, b| differ += @intFromBool(b != fp8.encode(v / s));
+        }
+    }
+    return .{ .name = "rope_append FP8 encoding (exact)", .err = @as(f64, @floatFromInt(differ)) / @as(f64, @floatFromInt(2 * (n_values + tokens * kv))), .tolerance = 0 };
+}
+
+/// A cache holding `values` (rows of head_dim `hd`) as the kernels store it
+/// in `format`; `values` are rounded to what the cache holds.
+fn cacheWords(c: *Ctx, values: []f32, format: KvFormat, hd: usize) ![]u32 {
+    switch (format) {
+        .f32 => return @constCast(std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(values))),
+        .f16 => {},
+        .fp8 => {
+            // The values, four a word, then each row's scale.
+            const rows = values.len / hd;
+            const words = try c.arena.alloc(u32, values.len / 4 + rows);
+            const bytes = std.mem.sliceAsBytes(words[0 .. values.len / 4]);
+            for (0..rows) |r| {
+                const row = values[r * hd ..][0..hd];
+                const s = fp8.rowScale(row);
+                words[values.len / 4 + r] = @bitCast(s);
+                for (row, bytes[r * hd ..][0..hd]) |*v, *b| {
+                    b.* = fp8.encode(v.* / s);
+                    v.* = fp8.decode(b.*) * s;
+                }
+            }
+            return words;
+        },
+    }
     const words = try c.arena.alloc(u32, values.len / 2);
     for (words, 0..) |*w, i| {
         const lo: f16 = @floatCast(values[2 * i]);
@@ -990,7 +1077,7 @@ fn attnWant(c: *Ctx, comptime S: type, qg: []const f32, k: []const f32, v: []con
 /// Prefill attention for 70 queries after 270 cached positions, as a step
 /// runs it: attn_split and attn_combine over chunks of attn_rows tokens (32,
 /// 32, 6), each over 64-position blocks of the 340 keys, the last partial.
-fn attentionCase(c: *Ctx, comptime S: type, name: []const u8, half: bool) !Result {
+fn attentionCase(c: *Ctx, comptime S: type, name: []const u8, format: KvFormat) !Result {
     const first = 270;
     const second = 70;
     const total = first + second;
@@ -1001,13 +1088,13 @@ fn attentionCase(c: *Ctx, comptime S: type, name: []const u8, half: bool) !Resul
     const max_blocks = std.math.divCeil(u32, total, kernels.attn_block) catch unreachable;
     const part = try c.output(kernels.attn_rows * S.heads * max_blocks * (S.hd + 2));
     const qa = try c.upload(qg);
-    const ka = try c.upload(try cacheWords(c, k, half));
-    const va = try c.upload(try cacheWords(c, v, half));
+    const ka = try c.upload(try cacheWords(c, k, format, S.hd));
+    const va = try c.upload(try cacheWords(c, v, format, S.hd));
     const step = try c.step(second, first, 0);
     const l = c.launcher();
     var row0: u32 = 0;
     while (row0 < second) : (row0 += kernels.attn_rows) {
-        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = @intFromBool(half), .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .row0 = row0, .gated = @intFromBool(S.gated) };
+        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .kv = @backingInt(format), .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .row0 = row0, .gated = @intFromBool(S.gated), .scales = format.scales(total, S.kv, S.hd) };
         const split: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } };
         const combine: kernels.Grid = .{ .rows_y_from = .{ .x = S.heads, .row0 = row0, .max_rows = kernels.attn_rows } };
         const e: kernels.Extent = .{ .rows = second, .keys = total };
@@ -1019,19 +1106,23 @@ fn attentionCase(c: *Ctx, comptime S: type, name: []const u8, half: bool) !Resul
 }
 
 fn checkAttentionF32(c: *Ctx) !Result {
-    return attentionCase(c, AttnShape(8, true), "attention, 3 chunks (f32 cache)", false);
+    return attentionCase(c, AttnShape(8, true), "attention, 3 chunks (f32 cache)", .f32);
 }
 
 fn checkAttentionF16(c: *Ctx) !Result {
-    return attentionCase(c, AttnShape(8, true), "attention, 3 chunks (f16 cache)", true);
+    return attentionCase(c, AttnShape(8, true), "attention, 3 chunks (f16 cache)", .f16);
+}
+
+fn checkAttentionFp8(c: *Ctx) !Result {
+    return attentionCase(c, AttnShape(8, true), "attention, 3 chunks (FP8 cache)", .fp8);
 }
 
 fn checkAttentionWide(c: *Ctx) !Result {
-    return attentionCase(c, AttnShape(24, true), "attention, 3 chunks, groups of 12", true);
+    return attentionCase(c, AttnShape(24, true), "attention, 3 chunks, groups of 12", .f16);
 }
 
 fn checkAttentionUngated(c: *Ctx) !Result {
-    return attentionCase(c, AttnShape(8, false), "attention, 3 chunks, ungated", true);
+    return attentionCase(c, AttnShape(8, false), "attention, 3 chunks, ungated", .f16);
 }
 
 /// Decode attention: 3 queries after 150 cached positions, through
@@ -1048,10 +1139,10 @@ fn attnDecodeCase(c: *Ctx, comptime S: type, name: []const u8) !Result {
     const part = try c.output(second * S.heads * max_blocks * (S.hd + 2));
     const l = c.launcher();
     const step = try c.step(second, first, 0);
-    const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .gated = @intFromBool(S.gated) };
+    const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .kv = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .gated = @intFromBool(S.gated) };
     const qa = try c.upload(qg);
     const grid: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block } };
-    try l.launch(S.split, params, &.{ qa, try c.upload(try cacheWords(c, k, true)), try c.upload(try cacheWords(c, v, true)), part, step }, grid.resolve(.{ .rows = second, .keys = total }));
+    try l.launch(S.split, params, &.{ qa, try c.upload(try cacheWords(c, k, .f16, S.hd)), try c.upload(try cacheWords(c, v, .f16, S.hd)), part, step }, grid.resolve(.{ .rows = second, .keys = total }));
     try l.launch(.attn_combine, params, &.{ qa, part, out, step }, .{ S.heads, second, 1 });
     const got = try c.read(out);
     return .{ .name = name, .err = relErr(got, try attnWant(c, S, qg, k, v, first, second)), .tolerance = 1e-5 };
@@ -1221,8 +1312,8 @@ fn checkAttnSparse(c: *Ctx) !Result {
     const k = try c.random(total * S.width, 1);
     const v = try c.random(total * S.width, 1);
     const qg = try c.random(second * S.q_row, 1);
-    const ka = try c.upload(try cacheWords(c, k, true));
-    const va = try c.upload(try cacheWords(c, v, true));
+    const ka = try c.upload(try cacheWords(c, k, .f16, S.hd));
+    const va = try c.upload(try cacheWords(c, v, .f16, S.hd));
     const qa = try c.upload(qg);
     const sel = try c.arena.alloc(u32, second * stride);
     for (sel, 0..) |*s, j| {
@@ -1237,7 +1328,7 @@ fn checkAttnSparse(c: *Ctx) !Result {
         const part = try c.output(second * S.heads * max_blocks * (S.hd + 2));
         const step = try c.step(second, first, 0);
         const qsa = try c.uniform(P.Qsa{ .heads = 4, .dim = 128, .ratio = r, .width = width, .stride = stride, .n_rot = 64, .eps = 1e-6, .row = 640 });
-        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .f16 = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .gated = @intFromBool(S.gated) };
+        const params: P.Attention = .{ .heads = S.heads, .kv_heads = S.kv, .head_dim = S.hd, .kv = 1, .scale = S.scale, .max_blocks = max_blocks, .q_row = S.q_row, .gated = @intFromBool(S.gated) };
         const grid: kernels.Grid = .{ .key_blocks = .{ .x = S.kv, .block = kernels.attn_block } };
         const l = c.launcher();
         try l.launch(.attn_split_sparse, params, &.{ qa, ka, va, part, step, sel_a, qsa }, grid.resolve(.{ .rows = second, .keys = total }));
@@ -1290,8 +1381,18 @@ fn attnWantMasked(c: *Ctx, comptime S: type, qg: []const f32, k: []const f32, v:
 }
 
 /// Cache words as f32 values.
-fn decodeCache(c: *Ctx, words: []const u32, half: bool) ![]f32 {
-    if (!half) return @constCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(words)));
+/// The `n` values of a cache in `format` (rows of head_dim `hd`).
+fn decodeCache(c: *Ctx, words: []const u32, format: KvFormat, n: usize, hd: usize) ![]f32 {
+    switch (format) {
+        .f32 => return @constCast(std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(words))),
+        .f16 => {},
+        .fp8 => {
+            const values = try c.arena.alloc(f32, n);
+            const bytes = std.mem.sliceAsBytes(words[0 .. n / 4]);
+            for (values, bytes, 0..) |*v, b, i| v.* = fp8.decode(b) * @as(f32, @bitCast(words[n / 4 + i / hd]));
+            return values;
+        },
+    }
     const values = try c.arena.alloc(f32, words.len * 2);
     for (words, 0..) |w, i| {
         values[2 * i] = @as(f16, @bitCast(@as(u16, @truncate(w))));

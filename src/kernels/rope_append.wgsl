@@ -11,8 +11,10 @@
 //
 // RoPE rotates pairs (i, i + n_rot/2) (NeoX), or (2i, 2i + 1) when `normal`,
 // by the angle of position pos0 + t, read as (cos, sin) from a host-built
-// table: WGSL sin/cos are only accurate near [−π, π]. The cache stores f16 pairs when f16 != 0, else f32 bits,
-// `kv_heads · head_dim` values per position. head_dim ≤ WG.
+// table: WGSL sin/cos are only accurate near [−π, π]. The cache stores
+// `kv_heads · head_dim` values per position as `kv` says (KvFormat): f32
+// bits, f16 pairs, or FP8 (fp8.wgsl) with a scale per position and KV head
+// at word `scales` on. head_dim ≤ WG.
 //
 // The f16 values are rounded to nearest, ties to even, as llama.cpp's cache
 // rounds: WGSL lets pack2x16float round either way, and D3D12 truncates,
@@ -26,11 +28,15 @@ struct Params {
     row: u32,
     k_off: u32,
     v_off: u32,
-    f16: u32,
+    kv: u32,
     eps: f32,
     gated: u32,
     qk_norm: u32,
     normal: u32,
+    scales: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct Step {
@@ -106,16 +112,37 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
         }
         return;
     }
-    // K and V to the cache, one thread per pair of values.
     let width = p.kv_heads * hd;
     let e = pos * width + g * hd;
     let vb = t * p.row + p.v_off + g * hd;
+    if (p.kv == 2u) {
+        // FP8: each row by its power-of-two scale (fp8.wgsl), one thread
+        // per word of four values.
+        let k_exp = fp8_scale_exp(row_max(select(0.0, abs(vals[i]), i < hd), i));
+        let v_exp = fp8_scale_exp(row_max(select(0.0, abs(qkv[vb + min(i, hd - 1u)]), i < hd), i));
+        if (i < hd / 4u) {
+            var kw = 0u;
+            var vw = 0u;
+            for (var j = 0u; j < 4u; j++) {
+                kw |= fp8_bits(vals[4u * i + j] * pow2(-k_exp)) << (8u * j);
+                vw |= fp8_bits(qkv[vb + 4u * i + j] * pow2(-v_exp)) << (8u * j);
+            }
+            kc[e / 4u + i] = kw;
+            vc[e / 4u + i] = vw;
+        }
+        if (i == 0u) {
+            kc[p.scales + pos * p.kv_heads + g] = bitcast<u32>(pow2(k_exp));
+            vc[p.scales + pos * p.kv_heads + g] = bitcast<u32>(pow2(v_exp));
+        }
+        return;
+    }
+    // K and V to the cache, one thread per pair of values.
     if (i < hd / 2u) {
         let k0 = vals[2u * i];
         let k1 = vals[2u * i + 1u];
         let v0 = qkv[vb + 2u * i];
         let v1 = qkv[vb + 2u * i + 1u];
-        if (p.f16 != 0u) {
+        if (p.kv == 1u) {
             kc[e / 2u + i] = pack_f16(vec2f(k0, k1));
             vc[e / 2u + i] = pack_f16(vec2f(v0, v1));
         } else {
@@ -125,4 +152,19 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid3: ve
             vc[e + 2u * i + 1u] = bitcast<u32>(v1);
         }
     }
+}
+
+// The largest `a` over the workgroup's threads. Every thread calls it.
+fn row_max(a: f32, i: u32) -> f32 {
+    partial[i] = a;
+    workgroupBarrier();
+    for (var s = WG / 2u; s > 0u; s /= 2u) {
+        if (i < s) {
+            partial[i] = max(partial[i], partial[i + s]);
+        }
+        workgroupBarrier();
+    }
+    let m = partial[0];
+    workgroupBarrier();
+    return m;
 }

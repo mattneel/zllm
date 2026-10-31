@@ -487,8 +487,8 @@ pub const Program = struct {
         const counts = try a.storage(hp.vocab);
         const work = try a.storage(hp.vocab);
         const sample_state = try a.storage(kernels.sampleStateWords(hp.vocab));
-        const kv_bytes: u64 = if (cfg.kv == .f16) 2 else 4;
-        const kv_layer = @as(u64, cfg.context) * kv_dim * kv_bytes;
+        const kv_layer = cfg.kv.layerBytes(cfg.context, hp.n_head_kv, hp.head_dim);
+        const kv_scales = cfg.kv.scales(cfg.context, hp.n_head_kv, hp.head_dim);
 
         var b: kernels.Builder = .{ .gpa = gpa, .arena = arena, .rec = rec, .set = set };
         defer b.deinit();
@@ -592,7 +592,7 @@ pub const Program = struct {
                 .full => |*w| {
                     const kc = try a.buffer(kv_layer, .{ .storage = true });
                     const vc = try a.buffer(kv_layer, .{ .storage = true });
-                    const half: u32 = @backingInt(cfg.kv);
+                    const kv: u32 = @backingInt(cfg.kv);
                     const q_row: u32 = @intCast(qkv_row);
                     // The indexer: its keys (f16) and pooled blocks, the
                     // queries' scores and the cells each row attends to.
@@ -625,18 +625,20 @@ pub const Program = struct {
                         .row = q_row,
                         .k_off = @intCast(2 * hdim * hp.n_head),
                         .v_off = @intCast(2 * hdim * hp.n_head + kv_dim),
-                        .f16 = half,
+                        .kv = kv,
                         .eps = hp.eps,
+                        .scales = kv_scales,
                     }, &.{ qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
                     const params: P.Attention = .{
                         .heads = hp.n_head,
                         .kv_heads = hp.n_head_kv,
                         .head_dim = hp.head_dim,
-                        .f16 = half,
+                        .kv = kv,
                         .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hp.head_dim))),
                         .max_blocks = max_blocks,
                         .q_row = q_row,
                         .row0 = 0,
+                        .scales = kv_scales,
                     };
                     try body.append(arena, .{ .launch = try b.add(.attn_split_sparse, params, &.{ qkv, kc, vc, attn_part, step, qsa_sel, qsa_params }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = 0, .max_rows = kernels.attn_rows } }) });
                     try body.append(arena, .{ .launch = try b.add(.attn_combine, params, &.{ qkv, attn_part, att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = 0, .max_rows = kernels.attn_rows } }) });

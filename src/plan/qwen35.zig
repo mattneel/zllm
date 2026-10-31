@@ -499,8 +499,7 @@ pub const Program = struct {
         // layer binds the same unwritten stand-in.
         const kept = try a.buffer(if (cfg.mtp) recurrent.size else 16, .{ .storage = true, .copy_src = true });
 
-        const kv_bytes: u64 = if (cfg.kv == .f16) 2 else 4;
-        const kv_layer = @as(u64, cfg.context) * kv_dim * kv_bytes;
+        const kv_layer = cfg.kv.layerBytes(cfg.context, hp.n_head_kv, hp.head_dim);
 
         const sample_params = try a.buffer(@sizeOf(P.Sample), .{ .uniform = true, .copy_dst = true });
         const bias = try a.storage(2 * kernels.max_bias);
@@ -536,6 +535,7 @@ pub const Program = struct {
             .hp = hp,
             .attn = m.attn,
             .kv_layer = kv_layer,
+            .kv_scales = cfg.kv.scales(cfg.context, hp.n_head_kv, hp.head_dim),
             .kv = cfg.kv,
             .max_blocks = max_blocks,
             .x = x,
@@ -973,6 +973,8 @@ const LayerBuilder = struct {
     attn: AttnVariant,
     kv_layer: u64,
     kv: KvFormat,
+    /// FP8: the word where the cache's scales start.
+    kv_scales: u32,
     max_blocks: u32,
     x: Arg,
     h: Arg,
@@ -995,7 +997,7 @@ const LayerBuilder = struct {
         const qkv_row: u64 = q_dim + 2 * kv_dim;
         const kc = try lb.a.buffer(lb.kv_layer, .{ .storage = true });
         const vc = try lb.a.buffer(lb.kv_layer, .{ .storage = true });
-        const half: u32 = @backingInt(lb.kv);
+        const kv: u32 = @backingInt(lb.kv);
         const scale = lb.attn.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(hd))));
         const gated: u32 = @intFromBool(lb.attn.gated);
         const q_row: u32 = @intCast(qkv_row);
@@ -1011,18 +1013,19 @@ const LayerBuilder = struct {
             .row = q_row,
             .k_off = @intCast(q_dim),
             .v_off = @intCast(q_dim + kv_dim),
-            .f16 = half,
+            .kv = kv,
             .eps = hp.rms_eps,
             .gated = gated,
             .qk_norm = @intFromBool(lb.attn.qk_norm),
             .normal = @intFromBool(lb.attn.normal_rope),
+            .scales = lb.kv_scales,
         }, &.{ lb.qkv, w.q_norm, w.k_norm, rope, kc, vc, step }, .{ .rows_y = hp.n_head + hp.n_head_kv }) });
         // Split attention over blocks of cache positions, in chunks of
         // attn_rows tokens; a step records the chunks its rows reach.
         var attn: std.ArrayList(kernels.Launch) = .empty;
         var row0: u32 = 0;
         while (row0 < mm.cap) : (row0 += kernels.attn_rows) {
-            const params: P.Attention = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .f16 = half, .scale = scale, .max_blocks = lb.max_blocks, .q_row = q_row, .row0 = row0, .gated = gated };
+            const params: P.Attention = .{ .heads = hp.n_head, .kv_heads = hp.n_head_kv, .head_dim = hp.head_dim, .kv = kv, .scale = scale, .max_blocks = lb.max_blocks, .q_row = q_row, .row0 = row0, .gated = gated, .scales = lb.kv_scales };
             try attn.append(arena, try b.add(kernels.attnSplit(hp.n_head / hp.n_head_kv), params, &.{ lb.qkv, kc, vc, lb.attn_part, step }, .{ .key_blocks = .{ .x = hp.n_head_kv, .block = kernels.attn_block, .row0 = row0, .max_rows = kernels.attn_rows } }));
             try attn.append(arena, try b.add(.attn_combine, params, &.{ lb.qkv, lb.attn_part, lb.att, step }, .{ .rows_y_from = .{ .x = hp.n_head, .row0 = row0, .max_rows = kernels.attn_rows } }));
         }

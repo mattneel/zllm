@@ -164,11 +164,13 @@ fn composed(comptime name: []const u8) []const u8 {
         }
     }
     const group = std.fmt.comptimePrint;
-    if (std.mem.eql(u8, name, "attn_split")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group}) ++ @embedFile("attn_dense.wgsl") ++ @embedFile("attn_split.wgsl");
-    if (std.mem.eql(u8, name, "attn_split_wide")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group_wide}) ++ @embedFile("attn_dense.wgsl") ++ @embedFile("attn_split.wgsl");
-    if (std.mem.eql(u8, name, "attn_split_sparse")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group_wide}) ++ @embedFile("attn_sparse.wgsl") ++ @embedFile("attn_split.wgsl");
+    // The cache's readers and writer take the FP8 format (fp8.wgsl).
+    if (std.mem.eql(u8, name, "attn_split")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group}) ++ @embedFile("fp8.wgsl") ++ @embedFile("attn_dense.wgsl") ++ @embedFile("attn_split.wgsl");
+    if (std.mem.eql(u8, name, "attn_split_wide")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group_wide}) ++ @embedFile("fp8.wgsl") ++ @embedFile("attn_dense.wgsl") ++ @embedFile("attn_split.wgsl");
+    if (std.mem.eql(u8, name, "attn_split_sparse")) return group("const MAX_GROUP: u32 = {d}u;\n", .{attn_max_group_wide}) ++ @embedFile("fp8.wgsl") ++ @embedFile("attn_sparse.wgsl") ++ @embedFile("attn_split.wgsl");
     // The kernels that store f16 round it themselves.
-    if (std.mem.eql(u8, name, "rope_append") or std.mem.eql(u8, name, "qsa_keys")) return @embedFile("f16_round.wgsl") ++ @embedFile(name ++ ".wgsl");
+    if (std.mem.eql(u8, name, "rope_append")) return @embedFile("f16_round.wgsl") ++ @embedFile("fp8.wgsl") ++ @embedFile("rope_append.wgsl");
+    if (std.mem.eql(u8, name, "qsa_keys")) return @embedFile("f16_round.wgsl") ++ @embedFile("qsa_keys.wgsl");
     return @embedFile(name ++ ".wgsl");
 }
 
@@ -402,7 +404,8 @@ pub const params = struct {
         row: u32,
         k_off: u32,
         v_off: u32,
-        f16: u32,
+        /// The cache format (plan.common.KvFormat).
+        kv: u32,
         eps: f32,
         /// Query heads interleaved with their output gates (2·head_dim
         /// apart); else head_dim apart.
@@ -413,6 +416,9 @@ pub const params = struct {
         /// RoPE pairs (2i, 2i + 1) (Llama's "normal" RoPE); else
         /// (i, i + n_rot/2) (NeoX).
         normal: u32 = 0,
+        /// FP8 cache: the word where the scales start (kvScales).
+        scales: u32 = 0,
+        _pad: [3]u32 = @splat(0),
     };
     /// The sparse attention indexer's (qsa_*.wgsl, attn_sparse.wgsl):
     /// `heads` query heads of `dim`, blocks of `ratio` cells, `width` cells
@@ -433,7 +439,8 @@ pub const params = struct {
         heads: u32,
         kv_heads: u32,
         head_dim: u32,
-        f16: u32,
+        /// The cache format (plan.common.KvFormat).
+        kv: u32,
         scale: f32,
         max_blocks: u32,
         q_row: u32,
@@ -441,7 +448,9 @@ pub const params = struct {
         /// Query heads interleaved with their output gates, which
         /// attn_combine applies; else head_dim apart, ungated.
         gated: u32 = 1,
-        _pad: [3]u32 = @splat(0),
+        /// FP8 cache: the word where the scales start (kvScales).
+        scales: u32 = 0,
+        _pad: [2]u32 = @splat(0),
     };
     pub const DeltaPrep = extern struct {
         channels: u32,

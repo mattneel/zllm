@@ -81,9 +81,12 @@ pub fn source(k: Kernel) ?[]const u8 {
 ///   <op>_q<type>          quant/common.hlsli, quant/<type>.hlsli, for
 ///                         matvec quant/<type>_dot.hlsli and the template
 ///                         matvec_quant.hlsl.hbs, else <op>_quant.hlsl
-///   attn_split[_wide]     #define MAX_GROUP, attn_dense.hlsli, attn_split.hlsl
-///   attn_split_sparse     #define MAX_GROUP, attn_sparse.hlsli, attn_split.hlsl
-///   rope_append, qsa_keys f16_round.hlsli, <name>.hlsl
+///   attn_split[_wide]     #define MAX_GROUP, fp8.hlsli, attn_dense.hlsli,
+///                         attn_split.hlsl
+///   attn_split_sparse     #define MAX_GROUP, fp8.hlsli, attn_sparse.hlsli,
+///                         attn_split.hlsl
+///   rope_append           f16_round.hlsli, fp8.hlsli, rope_append.hlsl
+///   qsa_keys              f16_round.hlsli, qsa_keys.hlsl
 ///   anything else         <name>.hlsl
 fn composed(comptime name: []const u8) []const u8 {
     @setEvalBranchQuota(10_000);
@@ -104,10 +107,11 @@ fn composed(comptime name: []const u8) []const u8 {
         }
     }
     const group = std.fmt.comptimePrint;
-    if (std.mem.eql(u8, name, "attn_split")) return group("#define MAX_GROUP {d}\n", .{kernels.attn_max_group}) ++ @embedFile("kernels/attn_dense.hlsli") ++ @embedFile("kernels/attn_split.hlsl");
-    if (std.mem.eql(u8, name, "attn_split_wide")) return group("#define MAX_GROUP {d}\n", .{kernels.attn_max_group_wide}) ++ @embedFile("kernels/attn_dense.hlsli") ++ @embedFile("kernels/attn_split.hlsl");
-    if (std.mem.eql(u8, name, "attn_split_sparse")) return group("#define MAX_GROUP {d}\n", .{kernels.attn_max_group_wide}) ++ @embedFile("kernels/attn_sparse.hlsli") ++ @embedFile("kernels/attn_split.hlsl");
-    if (std.mem.eql(u8, name, "rope_append") or std.mem.eql(u8, name, "qsa_keys")) return @embedFile("kernels/f16_round.hlsli") ++ @embedFile("kernels/" ++ name ++ ".hlsl");
+    if (std.mem.eql(u8, name, "attn_split")) return group("#define MAX_GROUP {d}\n", .{kernels.attn_max_group}) ++ @embedFile("kernels/fp8.hlsli") ++ @embedFile("kernels/attn_dense.hlsli") ++ @embedFile("kernels/attn_split.hlsl");
+    if (std.mem.eql(u8, name, "attn_split_wide")) return group("#define MAX_GROUP {d}\n", .{kernels.attn_max_group_wide}) ++ @embedFile("kernels/fp8.hlsli") ++ @embedFile("kernels/attn_dense.hlsli") ++ @embedFile("kernels/attn_split.hlsl");
+    if (std.mem.eql(u8, name, "attn_split_sparse")) return group("#define MAX_GROUP {d}\n", .{kernels.attn_max_group_wide}) ++ @embedFile("kernels/fp8.hlsli") ++ @embedFile("kernels/attn_sparse.hlsli") ++ @embedFile("kernels/attn_split.hlsl");
+    if (std.mem.eql(u8, name, "rope_append")) return @embedFile("kernels/f16_round.hlsli") ++ @embedFile("kernels/fp8.hlsli") ++ @embedFile("kernels/rope_append.hlsl");
+    if (std.mem.eql(u8, name, "qsa_keys")) return @embedFile("kernels/f16_round.hlsli") ++ @embedFile("kernels/qsa_keys.hlsl");
     return @embedFile("kernels/" ++ name ++ ".hlsl");
 }
 

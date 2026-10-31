@@ -8,7 +8,8 @@
 //
 // Scores: 4 threads per key, each over a quarter of head_dim; the group's
 // queries sit in workgroup memory, so each K row is read once for the whole
-// group. Cache format as in `attention` (f16 pairs or f32 bits). Query
+// group. Cache format as rope_append writes it (`kv`: f32 bits, f16 pairs,
+// or scaled FP8 with its scales at word `scales`). Query
 // heads sit 2·head_dim apart, interleaved with their gates, when `gated`;
 // else head_dim apart.
 //
@@ -30,15 +31,15 @@ struct Params {
     heads: u32,
     kv_heads: u32,
     head_dim: u32,
-    f16: u32,
+    kv: u32,
     scale: f32,
     max_blocks: u32,
     q_row: u32,
     row0: u32,
     gated: u32,
+    scales: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 struct Step {
@@ -66,15 +67,26 @@ var<workgroup> qs: array<f32, MAX_GROUP * MAX_HEAD_DIM>;
 var<workgroup> red: array<f32, WG>;
 var<workgroup> sc: array<f32, MAX_GROUP * BLOCK>;
 
+// Cache values are indexed as position · kv_heads · head_dim + head ·
+// head_dim + d, so value i's FP8 scale is scale i / head_dim.
 fn k_pair(i: u32) -> vec2f {
-    if (p.f16 != 0u) {
+    if (p.kv == 2u) {
+        let s = bitcast<f32>(kc[p.scales + 2u * i / p.head_dim]);
+        let w = kc[i / 2u];
+        let o = 2u * (i & 1u);
+        return vec2f(fp8_at(w, o), fp8_at(w, o + 1u)) * s;
+    }
+    if (p.kv == 1u) {
         return unpack2x16float(kc[i]);
     }
     return vec2f(bitcast<f32>(kc[2u * i]), bitcast<f32>(kc[2u * i + 1u]));
 }
 
 fn v_at(i: u32) -> f32 {
-    if (p.f16 != 0u) {
+    if (p.kv == 2u) {
+        return fp8_at(vc[i / 4u], i) * bitcast<f32>(vc[p.scales + i / p.head_dim]);
+    }
+    if (p.kv == 1u) {
         let pair = unpack2x16float(vc[i / 2u]);
         return select(pair.x, pair.y, (i & 1u) == 1u);
     }

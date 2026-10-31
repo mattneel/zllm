@@ -4,6 +4,7 @@
 pub const ops = @import("ops.zig");
 pub const tensor = @import("tensor.zig");
 pub const matmul = @import("matmul.zig");
+pub const fp8 = @import("fp8.zig");
 pub const qwen35 = @import("qwen35.zig");
 pub const dense = @import("dense.zig");
 pub const gyro = @import("gyro/gyro.zig");
