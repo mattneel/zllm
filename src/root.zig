@@ -26,6 +26,8 @@ test {
     _ = @import("tokenizer/unicode.zig");
     _ = @import("tokenizer/pretokenize.zig");
     _ = @import("tokenizer/bpe.zig");
+    _ = @import("tokenizer/gemma.zig");
+    _ = @import("tokenizer/sentencepiece.zig");
     _ = @import("sampler/defaults.zig");
     _ = @import("plan/cache.zig");
     _ = @import("precision.zig");

@@ -128,6 +128,19 @@ def build_llama(checkout: Path, cache: Path, cxx: str) -> Path:
     subprocess.run([*compiler, "-O3", "-std=c++17", str(ROOT / "tools" / "tokenize-bench.cpp"), "-I", str(checkout / "include"), "-I", str(checkout / "ggml" / "include"), "-L", str(lib), f"-Wl,-rpath,{lib}", "-lllama", "-o", str(executable)], check=True, capture_output=True, text=True)
     return executable
 
+def vocabulary_only_header(source: Path, target: Path) -> None:
+    """Preserve every vocabulary/metadata byte, omit the tensor directory.
+
+    A real range-read header lacks tensor data; vocab_only in llama.cpp still
+    validates its tensor bounds. Setting only the GGUF tensor count to zero
+    makes a genuine metadata-only input without downloading or faking weights.
+    The original pinned header is never modified.
+    """
+    raw = source.read_bytes()
+    if len(raw) < 24 or raw[:4] != b"GGUF" or int.from_bytes(raw[4:8], "little") not in (2, 3):
+        raise ValueError("expected a GGUF v2/v3 metadata header")
+    target.write_bytes(raw[:8] + bytes(8) + raw[16:])
+
 
 def benchmark_llama(args, texts: list[str], expected: list[list[int]]) -> dict:
     try:
@@ -143,13 +156,18 @@ def benchmark_llama(args, texts: list[str], expected: list[list[int]]) -> dict:
                 raw = text.encode("utf-8")
                 output.write(struct.pack("<I", len(raw)))
                 output.write(raw)
-        result = run_json([str(executable), str(args.model.resolve()), str(corpus)])
+        model = args.model.resolve()
+        if getattr(args, "llama_metadata_only", False):
+            derived = Path(directory) / "vocabulary.gguf"
+            vocabulary_only_header(model, derived)
+            model = derived
+        result = run_json([str(executable), str(model), str(corpus)])
     if not isinstance(result, dict):
         raise ValueError("expected llama.cpp benchmark object")
     ids = result.pop("ids", None)
     parity = validate_ids(ids, expected)
     report = validate_report(result, "llama.cpp", texts, sum(map(len, ids)))
-    return {**report, **parity, "status": "measured"}
+    return {**report, **parity, "status": "measured", "input_variant": "metadata-only" if getattr(args, "llama_metadata_only", False) else "original"}
 
 
 def main() -> int:
@@ -163,6 +181,7 @@ def main() -> int:
     parser.add_argument("--cache", type=Path, default=ROOT / ".fixtures" / "cache" / "tokenize-bench")
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     parser.add_argument("--skip-llama", action="store_true", help="explicitly omit llama.cpp instead of attempting its build")
+    parser.add_argument("--llama-metadata-only", action="store_true", help="derive a vocabulary-only GGUF from a pinned header; preserve metadata, omit tensor entries")
     args = parser.parse_args()
     from tokenizers import Tokenizer, __version__ as tokenizers_version
 

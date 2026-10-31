@@ -21,8 +21,8 @@ CHAT_TEMPLATE = "hf/Qwen-Fixed-Chat-Templates/chat_template.jinja"
 
 
 @dataclass(frozen=True)
-class DenseModel:
-    """One of scripts/fixtures.sh's dense_models."""
+class ModelFixture:
+    """Pinned model/header/tokenizer paths; only DENSE_MODELS fetch weights."""
 
     name: str
     file: str
@@ -39,10 +39,18 @@ class DenseModel:
 
 # Mirrors dense_models in scripts/fixtures.sh.
 DENSE_MODELS = (
-    DenseModel("qwen3", "Qwen3-0.6B-BF16.gguf"),
-    DenseModel("llama", "Llama-3.2-1B-Instruct-BF16.gguf"),
-    DenseModel("granite", "granite-4.2-3b-bf16.gguf"),
+    ModelFixture("qwen3", "Qwen3-0.6B-BF16.gguf"),
+    ModelFixture("llama", "Llama-3.2-1B-Instruct-BF16.gguf"),
+    ModelFixture("granite", "granite-4.2-3b-bf16.gguf"),
 )
+
+# Mirrors tokenizer_models in scripts/fixtures.sh. Keep these out of the
+# forward/GPU model list: only their small vocabulary fixtures are fetched.
+TOKENIZER_ONLY_MODELS = (
+    ModelFixture("nanbeige", "Nanbeige4.3-33B-Q5_K_M.gguf"),
+    ModelFixture("gemma4", "gemma-4-31B-it-Q4_K_M.gguf"),
+)
+TOKENIZER_MODELS = DENSE_MODELS + TOKENIZER_ONLY_MODELS
 
 
 @dataclass(frozen=True)

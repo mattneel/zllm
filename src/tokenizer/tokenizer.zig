@@ -1,15 +1,16 @@
-//! Byte-level BPE tokenizer built from GGUF `tokenizer.ggml.*` metadata.
+//! Hugging Face-compatible BPE tokenizers built from GGUF metadata.
 //!
 //! Encoding follows Hugging Face `tokenizers` for the supported models:
 //!
-//! 1. Split out added tokens (GGUF token types CONTROL and USER_DEFINED),
-//!    leftmost-longest, on the raw text.
-//! 2. NFC-normalize the remaining segments, for the models whose tokenizer
-//!    declares it (`pretokenize.Kind.nfc`).
-//! 3. Split each segment with the model's pre-tokenizer regex.
-//! 4. Map each piece's bytes to the GPT-2 byte alphabet and apply BPE merges
-//!    in rank order, leftmost first on ties; with `ignore_merges` (Llama 3),
-//!    a piece that is itself a token is taken whole.
+//! Added tokens match leftmost-longest on raw text before normalization.
+//! GPT-2-alphabet models use their NFC/regex profiles and rank-pair merges,
+//! including Llama 3's whole-piece `ignore_merges` shortcut. SentencePiece
+//! reconstructs exact pair ranks from scored vocabulary splits; Gemma 4 uses
+//! explicit merges. Both metaspace families preserve Unicode scalar symbols
+//! and byte fallback rather than mapping text to the GPT-2 alphabet.
+//!
+//! `encode` follows raw tokenizer.json postprocessing; `encodePrompt` also
+//! applies the GGUF inference BOS policy without duplicating a template BOS.
 //!
 //! Token strings borrow from the GGUF bytes, which must outlive the tokenizer.
 
@@ -19,6 +20,8 @@ const gguf = @import("../gguf/gguf.zig");
 const unicode = @import("unicode.zig");
 const pretokenize = @import("pretokenize.zig");
 const bpe = @import("bpe.zig");
+const sentencepiece = @import("sentencepiece.zig");
+const gemma = @import("gemma.zig");
 
 pub const Id = u32;
 
@@ -45,21 +48,36 @@ pub const Tokenizer = struct {
     tokens: []const []const u8,
     types: []TokenType,
     ids: std.StringHashMapUnmanaged(Id),
-    merges: bpe.MergeTable,
+    merges: bpe.MergeTable = .{ .entries = &.{} },
     /// Byte-alphabet vocabulary decoded once at load time, in a packed arena.
-    decoded: []Decoded,
-    decoded_bytes: []u8,
+    decoded: []Decoded = &.{},
+    decoded_bytes: []u8 = &.{},
     /// Raw-byte vocabulary lookup for ignore_merges, without alphabet expansion.
-    raw_ids: std.StringHashMapUnmanaged(Id),
+    raw_ids: std.StringHashMapUnmanaged(Id) = .empty,
     /// Token id of each byte's single-character GPT-2 alphabet token.
-    byte_token: [256]Id,
+    byte_token: [256]Id = undefined,
     /// Added tokens in first-byte buckets, longest first within each bucket.
     added: []Id,
     added_offsets: [257]usize,
-    pre: pretokenize.Kind,
+    pre: ?pretokenize.Kind = null,
     eos: ?Id,
     bos: ?Id,
     add_bos: bool,
+    engine: Engine = .gpt2,
+
+    const Engine = union(enum) {
+        gpt2,
+        sentencepiece: sentencepiece.Model,
+        gemma: gemma.Model,
+
+        fn deinit(engine: *Engine, gpa: Allocator) void {
+            switch (engine.*) {
+                .gpt2 => {},
+                .sentencepiece => |*model| model.deinit(gpa),
+                .gemma => |*model| model.deinit(gpa),
+            }
+        }
+    };
 
     const Decoded = struct {
         offset: usize,
@@ -68,6 +86,7 @@ pub const Tokenizer = struct {
     };
 
     pub fn deinit(t: *Tokenizer, gpa: Allocator) void {
+        t.engine.deinit(gpa);
         gpa.free(t.tokens);
         gpa.free(t.types);
         t.ids.deinit(gpa);
@@ -81,13 +100,15 @@ pub const Tokenizer = struct {
 
     pub fn load(gpa: Allocator, file: gguf.File) LoadError!Tokenizer {
         const model = getString(file, "tokenizer.ggml.model") orelse return error.MissingMetadata;
-        if (!std.mem.eql(u8, model, "gpt2")) return error.UnsupportedTokenizer;
-        const pre_name = getString(file, "tokenizer.ggml.pre") orelse return error.MissingMetadata;
-        const pre = pretokenize.Kind.fromGgufName(pre_name) orelse return error.UnsupportedTokenizer;
+        const is_spm = std.mem.eql(u8, model, "llama");
+        const is_gemma = std.mem.eql(u8, model, "gemma4");
+        if (!is_spm and !is_gemma and !std.mem.eql(u8, model, "gpt2")) return error.UnsupportedTokenizer;
+        const pre: ?pretokenize.Kind = if (is_spm or is_gemma) null else pretokenize.Kind.fromGgufName(
+            getString(file, "tokenizer.ggml.pre") orelse return error.MissingMetadata,
+        ) orelse return error.UnsupportedTokenizer;
 
         const token_arr = getArray(file, "tokenizer.ggml.tokens", .string) orelse return error.MissingMetadata;
         const type_arr = getArray(file, "tokenizer.ggml.token_type", .i32) orelse return error.MissingMetadata;
-        const merge_arr = getArray(file, "tokenizer.ggml.merges", .string) orelse return error.MissingMetadata;
         if (type_arr.len != token_arr.len) return error.BadMetadata;
         const n: usize = @intCast(token_arr.len);
         if (n > std.math.maxInt(Id)) return error.BadMetadata;
@@ -110,7 +131,9 @@ pub const Tokenizer = struct {
             // First occurrence wins, as in Hugging Face vocab loading.
             const gop = ids.getOrPutAssumeCapacity(tok.*);
             if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
-            if ((ty.* == .control or ty.* == .user_defined) and tok.len > 0) try added.append(gpa, @intCast(i));
+            // Gemma's HF-added eos is NORMAL in GGUF, unlike its other added tokens.
+            const raw_added = ty.* == .control or ty.* == .user_defined or (is_gemma and std.mem.eql(u8, tok.*, "<eos>"));
+            if (raw_added and tok.len > 0) try added.append(gpa, @intCast(i));
         }
 
         // First-byte buckets avoid testing every added token at every byte.
@@ -127,6 +150,26 @@ pub const Tokenizer = struct {
             while (added_index < added.items.len and tokens[added.items[added_index]][0] == byte) : (added_index += 1) {}
         }
         added_offsets[256] = added.items.len;
+
+        if (is_spm or is_gemma) {
+            var engine: Engine = if (is_spm)
+                .{ .sentencepiece = try sentencepiece.init(gpa, file, tokens, &ids) }
+            else
+                .{ .gemma = try gemma.init(gpa, file, tokens, &ids) };
+            errdefer engine.deinit(gpa);
+            return .{
+                .tokens = tokens,
+                .types = types,
+                .ids = ids,
+                .added = try added.toOwnedSlice(gpa),
+                .added_offsets = added_offsets,
+                .eos = getId(file, "tokenizer.ggml.eos_token_id"),
+                .bos = getId(file, "tokenizer.ggml.bos_token_id"),
+                .add_bos = if (file.get("tokenizer.ggml.add_bos_token")) |v| (v == .bool and v.bool) else false,
+                .engine = engine,
+            };
+        }
+        const merge_arr = getArray(file, "tokenizer.ggml.merges", .string) orelse return error.MissingMetadata;
 
         var byte_token: [256]Id = undefined;
         for (0..256) |b| {
@@ -185,7 +228,7 @@ pub const Tokenizer = struct {
         errdefer gpa.free(decoded_bytes);
         var raw_ids: std.StringHashMapUnmanaged(Id) = .empty;
         errdefer raw_ids.deinit(gpa);
-        if (pre.ignoresMerges()) {
+        if (pre.?.ignoresMerges()) {
             try raw_ids.ensureTotalCapacity(gpa, @intCast(n));
             for (alphabet, 0..) |entry, index| {
                 if (entry.len == Decoded.invalid) continue;
@@ -214,7 +257,6 @@ pub const Tokenizer = struct {
 
     pub const EncodeError = unicode.NormalizeError;
 
-    /// Appends the token ids of `text` to `out`. Adds BOS when the model asks for it.
     /// The tokens that end generation, as llama.cpp picks them: those named
     /// like an end of turn, message or text (llama-vocab.cpp's list, without
     /// its model-specific entries), and the end-of-sequence token.
@@ -228,8 +270,21 @@ pub const Tokenizer = struct {
         if (t.eos) |id| if (std.mem.indexOfScalar(Id, out.items, id) == null) try out.append(gpa, id);
     }
 
+    /// Raw HF-tokenizer semantics, including its model postprocessor. Gemma's
+    /// raw tokenizer.json has no BOS despite its GGUF inference BOS policy.
     pub fn encode(t: *const Tokenizer, gpa: Allocator, text: []const u8, out: *std.ArrayList(Id)) EncodeError!void {
-        if (t.add_bos) if (t.bos) |b| try out.append(gpa, b);
+        return t.encodeImpl(gpa, text, out, t.add_bos and t.engine != .gemma);
+    }
+
+    /// Inference prompt semantics: honor GGUF BOS, but never add a second BOS
+    /// when the rendered chat template already starts with its literal token.
+    pub fn encodePrompt(t: *const Tokenizer, gpa: Allocator, text: []const u8, out: *std.ArrayList(Id)) EncodeError!void {
+        const has_bos = if (t.bos) |id| std.mem.startsWith(u8, text, t.tokens[id]) else false;
+        return t.encodeImpl(gpa, text, out, t.add_bos and !has_bos);
+    }
+
+    fn encodeImpl(t: *const Tokenizer, gpa: Allocator, text: []const u8, out: *std.ArrayList(Id), prepend_bos: bool) EncodeError!void {
+        if (prepend_bos) if (t.bos) |id| try out.append(gpa, id);
         var scratch: bpe.Scratch = .{};
         defer scratch.deinit(gpa);
 
@@ -237,7 +292,7 @@ pub const Tokenizer = struct {
         var seg_start: usize = 0;
         while (pos < text.len) {
             if (t.matchAdded(text[pos..])) |id| {
-                try t.encodeSegment(gpa, text[seg_start..pos], out, &scratch);
+                try t.encodeSegment(gpa, text[seg_start..pos], seg_start == 0, out, &scratch);
                 try out.append(gpa, id);
                 pos += t.tokens[id].len;
                 seg_start = pos;
@@ -245,7 +300,7 @@ pub const Tokenizer = struct {
                 pos += 1;
             }
         }
-        try t.encodeSegment(gpa, text[seg_start..], out, &scratch);
+        try t.encodeSegment(gpa, text[seg_start..], seg_start == 0, out, &scratch);
     }
 
     fn matchAdded(t: *const Tokenizer, rest: []const u8) ?Id {
@@ -255,19 +310,25 @@ pub const Tokenizer = struct {
         return null;
     }
 
-    fn encodeSegment(t: *const Tokenizer, gpa: Allocator, raw: []const u8, out: *std.ArrayList(Id), scratch: *bpe.Scratch) EncodeError!void {
+    fn encodeSegment(t: *const Tokenizer, gpa: Allocator, raw: []const u8, first: bool, out: *std.ArrayList(Id), scratch: *bpe.Scratch) EncodeError!void {
         if (raw.len == 0) return;
-        const normalized = if (t.pre.nfc()) try unicode.nfc(gpa, raw) else null;
+        switch (t.engine) {
+            .sentencepiece => |*model| return model.encode(gpa, raw, first, out),
+            .gemma => |*model| return model.encode(gpa, raw, out),
+            .gpt2 => {},
+        }
+        const pre = t.pre.?;
+        const normalized = if (pre.nfc()) try unicode.nfc(gpa, raw) else null;
         defer if (normalized) |n| gpa.free(n);
         const text = normalized orelse raw;
 
-        var pieces = pretokenize.iterator(t.pre, text);
+        var pieces = pretokenize.iterator(pre, text);
         while (pieces.next()) |piece| {
             if (piece.len == 1) {
                 try out.append(gpa, t.byte_token[piece[0]]);
                 continue;
             }
-            if (t.pre.ignoresMerges()) {
+            if (pre.ignoresMerges()) {
                 if (t.raw_ids.get(piece)) |id| {
                     try out.append(gpa, id);
                     continue;
@@ -281,12 +342,37 @@ pub const Tokenizer = struct {
 
     /// Appends the bytes of `ids` to `out`. Added tokens decode to their text.
     pub fn decode(t: *const Tokenizer, gpa: Allocator, ids: []const Id, out: *std.ArrayList(u8)) DecodeError!void {
+        switch (t.engine) {
+            .sentencepiece => |*model| return model.decode(gpa, ids, out),
+            .gemma => |*model| return model.decode(gpa, ids, out),
+            .gpt2 => {},
+        }
+        return t.decodeRaw(gpa, ids, out);
+    }
+
+    /// Internal streaming primitive: fallback bytes are validated as a whole
+    /// run by Stream, and SPM's initial-space Strip is applied once there.
+    pub fn decodeRaw(t: *const Tokenizer, gpa: Allocator, ids: []const Id, out: *std.ArrayList(u8)) DecodeError!void {
+        switch (t.engine) {
+            .sentencepiece => |*model| return model.decodeRaw(gpa, ids, out),
+            .gemma => |*model| return model.decodeRaw(gpa, ids, out),
+            .gpt2 => {},
+        }
         for (ids) |id| {
             if (id >= t.tokens.len) return error.UnknownToken;
             const entry = t.decoded[id];
             if (entry.len == Decoded.invalid) return error.UnknownToken;
             try out.appendSlice(gpa, t.decoded_bytes[entry.offset..][0..entry.len]);
         }
+    }
+
+    pub fn fallbackByte(t: *const Tokenizer, id: Id) error{UnknownToken}!?u8 {
+        if (id >= t.tokens.len) return error.UnknownToken;
+        return if (t.engine == .gpt2) null else gemma.fallbackByte(t.tokens[id]);
+    }
+
+    pub fn stripsInitialSpace(t: *const Tokenizer) bool {
+        return t.engine == .sentencepiece;
     }
 };
 
@@ -392,4 +478,130 @@ test "predecoded bytes preserve split UTF-8 and streaming stop boundaries" {
     try std.testing.expectEqualStrings("€", output.items);
     try std.testing.expect(try stream.push(gpa, &tok, 2, &output));
     try std.testing.expectEqualStrings("€", output.items);
+}
+
+const test_fallback_names = blk: {
+    var names: [256][6]u8 = undefined;
+    const hex = "0123456789ABCDEF";
+    for (&names, 0..) |*name, byte| name.* = .{ '<', '0', 'x', hex[byte >> 4], hex[byte & 15], '>' };
+    break :blk names;
+};
+const test_metaspace_tokens = blk: {
+    const ordinary = [_][]const u8{ "▁", "a", "b", "▁a", "<bos>", "<eos>", "<turn|>", "▁b", "a▁" };
+    var tokens: [256 + ordinary.len][]const u8 = undefined;
+    for (&test_fallback_names, 0..) |*name, index| tokens[index] = name;
+    @memcpy(tokens[256..], &ordinary);
+    break :blk tokens;
+};
+
+fn testMetaspaceTokenizer(gpa: Allocator, spm: bool) !Tokenizer {
+    const tokens = try gpa.dupe([]const u8, &test_metaspace_tokens);
+    errdefer gpa.free(tokens);
+    const types = try gpa.alloc(TokenType, tokens.len);
+    errdefer gpa.free(types);
+    @memset(types, .normal);
+    @memset(types[0..256], .byte);
+    for ([_]usize{ 260, 261, 262 }) |id| types[id] = .control;
+    var ids: std.StringHashMapUnmanaged(Id) = .empty;
+    errdefer ids.deinit(gpa);
+    for (tokens, 0..) |token, index| try ids.put(gpa, token, @intCast(index));
+    var merges = try bpe.MergeTable.init(gpa, 3);
+    errdefer merges.deinit(gpa);
+    merges.putFirst(256, 257, .{ .rank = 0, .id = 259 });
+    merges.putFirst(256, 258, .{ .rank = 1, .id = 263 });
+    merges.putFirst(257, 256, .{ .rank = 2, .id = 264 });
+    var byte_tokens: [256]Id = undefined;
+    for (&byte_tokens, 0..) |*id, byte| id.* = @intCast(byte);
+    var ascii_tokens: [128]Id = undefined;
+    for (&ascii_tokens, 0..) |*id, byte| {
+        const name = [1]u8{@intCast(byte)};
+        id.* = if (byte == ' ') 256 else ids.get(&name) orelse byte_tokens[byte];
+    }
+    const base: gemma.Model = .{ .tokens = tokens, .ids = ids, .merges = merges, .byte_token = byte_tokens, .ascii_token = ascii_tokens };
+    const added = try gpa.dupe(Id, &.{ 262, 260, 261 });
+    var offsets: [257]usize = undefined;
+    for (&offsets, 0..) |*offset, byte| offset.* = if (byte <= '<') 0 else added.len;
+    return .{
+        .tokens = tokens,
+        .types = types,
+        .ids = ids,
+        .added = added,
+        .added_offsets = offsets,
+        .eos = 261,
+        .bos = 260,
+        .add_bos = true,
+        .engine = if (spm) .{ .sentencepiece = .{ .base = base, .add_prefix = true } } else .{ .gemma = base },
+    };
+}
+
+test "raw Gemma omits BOS but raw inference and rendered chat each get exactly one" {
+    const gpa = std.testing.allocator;
+    var tok = try testMetaspaceTokenizer(gpa, false);
+    defer tok.deinit(gpa);
+    var ids: std.ArrayList(Id) = .empty;
+    defer ids.deinit(gpa);
+    try tok.encode(gpa, "a", &ids);
+    try std.testing.expectEqualSlices(Id, &.{257}, ids.items);
+    ids.clearRetainingCapacity();
+    try tok.encodePrompt(gpa, "a", &ids);
+    try std.testing.expectEqualSlices(Id, &.{ 260, 257 }, ids.items);
+    ids.clearRetainingCapacity();
+    // The Gemma chat template emits its BOS literal before its first turn.
+    try tok.encodePrompt(gpa, "<bos>a", &ids);
+    try std.testing.expectEqualSlices(Id, &.{ 260, 257 }, ids.items);
+    ids.clearRetainingCapacity();
+    try tok.encode(gpa, "<eos>a", &ids);
+    try std.testing.expectEqualSlices(Id, &.{ 261, 257 }, ids.items);
+}
+
+test "SentencePiece first prefix is original offset and decoder strips only stream start" {
+    const gpa = std.testing.allocator;
+    var tok = try testMetaspaceTokenizer(gpa, true);
+    defer tok.deinit(gpa);
+    var ids: std.ArrayList(Id) = .empty;
+    defer ids.deinit(gpa);
+    try tok.encode(gpa, "a<eos>b", &ids);
+    try std.testing.expectEqualSlices(Id, &.{ 260, 259, 261, 258 }, ids.items);
+    ids.clearRetainingCapacity();
+    try tok.encode(gpa, "<bos>a", &ids);
+    try std.testing.expectEqualSlices(Id, &.{ 260, 260, 257 }, ids.items);
+    ids.clearRetainingCapacity();
+    try tok.encodePrompt(gpa, "<bos>a", &ids);
+    try std.testing.expectEqualSlices(Id, &.{ 260, 257 }, ids.items);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try tok.decode(gpa, &.{ 259, 263 }, &out);
+    try std.testing.expectEqualStrings("a b", out.items);
+    out.clearRetainingCapacity();
+    try tok.decode(gpa, &.{ 260, 259 }, &out);
+    try std.testing.expectEqualStrings("<bos> a", out.items);
+    out.clearRetainingCapacity();
+    var stream: @import("stream.zig").Stream = .{ .stops = &.{} };
+    defer stream.deinit(gpa);
+    _ = try stream.push(gpa, &tok, 259, &out);
+    _ = try stream.push(gpa, &tok, 263, &out);
+    try stream.flush(gpa, &out);
+    try std.testing.expectEqualStrings("a b", out.items);
+}
+
+test "metaspace streaming validates entire fallback runs before releasing or flushing" {
+    const gpa = std.testing.allocator;
+    var tok = try testMetaspaceTokenizer(gpa, false);
+    defer tok.deinit(gpa);
+    const cases = [_]struct { ids: []const Id, text: []const u8 }{
+        .{ .ids = &.{ 0xC3, 0xA9, 258 }, .text = "éb" },
+        .{ .ids = &.{ 0xFF, 0xC3, 0xA9, 258 }, .text = "���b" },
+        .{ .ids = &.{ 0xE2, 0x96, 0x81, 258 }, .text = "▁b" },
+        .{ .ids = &.{ 0xC3, 0xA9 }, .text = "é" },
+        .{ .ids = &.{0xC3}, .text = "�" },
+    };
+    for (cases) |case| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        var stream: @import("stream.zig").Stream = .{ .stops = &.{} };
+        defer stream.deinit(gpa);
+        for (case.ids) |id| _ = try stream.push(gpa, &tok, id, &out);
+        try stream.flush(gpa, &out);
+        try std.testing.expectEqualStrings(case.text, out.items);
+    }
 }

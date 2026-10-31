@@ -19,7 +19,7 @@ from pathlib import Path
 from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-from common import DENSE_MODELS, Failures, fixture_paths, gguf_metadata, parse_args
+from common import TOKENIZER_MODELS, Failures, fixture_paths, gguf_metadata, parse_args
 
 CORPUS = Path(__file__).parent / "corpus" / "chat.jsonl"
 
@@ -121,7 +121,7 @@ def main() -> int:
         want = render(template, case)
         fail.expect_eq(f"{case['name']}: prompt", out["text"], want)
     print(f"chat template: {len(cases) - len(fail.items)}/{len(cases)} conversations match")
-    for model in DENSE_MODELS:
+    for model in TOKENIZER_MODELS:
         header = model.gguf_header(paths.root)
         if not header.is_file():
             raise SystemExit(f"missing {header}; run scripts/fixtures.sh vocab")

@@ -1353,7 +1353,7 @@ const Renderer = struct {
 
     fn filter(r: *Renderer, n: []const u8, v: Value, args: EvalArgs) Error!Value {
         const a = r.arena;
-        const F = enum { tojson, trim, length, count, first, last, default, d, items, safe, string, list, join, upper, lower, replace, int, float, abs, reverse, map, selectattr, rejectattr, unique, capitalize };
+        const F = enum { tojson, trim, length, count, first, last, default, d, items, dictsort, safe, string, list, join, upper, lower, replace, int, float, abs, reverse, map, selectattr, rejectattr, unique, capitalize };
         const f = std.meta.stringToEnum(F, n) orelse return error.TemplateError;
         switch (f) {
             .tojson => {
@@ -1403,6 +1403,7 @@ const Renderer = struct {
                 .undefined => .{ .list = &.{} },
                 else => error.TemplateError,
             },
+            .dictsort => return .{ .list = try dictSort(a, v, args) },
             .safe => return v,
             .string => return .{ .string = try r.toStr(v) },
             .list => return .{ .list = try r.iterate(v) },
@@ -1559,6 +1560,68 @@ fn dictItems(a: Allocator, d: *const Dict) Allocator.Error![]const Value {
         o.* = .{ .list = pair };
     }
     return out;
+}
+
+/// Jinja's stable dictsort: pairs, not keys, with case-insensitive keys by
+/// default. Case conversion follows this renderer's ASCII lower/upper subset.
+fn dictSort(a: Allocator, v: Value, args: Renderer.EvalArgs) Error![]const Value {
+    if (v != .dict or args.pos.len > 3) return error.TemplateError;
+    var options = [3]Value{ .{ .boolean = false }, .{ .string = "key" }, .{ .boolean = false } };
+    var supplied = [3]bool{ false, false, false };
+    for (args.pos, 0..) |arg, i| {
+        options[i] = arg;
+        supplied[i] = true;
+    }
+    for (args.kw) |arg| {
+        const i: usize = if (std.mem.eql(u8, arg.name, "case_sensitive"))
+            0
+        else if (std.mem.eql(u8, arg.name, "by"))
+            1
+        else if (std.mem.eql(u8, arg.name, "reverse"))
+            2
+        else
+            return error.TemplateError;
+        if (supplied[i]) return error.TemplateError;
+        options[i] = arg.value;
+        supplied[i] = true;
+    }
+    if (options[1] != .string) return error.TemplateError;
+    const by: usize = if (std.mem.eql(u8, options[1].string, "key"))
+        0
+    else if (std.mem.eql(u8, options[1].string, "value"))
+        1
+    else
+        return error.TemplateError;
+    const case_sensitive = truthy(options[0]);
+    const reverse = truthy(options[2]);
+    const pairs = @constCast(try dictItems(a, v.dict));
+    if (pairs.len < 2) return pairs;
+    // Insertion sort keeps equal folded keys in original dictionary order,
+    // including in reverse mode; comparisons can propagate Python type errors.
+    for (1..pairs.len) |i| {
+        const pair = pairs[i];
+        var j = i;
+        while (j > 0) : (j -= 1) {
+            const left = pairs[j - 1].list[by];
+            const right = pair.list[by];
+            const cmp = if (!case_sensitive and left == .string and right == .string)
+                asciiLowerOrder(left.string, right.string)
+            else
+                try order(left, right);
+            if (cmp != (if (reverse) std.math.Order.lt else .gt)) break;
+            pairs[j] = pairs[j - 1];
+        }
+        pairs[j] = pair;
+    }
+    return pairs;
+}
+
+fn asciiLowerOrder(a: []const u8, b: []const u8) std.math.Order {
+    for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |x, y| {
+        const cmp = std.math.order(std.ascii.toLower(x), std.ascii.toLower(y));
+        if (cmp != .eq) return cmp;
+    }
+    return std.math.order(a.len, b.len);
 }
 
 fn codePoints(a: Allocator, s: []const u8) Error![]const Value {
@@ -2050,6 +2113,36 @@ test "jinja macros, filters and tests" {
     try testRender("{{ '  x  '|trim }}|{{ [1, 2]|first }}{{ [1, 2]|last }}|{{ none|default('d', true) }}|{{ undefined_name|default('u') }}", &.{}, "x|12|d|u");
     try testRender("{{ x is defined }} {{ x is not defined }} {{ 'a' is string }} {{ {} is mapping }} {{ 'a' is iterable }} {{ none is none }}", &.{}, "False True True True True True");
     try testRender("{{ 'a b  c'.split() }} {{ 'a,b'.split(',') }} {{ 'x</think>y'.split('</think>')|last }} {{ '\\n\\nhi\\n'.lstrip('\\n') }}", &.{}, "['a', 'b', 'c'] ['a', 'b'] y hi\n");
+}
+
+test "jinja dictsort preserves pairs and stable case-insensitive ordering" {
+    try testRender("{% for k, v in {'b': 2, 'A': 1, 'a': 3, 'B': 4}|dictsort %}{{ k }}={{ v }};{% endfor %}", &.{}, "A=1;a=3;b=2;B=4;");
+    try testRender("{% for k, v in {'b': 2, 'A': 1, 'a': 3, 'B': 4}|dictsort(reverse=true) %}{{ k }}={{ v }};{% endfor %}", &.{}, "b=2;B=4;A=1;a=3;");
+    try testRender("{% for k, v in {'b': 2, 'A': 1, 'a': 3, 'B': 4}|dictsort(case_sensitive=true) %}{{ k }}={{ v }};{% endfor %}", &.{}, "A=1;B=4;a=3;b=2;");
+    try testRender("{% for k, v in {'b': 2, 'A': 1, 'a': 3}|dictsort(false, 'value', true) %}{{ k }}={{ v }};{% endfor %}", &.{}, "a=3;b=2;A=1;");
+    try testRender("{% for k, v in {'z': 'apple', 'a': 'Banana'}|dictsort(by='value') %}{{ k }}={{ v }};{% endfor %}", &.{}, "z=apple;a=Banana;");
+    try testRender("{{ {}|dictsort|length }}|{% for k, v in {'z': {'x': 2}}|dictsort %}{{ k }}:{{ v.x }}{% endfor %}", &.{}, "0|z:2");
+}
+
+test "jinja dictsort argument and input mutations fail closed" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_][]const u8{
+        "{{ []|dictsort }}",
+        "{{ missing|dictsort }}",
+        "{{ {}|dictsort(by='invalid') }}",
+        "{{ {}|dictsort(by=1) }}",
+        "{{ {}|dictsort(unknown=true) }}",
+        "{{ {}|dictsort(false, case_sensitive=true) }}",
+        "{{ {}|dictsort(false, 'key', false, true) }}",
+        "{{ {'a': 1, 'b': 'x'}|dictsort(by='value') }}",
+    }) |source| {
+        const t = try Template.parse(a, source);
+        var out: std.ArrayList(u8) = .empty;
+        var raised: ?[]const u8 = null;
+        try std.testing.expectError(error.TemplateError, t.render(a, &.{}, null, &out, &raised));
+    }
 }
 
 test "jinja tojson is transformers' json.dumps" {

@@ -89,8 +89,18 @@ pub const Scratch = struct {
     }
 
     pub fn encode(scratch: *Scratch, gpa: Allocator, table: *const MergeTable, byte_tokens: *const [256]Id, piece: []const u8, out: *std.ArrayList(Id)) Allocator.Error!void {
+        return scratch.encodeInput(u8, gpa, table, byte_tokens, piece, out);
+    }
+
+    /// Applies the same rank/leftmost scheduler to Unicode or fallback symbols
+    /// already resolved by a model's tokenizer. The input is borrowed unchanged.
+    pub fn encodeIds(scratch: *Scratch, gpa: Allocator, table: *const MergeTable, symbols: []const Id, out: *std.ArrayList(Id)) Allocator.Error!void {
+        return scratch.encodeInput(Id, gpa, table, null, symbols, out);
+    }
+
+    fn encodeInput(scratch: *Scratch, comptime T: type, gpa: Allocator, table: *const MergeTable, byte_tokens: ?*const [256]Id, piece: []const T, out: *std.ArrayList(Id)) Allocator.Error!void {
         if (piece.len == 0) return;
-        if (piece.len == 1) return out.append(gpa, byte_tokens[piece[0]]);
+        if (piece.len == 1) return out.append(gpa, if (T == u8) byte_tokens.?[piece[0]] else piece[0]);
         const use_heap = piece.len > heap_threshold;
         var local: [heap_threshold]Node = undefined;
         const nodes = if (use_heap) blk: {
@@ -98,8 +108,8 @@ pub const Scratch = struct {
             break :blk scratch.nodes.items;
         } else local[0..piece.len];
         scratch.heap.clearRetainingCapacity();
-        for (piece, 0..) |byte, index| nodes[index] = .{
-            .id = byte_tokens[byte],
+        for (piece, 0..) |symbol, index| nodes[index] = .{
+            .id = if (T == u8) byte_tokens.?[symbol] else symbol,
             .prev = if (index == 0) end else index - 1,
             .next = if (index + 1 == piece.len) end else index + 1,
         };
@@ -247,4 +257,37 @@ test "cached merge schedulers match exhaustive rank leftmost oracle" {
         try scratch.encode(gpa, &table, &byte_tokens, bytes[0..len], &actual);
         try std.testing.expectEqualSlices(Id, expected.items, actual.items);
     }
+}
+
+test "resolved symbol input shares byte scheduler and supports wide ids" {
+    const gpa = std.testing.allocator;
+    var table = try MergeTable.init(gpa, 4);
+    defer table.deinit(gpa);
+    table.putFirst(1000, 1001, .{ .rank = 3, .id = 2000 });
+    table.putFirst(1001, 1000, .{ .rank = 3, .id = 2001 });
+    table.putFirst(2000, 1000, .{ .rank = 1, .id = 3000 });
+    var bytes: [129]u8 = undefined;
+    var symbols: [129]Id = undefined;
+    var byte_tokens: [256]Id = undefined;
+    for (&byte_tokens, 0..) |*id, index| id.* = @intCast(1000 + index);
+    for (&bytes, &symbols, 0..) |*byte, *id, index| {
+        byte.* = @intCast(index % 2);
+        id.* = byte_tokens[byte.*];
+    }
+    var scratch: Scratch = .{};
+    defer scratch.deinit(gpa);
+    var from_bytes: std.ArrayList(Id) = .empty;
+    defer from_bytes.deinit(gpa);
+    var from_ids: std.ArrayList(Id) = .empty;
+    defer from_ids.deinit(gpa);
+    for (0..symbols.len + 1) |len| {
+        from_bytes.clearRetainingCapacity();
+        from_ids.clearRetainingCapacity();
+        try scratch.encode(gpa, &table, &byte_tokens, bytes[0..len], &from_bytes);
+        try scratch.encodeIds(gpa, &table, symbols[0..len], &from_ids);
+        try std.testing.expectEqualSlices(Id, from_bytes.items, from_ids.items);
+    }
+    from_ids.clearRetainingCapacity();
+    try scratch.encodeIds(gpa, &table, &.{ 1000, 1001, 1000 }, &from_ids);
+    try std.testing.expectEqualSlices(Id, &.{3000}, from_ids.items);
 }

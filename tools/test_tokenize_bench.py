@@ -132,6 +132,41 @@ class BenchmarkValidationTests(unittest.TestCase):
         self.assertTrue(result["ids_match_hf"])
         self.assertNotIn("ids", result)
 
+    def test_vocabulary_only_derivation_changes_only_tensor_count(self) -> None:
+        raw = b"GGUF" + (3).to_bytes(4, "little") + (99).to_bytes(8, "little") + (7).to_bytes(8, "little") + b"exact vocabulary bytes\0"
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / "header.gguf", Path(directory) / "vocab.gguf"
+            source.write_bytes(raw)
+            bench.vocabulary_only_header(source, target)
+            derived = target.read_bytes()
+            self.assertEqual(source.read_bytes(), raw)
+            self.assertEqual(derived[:8], raw[:8])
+            self.assertEqual(derived[8:16], bytes(8))
+            self.assertEqual(derived[16:], raw[16:])
+            # Mutated magic/version/truncation must fail, not become an oracle.
+            for malformed in (b"", raw[:23], b"BAD!" + raw[4:], raw[:4] + (1).to_bytes(4, "little") + raw[8:]):
+                source.write_bytes(malformed)
+                with self.assertRaises(ValueError):
+                    bench.vocabulary_only_header(source, target)
+
+    def test_llama_metadata_mode_loads_derived_header_outside_clock(self) -> None:
+        raw = b"GGUF" + (3).to_bytes(4, "little") + (99).to_bytes(8, "little") + (7).to_bytes(8, "little")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "header.gguf"
+            source.write_bytes(raw)
+            args = SimpleNamespace(llama_cpp=Path("llama.cpp"), cache=Path("cache"), cxx="c++", model=source, llama_metadata_only=True)
+            report = {**copy.deepcopy(self.report), "engine": "llama.cpp", "ids": self.ids}
+
+            def run_json(command):
+                self.assertNotEqual(Path(command[1]), source)
+                self.assertEqual(Path(command[1]).read_bytes(), raw[:8] + bytes(8) + raw[16:])
+                return report
+
+            with patch.object(bench, "build_llama", return_value=Path("helper")), patch.object(bench, "run_json", side_effect=run_json), patch.object(bench.time, "perf_counter_ns", side_effect=AssertionError("header derivation must not be timed")):
+                result = bench.benchmark_llama(args, self.texts, self.ids)
+            self.assertEqual(result["input_variant"], "metadata-only")
+            self.assertEqual(source.read_bytes(), raw)
+
 
 if __name__ == "__main__":
     unittest.main()

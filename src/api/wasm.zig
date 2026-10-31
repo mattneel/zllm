@@ -511,14 +511,13 @@ const Runtime = struct {
                     return err;
                 };
             }
-            try rt.tok.encode(arena, text.items, &prompt);
+            try rt.tok.encodePrompt(arena, text.items, &prompt);
             inside_think = opensThink(text.items);
             defaults = rt.defaults.chat(r.enable_thinking);
         } else if (r.tokens) |ids| {
             try prompt.appendSlice(arena, ids);
         } else if (r.prompt) |text| {
-            if (rt.tok.add_bos) if (rt.tok.bos) |b| try prompt.append(arena, b);
-            try rt.tok.encode(arena, text, &prompt);
+            try rt.tok.encodePrompt(arena, text, &prompt);
         } else return error.NoPrompt;
 
         var p = defaults;

@@ -2,7 +2,7 @@
 # Fetch and verify the pinned M0 fixtures into .fixtures/ (gitignored).
 #
 #   scripts/fixtures.sh          everything below
-#   scripts/fixtures.sh vocab    GGUF header (one range read) + Hugging Face tokenizer files
+#   scripts/fixtures.sh vocab    tokenizer-only GGUF headers + Hugging Face tokenizer files
 #   scripts/fixtures.sh model    the full 0.8B BF16 GGUF (1.5 GB)
 #   scripts/fixtures.sh dense    the dense models' full GGUFs (Qwen 3, Llama 3.2, Granite 4.2; 11 GB)
 #   scripts/fixtures.sh llama    llama.cpp at the pinned commit, built for CPU
@@ -54,6 +54,14 @@ dense_models=(
 	"qwen3 unsloth/Qwen3-0.6B-GGUF 50968a4468ef4233ed78cd7c3de230dd1d61a56b Qwen3-0.6B-BF16.gguf f9c9f1d3c1e21755b82d4e165f88dbbbd4355646d632fb5d6cef7c66ed4ee04e 5951936 6514e3e1284deac8d90fd4f60cabe22891f474c0119979987120d601a33bedf2 Qwen/Qwen3-0.6B c1899de289a04d12100db370d81485cdf75e47ca aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
 	"llama unsloth/Llama-3.2-1B-Instruct-GGUF b69aef112e9f895e6f98d7ae0949f72ff09aa401 Llama-3.2-1B-Instruct-BF16.gguf f5d05e90d179fa27c01a049be1574a0201bdc09ba0b345eb85e1dbf3b87610f3 7831168 64144078721b3282c53519e75df603be3f3c976f7d431ca896191aa0a449d03e unsloth/Llama-3.2-1B-Instruct 5a8abab4a5d6f164389b1079fb721cfab8d7126c 6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b"
 	"granite ibm-granite/granite-4.2-3b-GGUF c40945d71cd90f249a56985e8155551a9188dc30 granite-4.2-3b-bf16.gguf 8aad15f38ab5796190c9701b1913fd8f0bef01968a42cd16ffe469831564ef47 3571232 d97b0939ca1a7b4ae9c2d275ecd005c1582367b05e7b392d126befdf02563c3a ibm-granite/granite-4.2-3b 4e9c275e232f10211ec88644d106a1f6a1b60e06 883975314d58743726347caaf2c32ac89afd5ad57222cffbc4f052f2ab27b2d7"
+)
+
+# Tokenizer-only models: vocab fetches their exact metadata/index ranges;
+# dense/model/all never download their tensor weights. Fields: name, GGUF
+# repo, revision, file, header bytes, header SHA-256, HF repo/revision/SHA-256.
+tokenizer_models=(
+	"nanbeige AtomicChat/Nanbeige4.3-33B-GGUF 560e151e11dfdd4b008d394f6e16bf196a952bd0 Nanbeige4.3-33B-Q5_K_M.gguf 4004608 b381e40c9de9fa73b0ebd44f0fb8a827733b5eb61364189b71dd618d2b1cd3e6 Nanbeige/Nanbeige4.3-33B df919e1e2cf077a22204c78b6c826bf3db18bc08 1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f"
+	"gemma4 unsloth/gemma-4-31B-it-GGUF c1ac76e99d5513b141e8adde7288b85c3f9c32ec gemma-4-31B-it-Q4_K_M.gguf 15834176 08b5ec420fb399608adbababcc53a848b69f12f6d2498cbfb50724af030b1856 google/gemma-4-31B-it 842da3794eaa0b77d5f08bae87a17459d91ff475 cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
 )
 
 llama_url="https://github.com/ggml-org/llama.cpp.git"
@@ -109,7 +117,7 @@ fetch_header() {
 	fi
 	log "range-reading GGUF header ($bytes bytes)"
 	mkdir -p "$(dirname "$path")"
-	curl --fail --location --retry 3 --range "0-$((bytes - 1))" --output "$path.part" "$url"
+	curl --fail --location --retry 3 --range "0-$((bytes - 1))" --max-filesize "$bytes" --output "$path.part" "$url"
 	mv "$path.part" "$path"
 	verify "$path" "$want"
 }
@@ -121,6 +129,13 @@ vocab() {
 	local entry name sha repo rev file file_sha bytes bytes_sha hf tok_rev tok_sha
 	for entry in "${dense_models[@]}"; do
 		read -r name repo rev file file_sha bytes bytes_sha hf tok_rev tok_sha <<<"$entry"
+		fetch_header "https://huggingface.co/$repo/resolve/$rev/$file" \
+			"$dir/models/${file%.gguf}.header.gguf" "$bytes" "$bytes_sha"
+		fetch "https://huggingface.co/$hf/resolve/$tok_rev/tokenizer.json" \
+			"$dir/hf/$name/tokenizer.json" "$tok_sha"
+	done
+	for entry in "${tokenizer_models[@]}"; do
+		read -r name repo rev file bytes bytes_sha hf tok_rev tok_sha <<<"$entry"
 		fetch_header "https://huggingface.co/$repo/resolve/$rev/$file" \
 			"$dir/models/${file%.gguf}.header.gguf" "$bytes" "$bytes_sha"
 		fetch "https://huggingface.co/$hf/resolve/$tok_rev/tokenizer.json" \

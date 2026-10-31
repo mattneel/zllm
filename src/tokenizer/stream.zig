@@ -12,16 +12,28 @@ pub const Stream = struct {
     pending: std.ArrayList(u8) = .empty,
     stops: []const []const u8,
     stopped: bool = false,
+    /// HF ByteFallback validates an entire consecutive byte-token run.
+    fallback: std.ArrayList(u8) = .empty,
+    decoded_started: bool = false,
+    strip_initial: bool = false,
 
     pub fn deinit(s: *Stream, gpa: Allocator) void {
         s.pending.deinit(gpa);
+        s.fallback.deinit(gpa);
         s.* = undefined;
     }
 
     /// Decodes `id` and appends the text it releases to `out`. Returns
     /// whether a stop string was completed (nothing more is released).
     pub fn push(s: *Stream, gpa: Allocator, tok: *const Tokenizer, id: u32, out: *std.ArrayList(u8)) Tokenizer.DecodeError!bool {
-        try tok.decode(gpa, &.{id}, &s.pending);
+        s.strip_initial = tok.stripsInitialSpace();
+        if (try tok.fallbackByte(id)) |byte| {
+            try s.fallback.append(gpa, byte);
+            return false;
+        }
+        try s.finishFallback(gpa);
+        try tok.decodeRaw(gpa, &.{id}, &s.pending);
+        s.stripInitial();
         return s.release(gpa, out);
     }
 
@@ -33,8 +45,34 @@ pub const Stream = struct {
 
     /// Releases everything still held (the generation ended without a stop).
     pub fn flush(s: *Stream, gpa: Allocator, out: *std.ArrayList(u8)) Allocator.Error!void {
+        if (!s.stopped) {
+            try s.finishFallback(gpa);
+            _ = try s.release(gpa, out);
+        }
         if (!s.stopped) try out.appendSlice(gpa, s.pending.items);
         s.pending.clearRetainingCapacity();
+    }
+
+    fn finishFallback(s: *Stream, gpa: Allocator) Allocator.Error!void {
+        if (s.fallback.items.len == 0) return;
+        if (std.unicode.utf8ValidateSlice(s.fallback.items)) {
+            try s.pending.appendSlice(gpa, s.fallback.items);
+        } else {
+            const needed = std.math.mul(usize, s.fallback.items.len, 3) catch return error.OutOfMemory;
+            try s.pending.ensureUnusedCapacity(gpa, needed);
+            for (s.fallback.items) |_| s.pending.appendSliceAssumeCapacity("�");
+        }
+        s.fallback.clearRetainingCapacity();
+        s.stripInitial();
+    }
+
+    fn stripInitial(s: *Stream) void {
+        if (s.decoded_started or s.pending.items.len == 0) return;
+        s.decoded_started = true;
+        if (s.strip_initial and s.pending.items[0] == ' ') {
+            std.mem.copyForwards(u8, s.pending.items[0 .. s.pending.items.len - 1], s.pending.items[1..]);
+            s.pending.items.len -= 1;
+        }
     }
 
     fn release(s: *Stream, gpa: Allocator, out: *std.ArrayList(u8)) Allocator.Error!bool {

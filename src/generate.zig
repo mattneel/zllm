@@ -385,7 +385,7 @@ pub const Runtime = struct {
     /// on the user's prompt. Tokenization is model-specific.
     pub fn qualityPrompt(rt: *const Runtime, arena: Allocator) ![]const u32 {
         var ids: std.ArrayList(u32) = .empty;
-        try rt.tok.encode(arena, "The capital of France is Paris. Two plus two equals four. " ++
+        try rt.tok.encodePrompt(arena, "The capital of France is Paris. Two plus two equals four. " ++
             "Explain why a binary search requires a sorted array. " ++
             "Write a Python function that returns the sum of the even integers " ++
             "in a list, and describe its time complexity. " ++
@@ -617,8 +617,7 @@ pub fn generate(rt: *Runtime, prompt: []const u8, o: Options, out: *Io.Writer) !
     const gpa = rt.gpa;
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(gpa);
-    if (rt.tok.add_bos) if (rt.tok.bos) |b| try ids.append(gpa, b);
-    try rt.tok.encode(gpa, prompt, &ids);
+    try rt.tok.encodePrompt(gpa, prompt, &ids);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
     try out.writeAll(prompt);
@@ -686,7 +685,7 @@ pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void
             try prompt.appendSlice(gpa, text.items);
         }
         ids.clearRetainingCapacity();
-        try rt.tok.encode(gpa, prompt.items, &ids);
+        try rt.tok.encodePrompt(gpa, prompt.items, &ids);
         if (ids.items.len >= o.context) return error.ConversationTooLong;
 
         reply.clearRetainingCapacity();

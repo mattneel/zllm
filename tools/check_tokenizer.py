@@ -3,8 +3,8 @@
 For every line of tools/corpus/tokenizer.jsonl, the token ids from zllm (vocab
 read from GGUF) must equal the ids from the pinned Hugging Face tokenizer.json,
 and decoding those ids must give the same text as Hugging Face's decoder.
-Runs for the 0.8B and every dense model (one per pre-tokenizer), on the
-range-read GGUF header (what CI fetches) and on the full GGUF when present.
+Runs for the 0.8B, every dense model, and the tokenizer-only Nanbeige and
+Gemma4 fixtures, on their range-read headers and full GGUFs when present.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 
 from tokenizers import Tokenizer
 
-from common import DENSE_MODELS, Failures, fixture_paths, parse_args
+from common import TOKENIZER_MODELS, Failures, fixture_paths, parse_args
 
 CORPUS = Path(__file__).parent / "corpus" / "tokenizer.jsonl"
 
@@ -28,7 +28,7 @@ def main() -> int:
     texts = [json.loads(line)["text"] for line in CORPUS.read_text(encoding="utf-8").split("\n") if line]
     fail = Failures()
     tokenizers = [(paths.hf_tokenizer, paths.gguf_header, paths.gguf)]
-    tokenizers += [(m.hf_tokenizer(paths.root), m.gguf_header(paths.root), m.gguf(paths.root)) for m in DENSE_MODELS]
+    tokenizers += [(m.hf_tokenizer(paths.root), m.gguf_header(paths.root), m.gguf(paths.root)) for m in TOKENIZER_MODELS]
     for hf_path, header, full in tokenizers:
         if not header.is_file() or not hf_path.is_file():
             raise SystemExit(f"missing {header} or {hf_path}; run scripts/fixtures.sh vocab")
