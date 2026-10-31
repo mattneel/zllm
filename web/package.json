@@ -9,7 +9,7 @@
     "fix": "biome check --write .",
     "test": "bun test src/dev",
     "build:book": "bun build src/book/mermaid.ts --target browser --format iife --minify --outfile ../docs/theme/mermaid-init.js",
-    "build:demo": "bun build src/demo/main.ts --target browser --format esm --minify --sourcemap=linked --outdir ../docs/book/demo && cp demo/index.html ../zig-out/web/zllm.wasm ../docs/book/demo/",
+    "build:demo": "bun build src/demo/main.ts --target browser --format esm --minify --sourcemap=linked --outdir ../docs/book/demo && cp demo/index.html demo/og.png ../zig-out/web/zllm.wasm ../docs/book/demo/",
     "dev": "bun src/dev/serve.ts",
     "build": "bun build src/zllm/index.ts --target browser --format esm --minify --sourcemap=linked --outdir dist --entry-naming zllm.[ext] && cp ../zig-out/web/zllm.wasm dist/"
   },
