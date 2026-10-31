@@ -8,6 +8,8 @@
 #   scripts/fixtures.sh llama    llama.cpp at the pinned commit, built for CPU
 #   scripts/fixtures.sh dawn     Dawn (webgpu.h) as libwebgpu_dawn.so; under WSL with
 #                                Visual Studio, also webgpu_dawn.dll staged with DXC
+#   scripts/fixtures.sh velocity the Velocity SDKs (Agility SDK, DirectStorage, DXC); under
+#                                WSL, their runtime DLLs staged next to the D3D12 host
 #
 # Every download is checked against a SHA-256 pinned here; llama.cpp is checked
 # out by commit. docs/src/validation.md mirrors these pins.
@@ -242,6 +244,54 @@ dawn() {
 	log "D3D12 host staged in $win_stage"
 }
 
+# Velocity (zllm -Dvelocity): the D3D12 Agility SDK preview (LinAlg, Shader
+# Model 6.10), DirectStorage, and the preview DXC that compiles its HLSL.
+agility_ver="1.722.0-preview"
+agility_sha256="bf9915dbb39f7c97018d42b36e65469f11c864b805e3bc9a773eba364208cdc3"
+dstorage_ver="1.3.0"
+dstorage_sha256="8ab6c1082537565388b79050d94fdd7f5f437cd0f1d909e7b19f786042b97177"
+dxc_ver="1.10.2605.37"
+dxc_zip="dxc_2026_08_11.zip"
+dxc_sha256="18da85ccac4d1736209bad960f0a124928a5c5a6046882e331c605d66744a889"
+
+unzip_once() { # archive destination
+	if [[ ! -d "$2" ]]; then
+		mkdir -p "$2.tmp"
+		(cd "$2.tmp" && unzip -q "$1")
+		mv "$2.tmp" "$2"
+	fi
+}
+
+velocity() {
+	local v="$dir/velocity"
+	local nuget="https://api.nuget.org/v3-flatcontainer"
+	fetch "$nuget/microsoft.direct3d.d3d12/$agility_ver/microsoft.direct3d.d3d12.$agility_ver.nupkg" \
+		"$v/agility.zip" "$agility_sha256"
+	fetch "$nuget/microsoft.direct3d.directstorage/$dstorage_ver/microsoft.direct3d.directstorage.$dstorage_ver.nupkg" \
+		"$v/directstorage.zip" "$dstorage_sha256"
+	fetch "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v$dxc_ver/$dxc_zip" \
+		"$v/dxc.zip" "$dxc_sha256"
+	unzip_once "$v/agility.zip" "$v/agility"
+	unzip_once "$v/directstorage.zip" "$v/directstorage"
+	unzip_once "$v/dxc.zip" "$v/dxc"
+	chmod +x "$v/dxc/bin/x64/dxc.exe"
+	log "Velocity SDKs in $v"
+
+	if [[ ! -f "$dir/dawn/win_stage" ]]; then
+		log "no D3D12 host stage (scripts/fixtures.sh dawn); not staging Velocity's DLLs"
+		return 0
+	fi
+	local stage
+	stage="$(wslpath -u "$(cat "$dir/dawn/win_stage")")"
+	mkdir -p "$stage/D3D12"
+	cp "$v/agility/build/native/bin/x64/D3D12Core.dll" "$v/agility/build/native/bin/x64/d3d12SDKLayers.dll" "$stage/D3D12/"
+	cp "$v/directstorage/native/bin/x64/dstorage.dll" "$v/directstorage/native/bin/x64/dstoragecore.dll" "$stage/"
+	# Velocity's HLSL compiler, apart from the DXC Dawn uses.
+	mkdir -p "$stage/velocity"
+	cp "$v/dxc/bin/x64/dxcompiler.dll" "$v/dxc/bin/x64/dxil.dll" "$stage/velocity/"
+	log "Velocity runtime staged in $(cat "$dir/dawn/win_stage")"
+}
+
 case "${1:-all}" in
 vocab) vocab ;;
 model) model ;;
@@ -249,15 +299,17 @@ dense) dense ;;
 model27b) model27b ;;
 llama) llama ;;
 dawn) dawn ;;
+velocity) velocity ;;
 all)
 	vocab
 	model
 	dense
 	llama
 	dawn
+	velocity
 	;;
 *)
-	log "usage: $0 [all|vocab|model|dense|model27b|llama|dawn]"
+	log "usage: $0 [all|vocab|model|dense|model27b|llama|dawn|velocity]"
 	exit 2
 	;;
 esac

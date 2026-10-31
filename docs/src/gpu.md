@@ -62,7 +62,7 @@ boundary once per batch rather than once per dispatch.
 |---|---|
 | `create_buffer` | id, size, usage (WebGPU `GPUBufferUsage` bits) |
 | `write_buffer` | buffer, offset, data, length |
-| `create_kernel` | id, kernel, variant, artifact (the backend's implementation: WGSL with entry point `main` on WebGPU, DXIL on Velocity) |
+| `create_kernel` | id, kernel, variant, artifact (the backend's implementation: WGSL with entry point `main` on WebGPU, HLSL on Velocity; empty where the backend lacks the kernel) |
 | `create_bind_group` | id, pipeline, group, then (binding, buffer, offset, size)… |
 | `dispatch` | pipeline, workgroups x/y/z, bind groups |
 | `copy_buffer` | src, offset, dst, offset, size |

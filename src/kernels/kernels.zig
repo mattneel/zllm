@@ -18,6 +18,7 @@ const ops = @import("../ref/ops.zig");
 const gguf = @import("../gguf/gguf.zig");
 const tmpl = @import("../tmpl/tmpl.zig");
 const Backend = @import("../backend/backend.zig").Backend;
+const velocity_kernels = @import("../velocity/kernels.zig");
 
 pub const Kernel = enum {
     rmsnorm,
@@ -616,6 +617,10 @@ pub const Set = struct {
     pipelines: std.EnumArray(Kernel, cmd.Pipeline),
     /// The backend the pipelines are built for.
     backend: Backend,
+    /// Kernels the backend has no implementation of yet: their pipelines
+    /// exist (with an empty artifact) but dispatching one fails the batch
+    /// with error.UnsupportedKernel. Empty on WebGPU.
+    missing: std.EnumSet(Kernel) = .empty,
     variants: [max_variants]Variant = undefined,
     n_variants: usize = 0,
 
@@ -624,11 +629,7 @@ pub const Set = struct {
     /// prologue.
     const max_variants = 2 * 5 * MatvecVariant.candidates.len;
 
-    pub const Error = Allocator.Error || tmpl.Error || error{
-        /// The backend has no implementation of a kernel yet (the
-        /// capability matrix lists it as planned).
-        UnsupportedKernel,
-    };
+    pub const Error = Allocator.Error || tmpl.Error;
 
     /// Records pipeline creation for every kernel on `backend`. Artifacts
     /// rendered from templates live in `arena`, which must outlive the
@@ -636,9 +637,25 @@ pub const Set = struct {
     pub fn create(gpa: Allocator, arena: Allocator, rec: *cmd.Recorder, backend: Backend) Error!Set {
         var set: Set = .{ .pipelines = undefined, .backend = backend };
         for (std.enums.values(Kernel)) |k| {
-            set.pipelines.set(k, try rec.createKernel(gpa, @backingInt(k), 0, try artifact(backend, arena, k, .{})));
+            const code = artifact(backend, arena, k, .{}) catch |err| switch (err) {
+                error.UnsupportedKernel => blk: {
+                    set.missing.insert(k);
+                    break :blk "";
+                },
+                else => |e| return e,
+            };
+            set.pipelines.set(k, try rec.createKernel(gpa, @backingInt(k), 0, code));
         }
         return set;
+    }
+
+    /// Fails, logging each missing kernel, unless the backend implements
+    /// every kernel: models load only on a complete backend.
+    pub fn requireAll(s: *const Set) error{UnsupportedKernel}!void {
+        if (s.missing.count() == 0) return;
+        var it = s.missing.iterator();
+        while (it.next()) |k| std.log.err("{t}: kernel {t} has no implementation", .{ s.backend, k });
+        return error.UnsupportedKernel;
     }
 
     /// The pipeline of decode multiply `k` with variant `v`, recording its
@@ -647,7 +664,11 @@ pub const Set = struct {
         if (std.meta.eql(v, MatvecVariant{})) return s.pipelines.get(k);
         for (s.variants[0..s.n_variants]) |x| if (x.kernel == k and std.meta.eql(x.v, v)) return x.pipeline;
         std.debug.assert(s.n_variants < max_variants);
-        const pipeline = try rec.createKernel(gpa, @backingInt(k), v.id(), try artifact(s.backend, arena, k, v));
+        const code = artifact(s.backend, arena, k, v) catch |err| switch (err) {
+            error.UnsupportedKernel => "",
+            else => |e| return e,
+        };
+        const pipeline = try rec.createKernel(gpa, @backingInt(k), v.id(), code);
         s.variants[s.n_variants] = .{ .kernel = k, .v = v, .pipeline = pipeline };
         s.n_variants += 1;
         return pipeline;
@@ -657,11 +678,10 @@ pub const Set = struct {
 /// Kernel `k`'s implementation on `backend`, in variant `v` (templated
 /// kernels only; the default otherwise), rendered into `arena` where it is
 /// a template.
-fn artifact(backend: Backend, arena: Allocator, k: Kernel, v: MatvecVariant) Set.Error![]const u8 {
+fn artifact(backend: Backend, arena: Allocator, k: Kernel, v: MatvecVariant) (Set.Error || error{UnsupportedKernel})![]const u8 {
     return switch (backend) {
         .webgpu => if (k.isTemplate()) v.render(arena, k) else k.source(),
-        // Velocity's HLSL kernels (port of gyro-dx's) are not registered yet.
-        .velocity => error.UnsupportedKernel,
+        .velocity => if (k.isTemplate()) error.UnsupportedKernel else velocity_kernels.source(k) orelse error.UnsupportedKernel,
     };
 }
 

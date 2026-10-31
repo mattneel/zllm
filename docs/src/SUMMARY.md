@@ -8,6 +8,7 @@
 - [Dense transformers](dense.md)
 - [Validation](validation.md)
 - [GPU backend](gpu.md)
+- [Velocity (native D3D12)](velocity.md)
 - [Generation](generation.md)
 - [Browser](browser.md)
 - [Contributing](contributing.md)

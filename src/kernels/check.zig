@@ -7,7 +7,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cmd = @import("../gpu/cmd.zig");
-const Host = @import("../gpu/host.zig").Host;
+const platform = @import("../gpu/host.zig");
+const Host = platform.Host;
 const kernels = @import("kernels.zig");
 const sampler = @import("../sampler/sampler.zig");
 const P = kernels.params;
@@ -26,13 +27,13 @@ pub const Result = struct {
 
 /// Runs every check, reporting one line per check to `out`. Returns whether
 /// all passed.
-pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
+pub fn run(gpa: Allocator, device: platform.Device, host: *Host, out: *std.Io.Writer) !bool {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var prng: std.Random.DefaultPrng = .init(0x5eed);
-    var ctx: Ctx = .{ .gpa = gpa, .host = host, .rec = .{}, .arena = arena_state.allocator(), .rand = prng.random() };
+    var ctx: Ctx = .{ .gpa = gpa, .device = device, .host = host, .rec = .{}, .arena = arena_state.allocator(), .rand = prng.random() };
     defer ctx.rec.deinit(gpa);
-    ctx.set = try kernels.Set.create(gpa, ctx.arena, &ctx.rec, .webgpu);
+    ctx.set = try kernels.Set.create(gpa, ctx.arena, &ctx.rec, device.backend());
     try ctx.flush();
 
     var ok = true;
@@ -52,23 +53,37 @@ pub fn run(gpa: Allocator, host: *Host, out: *std.Io.Writer) !bool {
         Quant(.q6_k).matmul,   Quant(.q6_k).embed,   checkQuantTiles,     checkQuantSiluPair,     checkQuantAct,
         checkQuantizeQ8K,      checkQuantizeQ80,     checkQuantizeNorm,   checkQuantizeSilu,
     }) |f| {
-        const r = try f(&ctx);
-        const pass = r.err <= r.tolerance;
-        ok = ok and pass;
-        const verdict = if (pass) "PASS" else "FAIL";
-        if (r.trials > 0) {
-            try out.print("{s} {s:<30} max draw deviation {e:.2} (tolerance {e:.0}); {d}/{d} draws exact\n", .{ verdict, r.name, r.err, r.tolerance, r.exact, r.trials });
-        } else {
-            try out.print("{s} {s:<30} max rel err {e:.2} (tolerance {e:.0})\n", .{ verdict, r.name, r.err, r.tolerance });
-        }
+        ok = try report(&ctx, f, out) and ok;
         _ = arena_state.reset(.retain_capacity);
     }
     return ok;
 }
 
+/// Runs one check and prints its line. A check using a kernel the backend
+/// lacks (kernels.Set.missing) fails as MISSING.
+fn report(ctx: *Ctx, f: anytype, out: *std.Io.Writer) !bool {
+    const r = f(ctx) catch |err| switch (err) {
+        error.UnsupportedKernel => {
+            ctx.rec.clear();
+            try out.print("MISSING {s}\n", .{ctx.device.errorMessage()});
+            return false;
+        },
+        else => |e| return e,
+    };
+    const pass = r.err <= r.tolerance;
+    const verdict = if (pass) "PASS" else "FAIL";
+    if (r.trials > 0) {
+        try out.print("{s} {s:<30} max draw deviation {e:.2} (tolerance {e:.0}); {d}/{d} draws exact\n", .{ verdict, r.name, r.err, r.tolerance, r.exact, r.trials });
+    } else {
+        try out.print("{s} {s:<30} max rel err {e:.2} (tolerance {e:.0})\n", .{ verdict, r.name, r.err, r.tolerance });
+    }
+    return pass;
+}
+
 const Ctx = struct {
     gpa: Allocator,
     arena: Allocator = undefined,
+    device: platform.Device,
     host: *Host,
     rec: cmd.Recorder,
     set: kernels.Set = undefined,
@@ -85,7 +100,7 @@ const Ctx = struct {
         c.token += 1;
         try c.rec.submit(c.gpa, c.token);
         c.host.execute(c.rec.batch(), &completions) catch |err| {
-            if (err == error.GpuError or err == error.DeviceLost) std.log.err("{s}", .{c.host.d.errorMessage()});
+            if (err == error.GpuError or err == error.DeviceLost) std.log.err("{s}", .{c.device.errorMessage()});
             return err;
         };
         c.rec.clear();

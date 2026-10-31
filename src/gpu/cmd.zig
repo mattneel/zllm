@@ -27,8 +27,10 @@ pub const Op = enum(u8) {
     /// id, kernel: u32, variant: u32, artifact: ptr, len: u32 — a compute
     /// pipeline for kernel `kernel` (kernels.Kernel) in variant `variant`
     /// (0: the default), from the backend's artifact for it: WGSL with one
-    /// entry point named "main" on WebGPU, DXIL on Velocity. The ids say
-    /// which kernel a pipeline is (profiles, capability reports).
+    /// entry point named "main" on WebGPU, HLSL on Velocity. The ids say
+    /// which kernel a pipeline is (profiles, capability reports). An empty
+    /// artifact marks a kernel the backend does not implement: dispatching
+    /// its pipeline fails the batch with error.UnsupportedKernel.
     create_kernel = 3,
     /// id, pipeline, group, count, then count × (binding, buffer, offset: u64, size: u64)
     create_bind_group = 5,

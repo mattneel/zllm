@@ -147,11 +147,13 @@ pub const Runtime = struct {
     gpa: Allocator,
     io: Io,
     /// What a rebuild after a lost device needs (recover).
-    dawn_lib: []const u8,
+    gpu: zllm.gpu.Open,
     file: zllm.gguf.File,
     bytes: []const u8,
+    /// The model file's path (Velocity reads weights with DirectStorage).
+    path: []const u8,
     options: Options,
-    device: *zllm.gpu.dawn.Device,
+    device: zllm.gpu.Device,
     host: *zllm.gpu.Host,
     arena_state: std.heap.ArenaAllocator,
     tok: zllm.tokenizer.Tokenizer,
@@ -194,18 +196,19 @@ pub const Runtime = struct {
         calibration: u64 = 0,
     };
 
-    /// Opens Dawn from `dawn_lib` and loads the model from `file` (its
-    /// header) and `bytes` (the mapped file), which must outlive the
-    /// runtime.
-    pub fn create(gpa: Allocator, io: Io, dawn_lib: []const u8, file: zllm.gguf.File, bytes: []const u8, o: Options) !*Runtime {
+    /// Opens the GPU `gpu` names and loads the model from `file` (its
+    /// header), `bytes` (the mapped file) and `path` (the file's path), which
+    /// must outlive the runtime.
+    pub fn create(gpa: Allocator, io: Io, gpu: zllm.gpu.Open, file: zllm.gguf.File, bytes: []const u8, path: []const u8, o: Options) !*Runtime {
         const rt = try gpa.create(Runtime);
         errdefer gpa.destroy(rt);
         rt.* = .{
             .gpa = gpa,
             .io = io,
-            .dawn_lib = dawn_lib,
+            .gpu = gpu,
             .file = file,
             .bytes = bytes,
+            .path = path,
             .options = o,
             .device = undefined,
             .host = undefined,
@@ -234,15 +237,19 @@ pub const Runtime = struct {
         return rt;
     }
 
-    /// Opens a Dawn device and a host on it.
+    /// Opens the device and a host on it.
     fn open(rt: *Runtime) !void {
-        rt.device = zllm.gpu.dawn.Device.init(rt.gpa, rt.dawn_lib) catch |err| {
-            std.log.err("cannot open Dawn ({s}): {t}", .{ rt.dawn_lib, err });
+        rt.device = zllm.gpu.Device.open(rt.gpa, rt.gpu) catch |err| {
+            switch (rt.gpu.backend) {
+                .webgpu => std.log.err("cannot open Dawn ({s}): {t}", .{ rt.gpu.dawn_lib, err }),
+                .velocity => std.log.err("cannot open Velocity (adapter {d}): {t}", .{ rt.gpu.adapter, err }),
+            }
             return err;
         };
         errdefer rt.device.deinit(rt.gpa);
         rt.host = try rt.gpa.create(zllm.gpu.Host);
-        rt.host.* = .init(rt.gpa, rt.device);
+        errdefer rt.gpa.destroy(rt.host);
+        rt.host.* = try .init(rt.gpa, rt.device);
     }
 
     fn close(rt: *Runtime) void {
@@ -260,28 +267,31 @@ pub const Runtime = struct {
         const file = rt.file;
         const bytes = rt.bytes;
         const o = rt.options;
-        const d = rt.host.d;
-        const limits: plan_common.Limits = .{
-            .max_binding = d.limits.maxStorageBufferBindingSize,
-            .offset_align = d.limits.minStorageBufferOffsetAlignment,
+        const backend = rt.device.backend();
+        const dl = rt.device.limits();
+        const limits: plan_common.Limits = .{ .max_binding = dl.max_binding, .offset_align = dl.offset_align };
+        const info = try rt.device.adapter(arena);
+        rt.adapter = switch (backend) {
+            .webgpu => try std.fmt.allocPrint(arena, "{s} ({s})", .{ info.device, info.api }),
+            .velocity => try std.fmt.allocPrint(arena, "{s} (velocity)", .{info.device}),
         };
-        var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
-        const info = d.info(&raw);
-        rt.adapter = try std.fmt.allocPrint(arena, "{s} ({s})", .{ info.device, info.backend });
         // What the plan cache's tuning is valid for (plan.cache.key).
         const plan_key = plan.cache.key(.{
-            .adapter = &.{ info.vendor, info.architecture, info.device, info.description, info.backend },
-            .runtime = "dawn",
+            .adapter = &.{ info.vendor, info.architecture, info.device, info.description, info.api },
+            .runtime = switch (backend) {
+                .webgpu => "dawn",
+                .velocity => "velocity",
+            },
             .limits = &.{ limits.max_binding, limits.offset_align },
             .model_header = bytes[0..@intCast(file.data_offset)],
         });
-        d.freeInfo(raw);
         var rec: zllm.gpu.cmd.Recorder = .{};
         defer rec.deinit(gpa);
         var t = Io.Timestamp.now(io, .awake);
-        rt.set = try .create(gpa, arena, &rec, .webgpu);
+        rt.set = try .create(gpa, arena, &rec, backend);
+        try rt.set.requireAll();
         try rt.executeTimed(&rec, &t, &rt.load.pipelines);
-        rt.host.file = bytes;
+        try rt.host.setFile(gpa, bytes, rt.path);
         rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
         try rt.executeTimed(&rec, &t, &rt.load.weights);
         const mtp = rt.model.canSpeculate(limits);
@@ -367,7 +377,7 @@ pub const Runtime = struct {
     pub fn execute(rt: *Runtime, words: []const u32) !void {
         rt.completions.clearRetainingCapacity();
         rt.host.execute(words, &rt.completions) catch |err| {
-            if (err == error.GpuError or err == error.DeviceLost) std.log.err("{s}", .{rt.host.d.errorMessage()});
+            if (err == error.GpuError or err == error.DeviceLost) std.log.err("{s}", .{rt.device.errorMessage()});
             return err;
         };
     }

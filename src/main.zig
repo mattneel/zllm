@@ -60,6 +60,9 @@ const usage =
     \\environment:
     \\  ZLLM_THREADS   worker threads for `forward` (default: one per physical core)
     \\  ZLLM_DAWN      path to the Dawn library (default: libwebgpu_dawn.so / webgpu_dawn.dll)
+    \\  ZLLM_BACKEND   GPU backend: webgpu (Dawn; default) or velocity (native D3D12; builds
+    \\                 with -Dvelocity)
+    \\  ZLLM_ADAPTER   Velocity's adapter index (default 0: the high-performance one)
     \\
 ;
 
@@ -128,8 +131,7 @@ pub fn main(init: std.process.Init) !void {
         var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
         defer file.deinit(gpa);
         const t0 = Io.Timestamp.now(io, .awake);
-        const dawn_lib = init.environ_map.get("ZLLM_DAWN") orelse zllm.gpu.dawn.default_library;
-        const rt = try gen.Runtime.create(gpa, io, dawn_lib, file, mapped.bytes, opts);
+        const rt = try gen.Runtime.create(gpa, io, try gpuOpen(init.environ_map), file, mapped.bytes, args[2], opts);
         defer rt.destroy();
         const ld = rt.load;
         std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, tuning {d}, program {d}, calibration {d}); context {d}, {t} KV", .{
@@ -439,25 +441,40 @@ const FileBytes = struct {
     }
 };
 
-fn openDawn(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) !*zllm.gpu.dawn.Device {
-    const lib = env.get("ZLLM_DAWN") orelse zllm.gpu.dawn.default_library;
-    return zllm.gpu.dawn.Device.init(gpa, lib) catch |err| {
-        std.log.err("cannot open Dawn ({s}): {t}", .{ lib, err });
+/// The GPU the environment selects (ZLLM_BACKEND, ZLLM_DAWN, ZLLM_ADAPTER).
+fn gpuOpen(env: *const std.process.Environ.Map) !zllm.gpu.Open {
+    var o: zllm.gpu.Open = .{};
+    if (env.get("ZLLM_BACKEND")) |b| o.backend = std.meta.stringToEnum(zllm.gpu.Backend, b) orelse {
+        std.log.err("ZLLM_BACKEND={s}: not a backend (webgpu, velocity)", .{b});
+        return error.InvalidUsage;
+    };
+    if (env.get("ZLLM_DAWN")) |lib| o.dawn_lib = lib;
+    if (env.get("ZLLM_ADAPTER")) |a| o.adapter = std.fmt.parseInt(u32, a, 10) catch return error.InvalidUsage;
+    return o;
+}
+
+fn openGpu(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) !zllm.gpu.Device {
+    const o = try gpuOpen(env);
+    return zllm.gpu.Device.open(gpa, o) catch |err| {
+        switch (o.backend) {
+            .webgpu => std.log.err("cannot open Dawn ({s}): {t}", .{ o.dawn_lib, err }),
+            .velocity => std.log.err("cannot open Velocity (adapter {d}): {t}", .{ o.adapter, err }),
+        }
         return err;
     };
 }
 
 fn gpuCheck(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *Io.Writer) !void {
-    const d = try openDawn(gpa, env);
+    const d = try openGpu(gpa, env);
     defer d.deinit(gpa);
-    var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
-    const info = d.info(&raw);
-    try out.print("{s} ({s})\n", .{ info.device, info.backend });
-    d.freeInfo(raw);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const info = try d.adapter(arena_state.allocator());
+    try out.print("{s} ({s}, {t})\n", .{ info.device, info.api, d.backend() });
 
-    var host = zllm.gpu.Host.init(gpa, d);
+    var host = try zllm.gpu.Host.init(gpa, d);
     defer host.deinit();
-    const ok = try zllm.kernel_check.run(gpa, &host, out);
+    const ok = try zllm.kernel_check.run(gpa, d, &host, out);
     try out.flush();
     if (!ok) return error.KernelCheckFailed;
 }
@@ -508,18 +525,15 @@ const ForwardOptions = struct {
 /// file. Writes the records the reference names alike:
 /// each layer's streams (`l_last-<layer>`) and chosen experts
 /// (`ffn_moe_topk-<layer>`), and every position's logits.
-fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file: zllm.gguf.File, bytes: []const u8, tokens: []const u32, out_path: []const u8, opts: ForwardOptions) !void {
+fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, d: zllm.gpu.Device, host: *zllm.gpu.Host, file: zllm.gguf.File, bytes: []const u8, path: []const u8, tokens: []const u32, out_path: []const u8, opts: ForwardOptions) !void {
     const plan = zllm.plan.qwen4exp;
     if (opts.path == .prefill or opts.mtp or opts.tune) {
         std.log.err("gpu-forward runs Qwen4Exp with the decode kernels only, without --mtp or --tune", .{});
         return error.InvalidUsage;
     }
     const t_start = Io.Timestamp.now(io, .awake);
-    const d = host.d;
-    const limits: zllm.plan.common.Limits = .{
-        .max_binding = d.limits.maxStorageBufferBindingSize,
-        .offset_align = d.limits.minStorageBufferOffsetAlignment,
-    };
+    const dl = d.limits();
+    const limits: zllm.plan.common.Limits = .{ .max_binding = dl.max_binding, .offset_align = dl.offset_align };
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -531,13 +545,14 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file
     const n: u32 = @intCast(tokens.len);
     if (n > plan.max_context) return error.ContextTooLong;
     const chunk: u32 = @min(opts.chunk, zllm.kernels.decode_max_rows, n);
-    var set = try zllm.kernels.Set.create(gpa, arena, &rec, .webgpu);
-    host.file = bytes;
+    var set = try zllm.kernels.Set.create(gpa, arena, &rec, d.backend());
+    try set.requireAll();
+    try host.setFile(gpa, bytes, path);
     const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
     var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{ .context = @max(n, 1), .kv = opts.kv, .fuse = !opts.no_fuse }, limits);
     try program.recordReset(gpa, &rec);
     try rec.submit(gpa, 0);
-    try runBatch(host, &rec, &completions);
+    try runBatch(d, host, &rec, &completions);
     const t_loaded = Io.Timestamp.now(io, .awake);
 
     const vocab: usize = model.hp.vocab;
@@ -571,7 +586,7 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file
             .readback = &readback,
         });
         try rec.submit(gpa, steps + 1);
-        try runBatch(host, &rec, &completions);
+        try runBatch(d, host, &rec, &completions);
         pos0 += m;
     }
     const t_done = Io.Timestamp.now(io, .awake);
@@ -609,18 +624,16 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     const tokens = try readTokens(gpa, io, tokens_path);
     defer gpa.free(tokens);
 
-    const d = try openDawn(gpa, env);
+    const d = try openGpu(gpa, env);
     defer d.deinit(gpa);
-    var host = zllm.gpu.Host.init(gpa, d);
+    var host = try zllm.gpu.Host.init(gpa, d);
     defer host.deinit();
     const arch = file.get("general.architecture") orelse return error.MissingMetadata;
     if (arch == .string and std.mem.eql(u8, arch.string, zllm.graph.qwen4exp.arch)) {
-        return gpuForwardQwen4exp(gpa, io, &host, file, mapped.bytes, tokens, out_path, opts);
+        return gpuForwardQwen4exp(gpa, io, d, &host, file, mapped.bytes, model_path, tokens, out_path, opts);
     }
-    const limits: plan_common.Limits = .{
-        .max_binding = d.limits.maxStorageBufferBindingSize,
-        .offset_align = d.limits.minStorageBufferOffsetAlignment,
-    };
+    const dl = d.limits();
+    const limits: plan_common.Limits = .{ .max_binding = dl.max_binding, .offset_align = dl.offset_align };
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -632,19 +645,20 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
 
     const n: u32 = @intCast(tokens.len);
     const chunk = @min(opts.chunk, n);
-    var set = try zllm.kernels.Set.create(gpa, arena, &rec, .webgpu);
-    host.file = mapped.bytes;
+    var set = try zllm.kernels.Set.create(gpa, arena, &rec, d.backend());
+    try set.requireAll();
+    try host.setFile(gpa, mapped.bytes, model_path);
     const model = try plan.Model.uploadAny(arena, gpa, &rec, &set, file, limits);
     // The upload runs before the program is built, which may read what it
     // read back (RoPE frequency factors).
     try rec.submit(gpa, 0);
-    try runBatch(&host, &rec, &completions);
+    try runBatch(d, &host, &rec, &completions);
     var tuning: plan_common.Tuning = .{};
     if (opts.tune) {
         var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &set, &model, .{}, @min(chunk, 2));
         while (try sweep.next()) |_| {
             const t0 = Io.Timestamp.now(io, .awake);
-            try runBatch(&host, &rec, &completions);
+            try runBatch(d, &host, &rec, &completions);
             try sweep.done(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()));
         }
         tuning = sweep.tuning();
@@ -661,7 +675,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     }, limits);
     try program.recordReset(gpa, &rec);
     try rec.submit(gpa, 0);
-    try runBatch(&host, &rec, &completions);
+    try runBatch(d, &host, &rec, &completions);
     const t_loaded = Io.Timestamp.now(io, .awake);
 
     const hp = model.hp;
@@ -699,7 +713,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
             .logits = mtp_logits[@as(usize, pos0) * hp.vocab ..][0 .. @as(usize, rows) * hp.vocab],
         });
         try rec.submit(gpa, steps + 1);
-        try runBatch(&host, &rec, &completions);
+        try runBatch(d, &host, &rec, &completions);
         pos0 += m;
     }
     const t_done = Io.Timestamp.now(io, .awake);
@@ -727,39 +741,58 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     try fw.interface.flush();
 }
 
-fn runBatch(host: *zllm.gpu.Host, rec: *zllm.gpu.cmd.Recorder, completions: *std.ArrayList(zllm.gpu.cmd.Completion)) !void {
+fn runBatch(d: zllm.gpu.Device, host: *zllm.gpu.Host, rec: *zllm.gpu.cmd.Recorder, completions: *std.ArrayList(zllm.gpu.cmd.Completion)) !void {
     host.execute(rec.batch(), completions) catch |err| {
-        if (err == error.GpuError or err == error.DeviceLost) std.log.err("{s}", .{host.d.errorMessage()});
+        if (err == error.GpuError or err == error.DeviceLost) std.log.err("{s}", .{d.errorMessage()});
         return err;
     };
     rec.clear();
 }
 
 fn gpuInfo(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, out: *Io.Writer) !void {
-    const d = try openDawn(gpa, env);
+    const d = try openGpu(gpa, env);
     defer d.deinit(gpa);
-    var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
-    const info = d.info(&raw);
-    defer d.freeInfo(raw);
-
     var s: std.json.Stringify = .{ .writer = out, .options = .{ .whitespace = .indent_1 } };
-    try s.write(.{
-        .vendor = info.vendor,
-        .architecture = info.architecture,
-        .device = info.device,
-        .description = info.description,
-        .backend = info.backend,
-        .adapter_type = info.adapter_type,
-        .shader_f16 = d.has_f16,
-        .limits = .{
-            .max_storage_buffer_binding_size = d.limits.maxStorageBufferBindingSize,
-            .max_buffer_size = d.limits.maxBufferSize,
-            .max_storage_buffers_per_shader_stage = d.limits.maxStorageBuffersPerShaderStage,
-            .max_compute_workgroup_storage_size = d.limits.maxComputeWorkgroupStorageSize,
-            .max_compute_invocations_per_workgroup = d.limits.maxComputeInvocationsPerWorkgroup,
-            .max_compute_workgroups_per_dimension = d.limits.maxComputeWorkgroupsPerDimension,
+    switch (d) {
+        .webgpu => |x| {
+            var raw: zllm.gpu.dawn.c.WGPUAdapterInfo = undefined;
+            const info = x.info(&raw);
+            defer x.freeInfo(raw);
+            try s.write(.{
+                .backend = "webgpu",
+                .vendor = info.vendor,
+                .architecture = info.architecture,
+                .device = info.device,
+                .description = info.description,
+                .api = info.backend,
+                .adapter_type = info.adapter_type,
+                .shader_f16 = x.has_f16,
+                .limits = .{
+                    .max_storage_buffer_binding_size = x.limits.maxStorageBufferBindingSize,
+                    .max_buffer_size = x.limits.maxBufferSize,
+                    .max_storage_buffers_per_shader_stage = x.limits.maxStorageBuffersPerShaderStage,
+                    .max_compute_workgroup_storage_size = x.limits.maxComputeWorkgroupStorageSize,
+                    .max_compute_invocations_per_workgroup = x.limits.maxComputeInvocationsPerWorkgroup,
+                    .max_compute_workgroups_per_dimension = x.limits.maxComputeWorkgroupsPerDimension,
+                },
+            });
         },
-    });
+        .velocity => {
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            const info = try d.adapter(arena_state.allocator());
+            const limits = d.limits();
+            try s.write(.{
+                .backend = "velocity",
+                .vendor = info.vendor,
+                .architecture = info.architecture,
+                .device = info.device,
+                .description = info.description,
+                .api = info.api,
+                .limits = .{ .max_binding = limits.max_binding, .offset_align = limits.offset_align },
+            });
+        },
+    }
     try out.writeByte('\n');
 }
 

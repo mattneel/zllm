@@ -117,8 +117,8 @@ pub fn run(rt: *gen.Runtime, chunk: u32, at: u32, out: *Io.Writer) !void {
 /// Each kernel's GPU time and dispatches per step, largest first, then
 /// the largest launches by grid (each a matrix shape, for the multiplies).
 fn report(rt: *gen.Runtime, steps: u64, out: *Io.Writer) !void {
-    const pr = rt.host.profile.?;
-    const Total = zllm.gpu.Host.Profile.Total;
+    const pr = rt.host.timings().?;
+    const Total = zllm.gpu.Timings.Total;
     const Row = struct { name: []const u8, grid: ?[3]u32 = null, t: Total };
     var names: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
     defer names.deinit(rt.gpa);
@@ -153,10 +153,10 @@ fn report(rt: *gen.Runtime, steps: u64, out: *Io.Writer) !void {
     try out.print("{s:<20} {d:>12.3}\n", .{ "sum", ms(sum / steps) });
     try out.print("largest launches by grid (x, y, z):\n", .{});
     for (by_grid.items[0..@min(12, by_grid.items.len)]) |r| try printRow(out, r.name, r.grid, r.t, steps, sum);
-    if (pr.untimed > 0) try out.print("({d} dispatches past {d} per submission were not timed)\n", .{ pr.untimed, zllm.gpu.Host.Profile.capacity });
+    if (pr.untimed > 0) try out.print("({d} dispatches past {d} per submission were not timed)\n", .{ pr.untimed, pr.capacity });
 }
 
-fn printRow(out: *Io.Writer, name: []const u8, grid: ?[3]u32, t: zllm.gpu.Host.Profile.Total, steps: u64, sum: u64) !void {
+fn printRow(out: *Io.Writer, name: []const u8, grid: ?[3]u32, t: zllm.gpu.Timings.Total, steps: u64, sum: u64) !void {
     var label_buf: [64]u8 = undefined;
     const label = if (grid) |g| try std.fmt.bufPrint(&label_buf, "{s} {d},{d},{d}", .{ name, g[0], g[1], g[2] }) else name;
     try out.print("{s:<20} {d:>12.3} {d:>14} {d:>12.1} {d:>6.1}%\n", .{
