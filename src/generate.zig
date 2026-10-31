@@ -181,6 +181,9 @@ pub const Runtime = struct {
     template_arena: std.heap.ArenaAllocator,
     /// Rebuilds after a lost device.
     recoveries: u32 = 0,
+    /// The device, host and engine are up; false after a failed recover,
+    /// which leaves only destroy to call.
+    ready: bool = true,
 
     pub const Load = struct {
         /// Shaders and pipelines compiled.
@@ -342,19 +345,24 @@ pub const Runtime = struct {
     pub fn recover(rt: *Runtime) !void {
         rt.engine.deinit();
         rt.close();
+        rt.ready = false;
         _ = rt.arena_state.reset(.free_all);
         rt.load = .{};
         rt.tuned = .{ 0, 0 };
         rt.plan_cached = false;
         try rt.open();
+        errdefer rt.close();
         try rt.build();
+        rt.ready = true;
         rt.recoveries += 1;
     }
 
     pub fn destroy(rt: *Runtime) void {
         const gpa = rt.gpa;
-        rt.engine.deinit();
-        rt.close();
+        if (rt.ready) {
+            rt.engine.deinit();
+            rt.close();
+        }
         rt.completions.deinit(gpa);
         rt.stop_tokens.deinit(gpa);
         rt.template_arena.deinit();
