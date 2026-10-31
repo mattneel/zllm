@@ -96,11 +96,11 @@ def host_command(args, paths, command: str, *argv: Path | str) -> tuple[list[str
 
 
 class GpuRuns:
-    """gpu-forward runs on one model, executed in one process: the model
-    loads once for all of them (`gpu-forward --runs`). On the Windows hosts
-    the outputs go to a scratch directory beside the Windows stage: a
-    Windows process writes WSL's filesystem slowly (9P), and the outputs
-    hold whole logits rows, hundreds of MB a run. Use as a context manager:
+    """Strict gpu-forward runs on one model, executed in one process: the
+    model loads once for all of them (`gpu-forward --precision exact --runs`).
+    Each run retains its explicit KV format. On Windows hosts the outputs go
+    beside the Windows stage: writing WSL's filesystem through 9P is slow,
+    and whole logits rows hold hundreds of MB. Use as a context manager:
     the scratch directory goes on exit."""
 
     def __init__(self, args, paths, model: Path, tmp: Path):
@@ -132,7 +132,7 @@ class GpuRuns:
         runs_file = self.tmp / f"runs-{self.model.stem}.txt"
         runs_file.write_text("".join(" ".join([host_path(t), host_path(o), *opts]) + "\n" for t, o, opts in self.runs))
         print(f"[{self.model.name}: {len(self.runs)} gpu-forward runs, one model load]", flush=True)
-        cmd, env = host_command(self.args, self.paths, "gpu-forward", self.model, "--runs", runs_file)
+        cmd, env = host_command(self.args, self.paths, "gpu-forward", self.model, "--precision", "exact", "--runs", runs_file)
         # stderr streams, so a long run on a slow host shows progress.
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         timing, errors = [], []
@@ -297,7 +297,7 @@ def main() -> int:
         fail.expect("top-1 agreement", agree == total, f"{agree}/{total}")
         fail.expect("decode top-1 agreement", decode_agree == decode_total, f"{decode_agree}/{decode_total}")
         return fail.report()
-    proc = zllm_on_host(args, paths, "engine-check", paths.gguf)
+    proc = zllm_on_host(args, paths, "engine-check", paths.gguf, "--precision", "exact")
     print(f"\n{args.host}, engine-check:")
     sys.stdout.write("".join(line + "\n" for line in proc.stdout.replace("\r", "").splitlines() if line.startswith(("PASS", "FAIL"))))
     if proc.returncode != 0:

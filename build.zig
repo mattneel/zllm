@@ -99,24 +99,31 @@ pub fn build(b: *std.Build) void {
     quant_run.addArgs(&.{ "--host", @tagName(gpu_host) });
     if (b.option([]const u8, "quant-model", "Quantized GGUF for check-quant (default: the 27B fixture)")) |m| quant_run.addArgs(&.{ "--model", m });
     // The Gyro-Coder is read in place (75.8 GB): its path is an option.
-    const gyro_model = b.option([]const u8, "gyro-model", "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf for check-gyro");
+    const gyro_model = b.option([]const u8, "gyro-model", "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf for check-gyro and check-precision");
     const gyro_run = addCheck(b, check_exe, fixtures, "check-gyro", "Compare the Qwen3.8-Flash-Next Gyro-Coder on the GPU with the CPU reference and its runtime's greedy tokens", "check_gyro.py");
     gyro_run.addArgs(&.{ "--host", @tagName(gpu_host), "--model", gyro_model orelse "" });
+    const precision_run = addCheck(b, check_exe, fixtures, "check-precision", "Check the selected precision rung against the CPU reference", "check_precision.py");
+    precision_run.addArgs(&.{ "--host", @tagName(gpu_host) });
+    if (gyro_model) |m| precision_run.addArgs(&.{ "--gyro-model", m });
 
     const kernel_step = b.step("gpu-check", "Check every GPU kernel against a CPU computation");
-    // The fast tier, for iterating: gpu-check, then check-gpu on the first
-    // eval text with engine-check, then check-gyro without its long prompt
-    // (with -Dgyro-model). One after another: the GPU runs one job at a time.
-    const fast_step = b.step("check-fast", "The fast tier: gpu-check, check-gpu --fast and check-gyro --fast (with -Dgyro-model)");
+    // The fast tier runs GPU jobs serially: kernels, strict forward parity,
+    // the precision ladder, then Gyro's strict short-prompt parity when its
+    // optional model is supplied. CPU reference work stays in that chain.
+    const fast_step = b.step("check-fast", "The fast tier: gpu-check, check-gpu --fast, check-precision and optional check-gyro --fast");
     const fast_gpu = checkRun(b, check_exe, fixtures, "check_gpu.py");
     fast_gpu.addArgs(&.{ "--host", @tagName(gpu_host), "--fast" });
     if (!engine_check) fast_gpu.addArg("--no-engine-check");
     fast_gpu.step.dependOn(kernel_step);
-    fast_step.dependOn(&fast_gpu.step);
+    const fast_precision = checkRun(b, check_exe, fixtures, "check_precision.py");
+    fast_precision.addArgs(&.{ "--host", @tagName(gpu_host) });
+    if (gyro_model) |m| fast_precision.addArgs(&.{ "--gyro-model", m });
+    fast_precision.step.dependOn(&fast_gpu.step);
+    fast_step.dependOn(&fast_precision.step);
     if (gyro_model) |m| {
         const fast_gyro = checkRun(b, check_exe, fixtures, "check_gyro.py");
         fast_gyro.addArgs(&.{ "--host", @tagName(gpu_host), "--model", m, "--fast" });
-        fast_gyro.step.dependOn(&fast_gpu.step);
+        fast_gyro.step.dependOn(&fast_precision.step);
         fast_step.dependOn(&fast_gyro.step);
     }
     switch (gpu_host) {

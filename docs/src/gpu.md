@@ -187,7 +187,7 @@ instead of 32 and Q8_0 two rows per lane group. Speculative decode went
 from 40.7–41.5 tok/s to 47.0–47.3; one token per step went from 30.0–30.4
 to 31.3–31.9. Tuned logits remained close to the CPU reference (6.4e-6
 relative L2 at most, against 6.2e-6). That sweep took 13 s. `--no-tune`
-skips the sweep and native tuning-cache lookup.
+skips the decode sweep and its tuning lookup, not native precision selection.
 
 ### Device lost
 
@@ -222,11 +222,11 @@ source. It does not hash tensor payloads or Agility's HLSL sources. Thus
 an HLSL-only change with an unchanged zllm version can leave a Agility
 cache valid under the current key.
 
-A valid hit skips tuning. A different key or malformed/unknown variant is
-ignored and a fresh sweep replaces it. The cache is not compiled pipelines
-or a serialized step program; it holds no precision decisions. Loads still
-create pipelines and upload weights. The earlier Gyro-Coder cache record
-skipped 2.5 s of tuning with the same decode output and rate.
+A valid native hit restores tuning and quality-approved precision rungs,
+skipping their sweep/calibration. Keys include requested precision policy
+and versioned quality thresholds; unknown/malformed choices are ignored.
+The cache is not compiled pipelines or a serialized step program. Loads
+still create pipelines and upload weights. See [Precision](precision.md).
 
 The browser tunes at load too, through the same sweep, between the
 weights and the step program. The shim gets the key from the core

@@ -28,9 +28,9 @@ available backend, option or performance claim.
 | Fusion pass | Implemented: `hc_act` into quantized decode matvec, under single-reader and layout rules | Same pass | Same pass and HLSL prologue | Not available |
 | Load-time tuning | Implemented: quantized decode matvec variants, correctness check before timing | Same sweep | Same sweep over HLSL variants | No catalog or sweep path |
 | Persistent tuning cache | OPFS under `zllm/plans/` | Native JSON cache directory | Same native cache, separate runtime identity | No cache integration |
-| f32 / f16 / FP8 KV | All implemented; f16 default | All implemented; f16 default | All implemented; f16 default | Not available |
-| Automatic precision ladder | Not implemented; cache format is explicit | Same | Same | Not available |
-| Native tensor-core / matrix-intrinsic kernels | Not implemented in current WGSL kernels | Not implemented in current WGSL kernels | LinAlg wave-matrix Q8_0 float-activation and grouped TQ2_T prefill GEMMs, capability-gated with scalar HLSL fallback | No implementation |
+| f32 / f16 / FP8 KV | All implemented; explicit f16 default | All implemented; quality-gated native default | Same native KV ladder | Not available |
+| Automatic precision ladder | Not implemented; cache format is explicit | Native KV ladder, scalar prefill, cached model-quality choice | Native KV and single/compensated/scalar prefill ladders, cached model-quality choice | Not available |
+| Native tensor-core / matrix-intrinsic kernels | Not implemented in current WGSL kernels | Not implemented in current WGSL kernels | LinAlg wave-matrix BF16/F16, float-Q8_0 and grouped TQ2_T prefill variants; capability and quality gated | No implementation |
 | Native wave optimizations | Current WGSL kernels do not use subgroup operations | Same WGSL path | Implemented in `gyro_matvec` and `moe_logits` | No implementation |
 | Model-file uploads | HTTP ranges or a local `File`, served by the shim | Ranges from a file mapping | DirectStorage range reads into GPU buffers, batching up to 510 consecutive disjoint ranges per destination | No file-upload path |
 | DirectStorage | No: browser has no native DirectStorage interface | No: Dawn host uses mapped bytes and queue writes | Implemented in `write_file` | Not integrated |
@@ -70,17 +70,19 @@ fuser handles the supported hyper-connection activation pattern; other
 fusions are expressed directly by the plans. Tuning runs before program
 construction, without a post-fusion sweep.
 
-The plan cache is a JSON record of non-default variants, not compiled WGSL,
-DXIL or serialized launch lists. A cache hit avoids the sweep, not weight
-upload or pipeline creation. Native Dawn and Agility use different runtime
-strings in the key; the browser supplies its runtime and adapter strings.
+The plan cache is a JSON record of tuned variants and, natively, selected
+precision rungs plus calibration observations, not compiled WGSL, DXIL or
+serialized launch lists. A native hit skips the tuning sweep and quality
+gate, not weight upload or pipeline creation. Dawn and Agility have distinct
+runtime identities; the browser supplies its runtime and adapter strings.
 
 The key hashes the zllm version, the adapter, the runtime, the plan limits,
 the GGUF header and index, the backend, and that backend's own kernel
 sources (`kernels.backendSource`: WGSL and its templates on WebGPU, HLSL on
 Agility), so a change to any kernel a backend runs invalidates its tuning.
-It does not hash the model's tensor payload. The cache stores neither
-precision choices nor an automated model-quality verdict.
+It does not hash the model's tensor payload. Requested precision overrides,
+native matrix capability and the gate-policy version also enter native keys.
+Quality-only entries do not masquerade as completed tuning sweeps.
 
 ## Precision and hardware features
 
@@ -88,18 +90,19 @@ FP8 KV storage is implemented in portable shader arithmetic on all three
 hosts. It is E4M3FN packed four values per word, with an f32 power-of-two
 scale per position and KV head, separately for K and V. This reduces cache
 storage; it is not FP8 tensor-core compute. Attention decodes the values for
-f32 arithmetic. f16 remains the default, and `--kv fp8` is an explicit
-native option. See [Precision](precision.md) for the implemented formats
-and the distinction from the planned quality-gated ladder.
+f32 arithmetic. Native loads select KV through the model-quality gate;
+browser loads retain their explicit f16 default. `--kv` forces a native
+format and `--precision exact` selects f32 KV and scalar prefill.
+See [Precision](precision.md) for formats, thresholds and calibration scope.
 
-Agility selects LinAlg prefill implementations at pipeline creation when
-experimental Shader Model 6.10, LinAlg tier 1.0 and native wave32
-16×16×16 FP16-input/FP32-accumulate multiplication are supported. Dense
-float-activation Q8_0 and grouped TQ2_T expert GEMMs keep their existing
-identity, bindings, write set and dispatch grid. Unsupported adapters run
-the existing scalar HLSL; Dawn and browser WGSL are unchanged. FP16
-high/residual operands preserve the unchanged f32-reference error bounds,
-not a new lower-precision tolerance. See [Precision](precision.md).
+Agility exposes LinAlg prefill variants only when experimental Shader Model
+6.10, LinAlg tier 1.0 and native wave32 16×16×16 FP16-input/FP32-accumulate
+multiplication are supported. BF16/F16 projections, float-activation Q8_0
+and grouped TQ2_T experts keep their identity, bindings, write set and grid.
+The native loader compares single-product and compensated operands with
+the scalar exact device reference; unsupported or rejected rungs fall back.
+`Set.create` itself is scalar/exact, so capability alone never silently
+substitutes approximate arithmetic. Dawn/browser WGSL stays unchanged.
 
 CUDA is a planned backend, not an alternative spelling of Agility. The
 current backend enum, build integration and artifact selector contain no

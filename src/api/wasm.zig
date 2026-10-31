@@ -152,6 +152,7 @@ fn planKey(h: anytype, o: LoadOptions) plan.cache.Key {
         .runtime = o.runtime,
         .limits = &.{ o.max_binding, o.offset_align },
         .model_header = h.bytes[0..@min(h.bytes.len, @as(usize, @intCast(h.file.data_offset)))],
+        .policy = .{ .kv = o.kv },
     });
 }
 
@@ -358,8 +359,10 @@ const Runtime = struct {
         try rt.setup.submit(gpa, 0);
         // The cached tuning, if it is this load's; else a sweep, if asked.
         const cached = if (o.plan) |bytes| plan.cache.parse(arena, bytes, key) else null;
-        if (cached) |t| rt.config.tuning = t;
-        rt.will_sweep = o.tune and cached == null;
+        if (cached) |entry| if (entry.tuned) {
+            rt.config.tuning = entry.tuning;
+        };
+        rt.will_sweep = o.tune and (cached == null or !cached.?.tuned);
         try rt.tok.endOfGeneration(gpa, &rt.stop_tokens);
         return rt;
     }
@@ -391,7 +394,11 @@ const Runtime = struct {
             .tune => if (try rt.sweep.?.next()) |words| return rt.submit(words) else {
                 // Done: the winners, and the plan cache's file for them.
                 rt.config.tuning = rt.sweep.?.tuning();
-                try plan.cache.serialize(gpa, rt.plan_key, rt.config.tuning, &rt.plan_file);
+                try plan.cache.serialize(gpa, rt.plan_key, .{
+                    .tuning = rt.config.tuning,
+                    .tuned = true,
+                    .selection = .{ .kv = rt.config.kv },
+                }, &rt.plan_file);
                 rt.sweep = null;
                 return rt.buildProgram();
             },

@@ -30,10 +30,10 @@ coverage universal.
   tradeoff from an implementation error. These checks are not a general
   task-quality benchmark or proof of equivalent generated answers.
 
-The automatic model-quality-gated [precision ladder](precision.md) is a
-design target, not a completed load-time selector. f16 KV remains the
-default; explicit FP8 support does not mean that FP8 has passed a model's
-default-quality gate.
+Native loads now select precision through a fixed model-quality
+[calibration ladder](precision.md). `check-precision` independently compares
+its chosen logits with the CPU oracle. Strict implementation comparisons
+remain separate and explicitly use exact operands with their original KV cases.
 
 ## Pins
 
@@ -601,10 +601,10 @@ the dense models' first:
 
 The FP8 bounds catch a broken cache path, not the quality a model needs.
 `ecec4af` (2026-10-31) records 1,231/1,264 top-1 agreement on Dawn and
-1,233/1,264 on Agility for this model/input set. These small models stay
-on f16 by default; automatic selection under the spec's precision ladder
-is not implemented. Choosing FP8 explicitly accepts a different accuracy
-profile, even when its encoding and attention kernels pass their tests.
+1,233/1,264 on Agility for this model/input set. Native loads now walk the
+per-model quality ladder; browser loading remains explicit.
+The fixed calibration may reject FP8 even when these aggregate diagnostic
+bounds pass. Neither diagnostic thresholds nor strict parity gates are loosened.
 
 `gpu-check` holds the FP8 encoding itself exact: `rope_append`'s FP8 bytes
 and power-of-two scales match `ref/fp8.zig`'s encoding of its f32 output

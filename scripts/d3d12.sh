@@ -8,7 +8,7 @@
 #   ZLLM_BACKEND=agility scripts/d3d12.sh gpu-check
 #
 # With the Agility SDKs fetched (scripts/fixtures.sh agility), the build
-# includes Agility. ZLLM_BACKEND and ZLLM_ADAPTER pass through to Windows.
+# includes Agility. Backend, adapter and precision overrides pass to Windows.
 # Paths in the arguments must be Windows paths (see `wslpath -w`).
 set -euo pipefail
 
@@ -26,5 +26,5 @@ if [[ -d "$dir/agility/agility" ]]; then agility=(-Dagility "-Dagility-sdk=$dir/
 (cd "$root" && zig build -Dtarget=x86_64-windows-gnu -Doptimize="${ZLLM_OPTIMIZE:-ReleaseSafe}" "${agility[@]}" -p .zig-out-windows)
 cp "$root/.zig-out-windows/bin/zllm.exe" "$stage/zllm.exe"
 cd "$stage"
-export WSLENV="${WSLENV:+$WSLENV:}ZLLM_BACKEND:ZLLM_ADAPTER"
+export WSLENV="${WSLENV:+$WSLENV:}ZLLM_BACKEND:ZLLM_ADAPTER:ZLLM_KV:ZLLM_PRECISION"
 exec ./zllm.exe "$@"

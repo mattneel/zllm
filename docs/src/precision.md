@@ -16,10 +16,10 @@ quality-gated selection policy described in [spec §9](spec.md#9-state-and-prefi
 |---|---|---|
 | Model weights | BF16, F16 and the supported GGUF quantizations; Gyro expert formats have separate constraints | Read each tensor's type from the GGUF; no automatic weight-quality sweep or requantization |
 | Dense and hybrid decode multiplies | Decode stored weights and multiply with f32 activations, accumulating in f32 | Weight-specific kernel, with load-time tuning of quantized decode variants |
-| BF16/F16 prefill multiplies | Widen stored weights and use f32 operands and accumulation | Weight-specific kernel |
+| BF16/F16 prefill multiplies | Scalar f32, or FP16 single-product / activation-high-and-residual LinAlg products with f32 accumulation | Native quality-gated operand ladder on capable Agility; scalar on Dawn |
 | Quantized prefill multiplies | Round operands to Q8_K blocks for K-quants or Q8_0 blocks for Q8_0 weights; accumulate in f32 | Part of the existing quantized prefill path, not an adaptive precision choice |
-| Gyro-Coder float-activation Q8_0 and grouped TQ2_T prefill | Original f32 values on scalar paths; FP16 activation high/residual parts, exact FP16 weight operands, and two f32-accumulating matrix products on supported Agility devices | Native LinAlg operation support selects the matrix variant, otherwise scalar HLSL; unchanged reference bounds and per-path bitwise split-step gates |
-| Attention KV | f32, f16, FP8 E4M3FN | f16 for generation and browser loading; `gpu-forward` defaults to f32 for comparisons |
+| Gyro-Coder float-activation Q8_0 and grouped TQ2_T prefill | Scalar f32; FP16-rounded activations and scaled weights (single product); or compensated high/residual activation products with exact unscaled weight operands | Native quality-gated operand ladder on capable Agility; scalar HLSL fallback |
+| Attention KV | f32, f16, FP8 E4M3FN | Native quality ladder FP8 → f16 → f32; browser remains explicit, default f16; `gpu-forward` defaults f32 |
 | DeltaNet recurrent state and convolution history | f32 | Not changed by `--kv` |
 | Gyro sparse indexer keys / pooled blocks | f16 / f32 | Separate from the attention KV choice |
 
@@ -27,8 +27,9 @@ CPU forward passes are correctness references, not a CPU serving backend.
 The ordinary hybrid/dense reference uses f32 activations and accumulation.
 Its `--llama-activations` mode deliberately reproduces the reference
 runtime's multiply-operand rounding for quantized model comparisons.
-Gyro-Coder's CPU reference uses f32 operands but f16 attention and indexer
-caches; do not assume that every reference graph has an f32 KV cache.
+Gyro-Coder's CPU reference defaults to f16 attention and indexer caches.
+`forward --kv f32` selects f32 attention KV for the ladder oracle while
+retaining the model's fixed f16 indexer storage.
 
 ## Weight formats
 
@@ -71,15 +72,15 @@ supports `TQ2_T`, `TQK6`, `TQK7`, `TQP5`, `TQP6`, `TQP7`, `TQK5` and
 the codebook and rotation signs. The PLE table requires Q8_0 rows. A
 `TQ2_0` file name does not override these per-tensor checks.
 
-Agility's LinAlg prefill variants decode weights into bounded shared-memory
-tiles, not persistent dense FP16 matrices. Activations are split into a
-rounded FP16 high part and an FP16 residual. Weight operands are exact
-signed-byte integers for Q8_0 or exact FP16 codebook entries for TQ2_T.
-Two matrix products accumulate high×weight and residual×weight in f32;
-each original quantization block's scale is applied after its dot product.
-This avoids rounding scaled weights to FP16. It is not an automatic
-precision ladder or permission to relax a quality gate. Scalar HLSL and
-WGSL retain their existing arithmetic.
+Agility's LinAlg variants decode into bounded shared-memory tiles, not
+persistent dense FP16 matrices. The compensated Q8_0/TQ2_T rung splits
+activations into rounded FP16 high and residual parts. Signed-byte integers
+and FP16 codebook entries are exact weight operands; each original block's
+scale is applied after its two f32-accumulating dot products. The faster
+single-product rung instead rounds activations and scaled/dequantized
+weights to FP16 and omits correction products. BF16/F16 variants use the
+same activation choices with weights converted to FP16. Every approximate
+rung is gated at model load; its existence is not a quality approval.
 
 ## KV cache formats
 
@@ -88,8 +89,8 @@ The shared `KvFormat` has three choices:
 | Choice | Storage | Intended use |
 |---|---|---|
 | `f32` | f32 cached values | High-precision diagnostic baseline; larger cache |
-| `f16` | Packed binary16 values, explicitly rounded to nearest with ties to even | Current generation default |
-| `fp8` | E4M3FN bytes, four values per word, with an f32 scale for each position and KV head | Explicit lower-precision option; model quality must be assessed separately |
+| `f16` | Packed binary16 values, explicitly rounded to nearest with ties to even | Middle native ladder rung; explicit browser default |
+| `fp8` | E4M3FN bytes, four values per word, with an f32 scale for each position and KV head | First native ladder rung, accepted only by the model gate |
 
 FP8 uses the smallest power-of-two row scale that puts the row's maximum
 magnitude within E4M3FN's finite range, 448. K and V have their own row
@@ -133,24 +134,54 @@ cache is therefore not a global exact-precision mode.
 
 ## Quality-gated precision ladder
 
-The spec's intended policy orders candidate formats by speed and keeps
-the fastest supported rung that passes the model's quality gate. For KV
-the proposed order is **FP8 → f16 → f32**. Similar selection is intended
-for prefill operands and weight storage. The choice should be recorded
-with the plan so that a cached plan preserves the quality decision, not
-merely a fast kernel configuration.
+Native generation, chat and benchmarks default to a deterministic load-time
+ladder. Each class is ordered fastest-first:
 
-This automatic quality-gated ladder is **planned policy, not current
-load-time behavior**. Today:
+- attention KV: **FP8 → f16 → f32**;
+- prefill GEMM operands: **FP16 single product → FP16 compensated two
+  products → scalar f32**;
+- weight storage: **stored** only. There are no unimplemented weight rungs
+  or automatic persistent requantization.
 
-- the caller selects KV explicitly, otherwise generation uses f16;
-- weights keep the formats declared by the file;
-- quantized prefill has its existing operand-rounding path;
-- the plan cache stores tuned kernel variants, not a quality-approved
-  choice of KV, weight or activation precision;
-- `--precision exact`, mentioned in the spec, is not an implemented CLI
-  option. `--kv f16` is implemented, but opts into a cache format rather
-  than disabling all lower-precision arithmetic.
+The loader runs a fixed coding/language text (the first 64 model-tokenized
+positions) through the exact device path, with f32 KV and scalar operands.
+It tries KV candidates first with scalar operands, then supported operand
+candidates with the chosen KV. The latter comparison uses the same exact
+logits, so the combined choice must pass, not merely its isolated classes.
+No tokens are sampled. Unsupported operand rungs are skipped; Dawn currently
+has only scalar-f32 prefill. Browser loading still uses its explicit KV
+option and does not run the native calibration.
+
+The model policy in `src/precision.zig` requires top-1 agreement ≥99%,
+mean **KL(P_exact || P_candidate) ≤0.001 nats**, and maximum per-position
+relative logits L2 ≤0.1. Reductions and stable log-softmax use deterministic
+f64 arithmetic. Nonfinite logits reject the rung. On a 64-position probe,
+99% requires all 64 top-1 predictions to agree. The KL bound limits mean
+total-variation distance to at most approximately 2.24% by Pinsker's
+inequality and Jensen's inequality; the L2 gate also catches changes that
+distribution normalization can hide. Measured per-rung results and the
+policy's separation between accepted and rejected candidates are recorded
+in [Performance](performance.md).
+
+This is a short calibration gate, not a guarantee about every future prompt
+or long-context workload. The existing strict kernel/model correctness
+gates are separate and are not relaxed.
+
+The native JSON plan cache records selected rungs and gate observations
+alongside tuning. A valid hit restores the same choice and skips the gate.
+The key includes requested overrides, model/header identity, native operand
+capability, all backend shader variants and the versioned gate policy.
+`--no-tune` skips only the decode sweep, not quality selection; cache metadata
+distinguishes a quality-only entry from completed empty tuning.
+
+`--kv f16|f32|fp8` opts the KV class out and forces that format. Its operand
+gate compares against scalar arithmetic with the same forced cache format.
+`--precision exact` overrides even a forced KV option and selects f32 KV
+plus scalar-f32 operands. Stored weight types, model-fixed indexer storage,
+and the existing non-Gyro quantized-prefill arithmetic are not rewritten.
+`ZLLM_KV` and `ZLLM_PRECISION=auto|exact` provide the corresponding native
+defaults; command-line flags take precedence. The load log and benchmark
+JSON report chosen rungs.
 
 A quality gate must distinguish these questions:
 
@@ -176,9 +207,9 @@ quality approvals. The recorded D3D12 small-model FP8 result is
 1,231/1,264 top-1 agreement,
 versus the f32 reference, and commit `ecec4af` records 1,233/1,264 on
 Agility. These results establish an implemented FP8 path, not a
-quality-approved FP8 default. The small models remain on f16. See
-[GPU forward validation](validation.md#gpu-forward-pass) for each model
-and the scope of the comparisons.
+quality-approved FP8 default. Native selection now measures each model's
+calibration instead of treating those aggregate diagnostic results as
+permission. See [GPU forward validation](validation.md#gpu-forward-pass).
 
 Quantized-prefill results also need care: rounding operands to 8-bit
 blocks changes outputs even when every kernel is correct. The 27B's

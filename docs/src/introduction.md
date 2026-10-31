@@ -32,7 +32,7 @@ from gaps and planned work.
 | WebGPU | Native Dawn and browser wasm hosts execute the shared command stream | [WebGPU](gpu.md) |
 | Agility | Native D3D12 backend, HLSL kernels, LinAlg capability queries and DirectStorage integration | [Agility](agility.md) |
 | Planning | Kernel identity and contracts, fusion pass, decode-multiply tuning and persistent plan cache | [Architecture](architecture.md) |
-| Precision | Quantized GGUF weights and selectable KV formats, including FP8; automatic quality-gated precision selection remains a separate goal | [Precision](precision.md) |
+| Precision | Quantized GGUF weights, FP8/f16/f32 KV, and a cached native model-quality ladder for KV and supported prefill operands | [Precision](precision.md) |
 | Generation | Single-sequence scheduler, prefix reuse, GPU sampling, MTP speculation and device-lost rebuilding | [Generation and serving](generation.md) |
 | API | Native CLI and browser generation/OpenAI-style chat interface; not an HTTP serving daemon | [Browser API](browser.md#api) |
 | Future scope | CUDA, additional model families, then image and video generation | [Roadmap](roadmap.md) |

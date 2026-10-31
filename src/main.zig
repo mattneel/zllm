@@ -19,7 +19,7 @@ const usage =
     \\  gguf-index <model.gguf>             print header, metadata and tensor index as JSON
     \\  tokenize <model.gguf> <texts.jsonl>  for each {"text": ...} line, print
     \\                                       {"ids": [...], "decoded": ...} as one JSON line
-    \\  forward <model.gguf> <tokens.i32> <out.bin> [--llama-activations] [--mtp]
+    \\  forward <model.gguf> <tokens.i32> <out.bin> [--llama-activations] [--mtp] [--kv f16|f32]
     \\                                       run the CPU f32 reference on little-endian int32
     \\                                       token ids; write activation records (format in
     \\                                       tools/llama-dump/dump.cpp). --llama-activations
@@ -47,6 +47,8 @@ const usage =
     \\                                       fails on a device error or a submission past 250 ms
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
+    \\  precision-check <model.gguf> <tokens.i32> <logits.f32>
+    \\                                       report ladder quality metrics and export its fixed probe
     \\  gpu-forward <model.gguf> --runs <runs.txt>
     \\                                       one run per line, `<tokens.i32> <out.bin> [options]`
     \\                                       as below, the model loaded once for all of them
@@ -66,6 +68,8 @@ const usage =
     \\  ZLLM_BACKEND   GPU backend: webgpu (Dawn; default) or agility (native D3D12; builds
     \\                 with -Dagility)
     \\  ZLLM_ADAPTER   Agility's adapter index (default 0: the high-performance one)
+    \\  ZLLM_KV        forced KV format (f16|f32|fp8); --kv overrides it
+    \\  ZLLM_PRECISION auto (default ladder) or exact; --precision overrides it
     \\
 ;
 
@@ -101,32 +105,42 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(texts);
         try tokenizeLines(gpa, &tok, texts, out);
     } else if (std.mem.eql(u8, cmd, "forward")) {
-        if (args.len < 5 or args.len > 7) return fail(usage);
+        if (args.len < 5) return fail(usage);
         var act: zllm.ref.matmul.Activations = .f32;
         var mtp = false;
-        for (args[5..]) |flag| {
+        var cpu_kv: ?zllm.ref.qwen4exp.engine.KvFormat = null;
+        var flag_index: usize = 5;
+        while (flag_index < args.len) : (flag_index += 1) {
+            const flag = args[flag_index];
             if (std.mem.eql(u8, flag, "--llama-activations")) {
                 act = .llama_cpp;
             } else if (std.mem.eql(u8, flag, "--mtp")) {
                 mtp = true;
+            } else if (std.mem.eql(u8, flag, "--kv")) {
+                flag_index += 1;
+                if (flag_index == args.len) return fail(usage);
+                cpu_kv = std.meta.stringToEnum(zllm.ref.qwen4exp.engine.KvFormat, args[flag_index]) orelse return fail(usage);
             } else return fail(usage);
         }
-        try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4], act, mtp);
-    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check") or std.mem.eql(u8, cmd, "bench") or std.mem.eql(u8, cmd, "profile") or std.mem.eql(u8, cmd, "soak") or std.mem.eql(u8, cmd, "benchmark")) {
+        try forward(gpa, io, defaultThreads(io, init.environ_map), args[2], args[3], args[4], act, mtp, cpu_kv);
+    } else if (std.mem.eql(u8, cmd, "generate") or std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "engine-check") or std.mem.eql(u8, cmd, "bench") or std.mem.eql(u8, cmd, "profile") or std.mem.eql(u8, cmd, "soak") or std.mem.eql(u8, cmd, "benchmark") or std.mem.eql(u8, cmd, "precision-check")) {
         const is_chat = std.mem.eql(u8, cmd, "chat");
         const is_check = std.mem.eql(u8, cmd, "engine-check");
         const is_bench = std.mem.eql(u8, cmd, "bench");
         const is_profile = std.mem.eql(u8, cmd, "profile");
         const is_soak = std.mem.eql(u8, cmd, "soak");
         const is_benchmark = std.mem.eql(u8, cmd, "benchmark");
-        var fixed: usize = if (is_chat or is_check or is_benchmark or ((is_bench or is_profile or is_soak) and args.len == 3)) 3 else 4;
-        // profile takes a second positional argument.
-        if (is_profile and args.len > 4 and !std.mem.startsWith(u8, args[4], "--")) fixed = 5;
+        const is_precision_check = std.mem.eql(u8, cmd, "precision-check");
+        var fixed: usize = if (is_precision_check) 5 else if (is_chat or is_check or is_benchmark or is_bench or is_profile or is_soak) 3 else 4;
+        if ((is_bench or is_profile or is_soak) and args.len > 3 and !std.mem.startsWith(u8, args[3], "--")) fixed = 4;
+        if (is_profile and fixed == 4 and args.len > 4 and !std.mem.startsWith(u8, args[4], "--")) fixed = 5;
         if (args.len < fixed) return fail(usage);
         var opts = gen.Options.parse(arena, args[fixed..]) catch |err| switch (err) {
             error.InvalidUsage => return fail(usage),
             else => return err,
         };
+        try applyPrecisionEnv(&opts, init.environ_map, args[fixed..]);
+        if (is_precision_check) opts.context = 128;
         if (is_check) opts.context = 2048;
         opts.plan_cache = try planCacheDir(arena, init.environ_map);
         var mapped = try FileBytes.open(io, args[2]);
@@ -137,25 +151,28 @@ pub fn main(init: std.process.Init) !void {
         const rt = try gen.Runtime.create(gpa, io, try gpuOpen(init.environ_map), file, mapped.bytes, args[2], opts);
         defer rt.destroy();
         const ld = rt.load;
-        std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, tuning {d}, program {d}, calibration {d}); context {d}, {t} KV", .{
-            rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.tuning / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, rt.program.context(), rt.program.kv(),
+        std.debug.print("[{s}; loaded in {d} ms (pipelines {d}, weights {d}, tuning {d}, quality {d}, program {d}, calibration {d}); context {d}, {t} KV; prefill {t}; weights {t}", .{
+            rt.adapter, t0.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds(), ld.pipelines / std.time.ns_per_ms, ld.weights / std.time.ns_per_ms, ld.tuning / std.time.ns_per_ms, ld.quality / std.time.ns_per_ms, ld.program / std.time.ns_per_ms, ld.calibration / std.time.ns_per_ms, rt.program.context(), rt.program.kv(), rt.selection.prefill, rt.selection.weights,
         });
         if (rt.plan_cached) std.debug.print("; tuning from the plan cache", .{});
+        if (rt.precision_cached) std.debug.print("; precision from the plan cache", .{});
         if (rt.tuned[0] > 0) std.debug.print("; {d} of {d} decode-multiply shapes tuned to another variant", .{ rt.tuned[1], rt.tuned[0] });
         if (rt.program.mtp()) std.debug.print("; {s}", .{if (rt.engine.speculates()) "speculative" else "MTP block, not speculating by default"});
         std.debug.print("]\n", .{});
-        if (is_benchmark) {
+        if (is_precision_check) {
+            try precisionCheck(rt, args[3], args[4], out);
+        } else if (is_benchmark) {
             try benchmark.run(rt, args[2], mapped.bytes.len, @intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()), out);
         } else if (is_soak) {
-            const minutes = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 10;
+            const minutes = if (fixed >= 4) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 10;
             if (!try soak.run(rt, minutes, out)) return error.SoakFailed;
         } else if (is_profile) {
-            const chunk = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 32;
-            const at = if (args.len > 4) std.fmt.parseInt(u32, args[4], 10) catch return fail(usage) else 0;
+            const chunk = if (fixed >= 4) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 32;
+            const at = if (fixed == 5) std.fmt.parseInt(u32, args[4], 10) catch return fail(usage) else 0;
             if (chunk == 0) return fail(usage);
             try profile.run(rt, chunk, at, out);
         } else if (is_bench) {
-            const fill = if (args.len > 3) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 1024;
+            const fill = if (fixed >= 4) std.fmt.parseInt(u32, args[3], 10) catch return fail(usage) else 1024;
             if (fill == 0 or fill >= opts.context) return fail(usage);
             try bench.run(rt, fill, out);
         } else if (is_check) {
@@ -196,7 +213,9 @@ pub fn main(init: std.process.Init) !void {
         if (args.len != 2) return fail(usage);
         try gpuCheck(gpa, init.environ_map, out);
     } else if (std.mem.eql(u8, cmd, "gpu-forward")) {
-        if (args.len == 5 and std.mem.eql(u8, args[3], "--runs")) {
+        if (args.len == 7 and std.mem.eql(u8, args[3], "--precision") and std.mem.eql(u8, args[4], "exact") and std.mem.eql(u8, args[5], "--runs")) {
+            try gpuForward(gpa, io, init.environ_map, args[2], try readRuns(arena, io, args[6]));
+        } else if (args.len == 5 and std.mem.eql(u8, args[3], "--runs")) {
             try gpuForward(gpa, io, init.environ_map, args[2], try readRuns(arena, io, args[4]));
         } else {
             if (args.len < 5) return fail(usage);
@@ -304,7 +323,7 @@ fn chatRenderTemplate(gpa: std.mem.Allocator, io: Io, cases: []const u8, model_p
     }
 }
 
-fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u8, tokens_path: []const u8, out_path: []const u8, act: zllm.ref.matmul.Activations, mtp: bool) !void {
+fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u8, tokens_path: []const u8, out_path: []const u8, act: zllm.ref.matmul.Activations, mtp: bool, cpu_kv: ?zllm.ref.qwen4exp.engine.KvFormat) !void {
     var mapped = try FileBytes.open(io, model_path);
     defer mapped.close(io);
     var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
@@ -323,13 +342,15 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
     const arch = file.get("general.architecture") orelse return error.MissingMetadata;
     const obs: zllm.ref.dense.Observer = .{ .ctx = &rec, .emit = RecordWriter.emit };
     if (arch == .string and std.mem.eql(u8, arch.string, zllm.ref.qwen4exp.model.arch)) {
-        try forwardQwen4exp(gpa, pool, file, mapped.bytes, tokens, &rec);
+        try forwardQwen4exp(gpa, pool, file, mapped.bytes, tokens, &rec, cpu_kv orelse .f16);
     } else if (arch == .string and zllm.graph.dense.Arch.fromName(arch.string) != null) {
         if (mtp) return error.NoMtpBlock;
+        if (cpu_kv == .f16) return error.UnsupportedCpuKv;
         var model = try zllm.ref.dense.Model.load(gpa, pool, file, mapped.bytes);
         defer model.deinit();
         try model.forward(gpa, tokens, pool, obs, act);
     } else {
+        if (cpu_kv == .f16) return error.UnsupportedCpuKv;
         var model = try zllm.ref.qwen35.Model.load(gpa, pool, file, mapped.bytes);
         defer model.deinit();
         try model.forward(gpa, tokens, pool, obs, act, mtp);
@@ -341,11 +362,11 @@ fn forward(gpa: std.mem.Allocator, io: Io, threads: usize, model_path: []const u
 /// intermediate tensors as records named `<name>-<layer>` (or `<name>`),
 /// as the reference runtime's dump tool names them, then the logits of
 /// every position as `result_output`.
-fn forwardQwen4exp(gpa: std.mem.Allocator, pool: *zllm.ref.Pool, file: zllm.gguf.File, bytes: []const u8, tokens: []const u32, rec: *RecordWriter) !void {
+fn forwardQwen4exp(gpa: std.mem.Allocator, pool: *zllm.ref.Pool, file: zllm.gguf.File, bytes: []const u8, tokens: []const u32, rec: *RecordWriter, kv: zllm.ref.qwen4exp.engine.KvFormat) !void {
     const q = zllm.ref.qwen4exp;
     var model = try q.Model.load(gpa, file, bytes);
     defer model.deinit();
-    var session = try q.Session.init(gpa, &model, pool, @intCast(tokens.len));
+    var session = try q.Session.init(gpa, &model, pool, @intCast(tokens.len), .{ .kv = kv });
     defer session.deinit();
     const Dump = struct {
         rec: *RecordWriter,
@@ -448,6 +469,65 @@ const FileBytes = struct {
     }
 };
 
+/// Flags override environment defaults; exact mode later overrides forced KV.
+fn applyPrecisionEnv(opts: *gen.Options, env: *const std.process.Environ.Map, args: []const []const u8) !void {
+    var has_kv = false;
+    var has_precision = false;
+    for (args) |arg| {
+        has_kv = has_kv or std.mem.eql(u8, arg, "--kv");
+        has_precision = has_precision or std.mem.eql(u8, arg, "--precision");
+    }
+    if (!has_kv) if (env.get("ZLLM_KV")) |value| {
+        opts.kv = std.meta.stringToEnum(zllm.plan.common.KvFormat, value) orelse return error.InvalidUsage;
+    };
+    if (!has_precision) if (env.get("ZLLM_PRECISION")) |value| {
+        opts.precision = std.meta.stringToEnum(zllm.precision.Mode, value) orelse return error.InvalidUsage;
+    };
+}
+
+/// Unlike a normal load, the diagnostic audits lower rungs even after an
+/// earlier one passed. These measurements do not alter the selected plan.
+fn precisionCheck(rt: *gen.Runtime, token_path: []const u8, logits_path: []const u8, out: *Io.Writer) !void {
+    var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const prompt = try rt.qualityPrompt(arena);
+    const exact = try rt.qualityLogits(arena, .{}, prompt);
+    var observations: std.ArrayList(zllm.precision.Observation) = .empty;
+    for (zllm.precision.kv_rungs) |format| {
+        const selection: zllm.precision.Selection = .{ .kv = format };
+        try observations.append(arena, .{
+            .selection = selection,
+            .metrics = if (format == .f32)
+                try gen.Runtime.qualityMetrics(exact, exact, prompt.len)
+            else
+                try rt.trial(prompt, exact, selection),
+        });
+    }
+    for (zllm.precision.prefill_rungs) |rung| {
+        if (rung == .scalar_f32 or !rt.device.supportsPrefill(rung)) continue;
+        const selection: zllm.precision.Selection = .{ .prefill = rung };
+        try observations.append(arena, .{ .selection = selection, .metrics = try rt.trial(prompt, exact, selection) });
+    }
+    const selected = try rt.qualityLogits(arena, rt.selection, prompt);
+    const metrics = try gen.Runtime.qualityMetrics(exact, selected, prompt.len);
+    try observations.append(arena, .{ .selection = rt.selection, .metrics = metrics });
+    try Io.Dir.cwd().writeFile(rt.io, .{ .sub_path = token_path, .data = std.mem.sliceAsBytes(prompt) });
+    try Io.Dir.cwd().writeFile(rt.io, .{ .sub_path = logits_path, .data = std.mem.sliceAsBytes(selected) });
+    var json: std.json.Stringify = .{ .writer = out };
+    try json.write(.{
+        .selection = rt.selection,
+        .gate = rt.qualityGate(),
+        .observations = observations.items,
+        .metrics = metrics,
+        .precision_cached = rt.precision_cached,
+        .reference_kv = zllm.plan.common.KvFormat.f32,
+        .positions = prompt.len,
+        .quality_ms = rt.load.quality / std.time.ns_per_ms,
+    });
+    try out.writeByte('\n');
+}
+
 /// The GPU the environment selects (ZLLM_BACKEND, ZLLM_DAWN, ZLLM_ADAPTER).
 fn gpuOpen(env: *const std.process.Environ.Map) !zllm.gpu.Open {
     var o: zllm.gpu.Open = .{};
@@ -518,6 +598,8 @@ const ForwardOptions = struct {
                 if (o.chunk == 0) return fail(usage);
             } else if (std.mem.eql(u8, args[i], "--kv")) {
                 o.kv = std.meta.stringToEnum(zllm.plan.common.KvFormat, args[i + 1]) orelse return fail(usage);
+            } else if (std.mem.eql(u8, args[i], "--precision")) {
+                if (!std.mem.eql(u8, args[i + 1], "exact")) return fail(usage);
             } else if (std.mem.eql(u8, args[i], "--path")) {
                 o.path = std.meta.stringToEnum(zllm.plan.qwen35.Path, args[i + 1]) orelse return fail(usage);
             } else return fail(usage);
@@ -538,6 +620,22 @@ test "gpu-forward options retain forced paths and requested chunks" {
     try std.testing.expectEqual(@as(u32, 4), decode.chunk);
     const automatic = try ForwardOptions.parse(&.{});
     try std.testing.expectEqual(@as(?zllm.plan.qwen35.Path, null), automatic.path);
+}
+
+test "generation precision defaults and explicit opt-outs stay distinct" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const automatic = try gen.Options.parse(arena.allocator(), &.{});
+    try std.testing.expectEqual(zllm.precision.Mode.auto, automatic.precision);
+    try std.testing.expectEqual(@as(?zllm.plan.common.KvFormat, null), automatic.kv);
+    const forced = try gen.Options.parse(arena.allocator(), &.{ "--kv", "f16" });
+    try std.testing.expectEqual(zllm.plan.common.KvFormat.f16, forced.kv.?);
+    try std.testing.expectEqual(zllm.precision.Mode.auto, forced.precision);
+    const exact = try gen.Options.parse(arena.allocator(), &.{ "--kv", "fp8", "--precision", "exact" });
+    try std.testing.expectEqualDeep(zllm.precision.Selection{}, (zllm.precision.Policy{ .mode = exact.precision, .kv = exact.kv }).resolve(.{ .prefill = .fp16_single }));
+    try std.testing.expectError(error.InvalidUsage, gen.Options.parse(arena.allocator(), &.{ "--precision", "unknown" }));
+    const diagnostic = try ForwardOptions.parse(&.{ "--precision", "exact", "--kv", "f16" });
+    try std.testing.expectEqual(zllm.plan.common.KvFormat.f16, diagnostic.kv);
 }
 
 /// One gpu-forward run: token ids in, activation records out.

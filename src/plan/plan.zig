@@ -64,6 +64,8 @@ pub const Config = struct {
     /// Positions the KV cache holds; Qwen4Exp caps it at its max_context.
     context: u32,
     kv: common.KvFormat = .f16,
+    /// Readback rows reserved for calibration; ordinary generation needs two.
+    logit_rows: u32 = 2,
     tuning: common.Tuning = .{},
     /// Qwen 3.5: build the MTP block's steps (qwen35.Config.mtp).
     mtp: bool = false,
@@ -108,13 +110,13 @@ pub const Program = union(enum) {
                 .max_tokens = @min(512, cfg.context),
                 .kv = cfg.kv,
                 .mtp = cfg.mtp,
-                .logit_rows = 2,
+                .logit_rows = cfg.logit_rows,
                 .tuning = cfg.tuning,
             }, limits) },
             .qwen4exp => |*w| .{ .qwen4exp = try .build(arena, gpa, rec, set, w, .{
                 .context = @min(cfg.context, qwen4exp.max_context),
                 .max_tokens = @min(512, cfg.context, qwen4exp.max_context),
-                .logit_rows = 2,
+                .logit_rows = cfg.logit_rows,
                 .kv = cfg.kv,
                 .tuning = cfg.tuning,
                 .fuse = cfg.fuse,

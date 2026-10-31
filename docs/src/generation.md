@@ -19,7 +19,8 @@ Use `chat` for a conversation rendered with the model's chat template, and
 |---|---|
 | `--max-tokens N` | Limit the generated tokens per turn; default 4096 |
 | `--ctx N` | Allocate context capacity; default 8192 tokens |
-| `--kv f16\|f32\|fp8` | Select the attention cache format; default f16 |
+| `--kv f16\|f32\|fp8` | Force the attention cache format instead of its default quality ladder |
+| `--precision exact` | Force f32 KV and scalar-f32 prefill operands; overrides `--kv` |
 | `--temperature`, `--top-k`, `--top-p`, `--min-p` | Override the model's sampling defaults |
 | `--repetition-penalty`, `--presence-penalty`, `--frequency-penalty` | Control repetition |
 | `--seed N` | Set the sampler's random seed |
@@ -30,8 +31,14 @@ Use `chat` for a conversation rendered with the model's chat template, and
 
 Context capacity includes both the prompt and the generated reply. A request
 finishes with `length` when either its output limit or context capacity is
-reached. FP8 is an explicit precision tradeoff, not an automatic quality-safe
-upgrade; see [Precision](precision.md).
+reached. By default native loading walks each supported precision ladder
+against a fixed model-quality probe and prints the chosen KV, prefill
+operand and stored-weight rungs. `--kv` opts only that class out;
+`--precision exact` opts all selectable classes out. `ZLLM_KV` and
+`ZLLM_PRECISION=auto|exact` supply environment defaults, overridden by flags.
+A valid plan-cache hit restores the quality choice and skips calibration;
+`--no-tune` disables only decode tuning, not this gate.
+See [Precision](precision.md) for thresholds and the short probe's limits.
 
 ## Engine
 
@@ -205,8 +212,8 @@ recorded hardware results and a software-renderer exception are in
 [Validation](validation.md#engine).
 
 KV is one contiguous cache per attention layer, sized for the context
-(8192 tokens by default). The default f16 cache uses 12 KiB per token for
-the 0.8B model; f32 and FP8 are explicit alternatives. The spec's 256-token
+(8192 tokens by default). An f16 cache uses 12 KiB per token for the 0.8B
+model; the native ladder may choose FP8 or f32 instead. The spec's 256-token
 pages describe a shared sequence pool, not this single-sequence allocation.
 
 ### Device recovery

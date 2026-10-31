@@ -4,6 +4,8 @@
 //! operation order follows agentionai/llama.cpp src/models/qwen4exp.cpp at
 //! 9aa51ce4. Lifted from gyro-dx, whose CPU engine reproduced that
 //! runtime's greedy tokens.
+//! Attention KV defaults to the runtime's f16 storage; the independent
+//! precision-ladder oracle can request f32. Indexer keys remain f16 in both.
 const std = @import("std");
 const kernels = @import("kernels.zig");
 const model_mod = @import("model.zig");
@@ -28,16 +30,116 @@ const LinearState = struct {
     conv: []f32, // (ssm_conv - 1) * channels, oldest first
     ssm: []f32, // v_heads * state * state, transposed per head: s[j * S + i] = S[i][j]
 };
+/// Attention-cache storage only; independent of the fixed f16 sparse indexer.
+pub const KvFormat = enum { f16, f32 };
+
+const AttentionKv = union(KvFormat) {
+    f16: struct { k: []u16 = &.{}, v: []u16 = &.{} },
+    f32: struct { k: []f32 = &.{}, v: []f32 = &.{} },
+
+    fn init(allocator: Allocator, format: KvFormat, count: usize) Allocator.Error!AttentionKv {
+        return switch (format) {
+            .f16 => blk: {
+                const k = try allocator.alloc(u16, count);
+                errdefer allocator.free(k);
+                break :blk .{ .f16 = .{ .k = k, .v = try allocator.alloc(u16, count) } };
+            },
+            .f32 => blk: {
+                const k = try allocator.alloc(f32, count);
+                errdefer allocator.free(k);
+                break :blk .{ .f32 = .{ .k = k, .v = try allocator.alloc(f32, count) } };
+            },
+        };
+    }
+
+    fn deinit(kv: AttentionKv, allocator: Allocator) void {
+        switch (kv) {
+            inline else => |data| {
+                allocator.free(data.k);
+                allocator.free(data.v);
+            },
+        }
+    }
+
+    fn store(kv: AttentionKv, offset: usize, k: []const f32, v: []const f32) void {
+        std.debug.assert(k.len == v.len);
+        switch (kv) {
+            .f16 => |data| for (k, v, offset..) |kk, vv, i| {
+                data.k[i] = f32ToF16(kk);
+                data.v[i] = f32ToF16(vv);
+            },
+            .f32 => |data| {
+                @memcpy(data.k[offset..][0..k.len], k);
+                @memcpy(data.v[offset..][0..v.len], v);
+            },
+        }
+    }
+};
+
+test "attention cache preserves f32 operands and retains existing f16 rounding" {
+    const k = [_]f32{ 1.0001, -2.0003 };
+    const v = [_]f32{ 3.0007, -4.0011 };
+    inline for (.{ KvFormat.f16, KvFormat.f32 }) |format| {
+        const kv = try AttentionKv.init(std.testing.allocator, format, 6);
+        defer kv.deinit(std.testing.allocator);
+        kv.store(2, &k, &v);
+        switch (kv) {
+            .f16 => |data| {
+                for (k, v, 2..) |kk, vv, i| {
+                    try std.testing.expectEqual(f32ToF16(kk), data.k[i]);
+                    try std.testing.expectEqual(f32ToF16(vv), data.v[i]);
+                    try std.testing.expect(f16ToF32(data.k[i]) != kk);
+                    try std.testing.expect(f16ToF32(data.v[i]) != vv);
+                }
+            },
+            .f32 => |data| {
+                try std.testing.expectEqualSlices(f32, &k, data.k[2..4]);
+                try std.testing.expectEqualSlices(f32, &v, data.v[2..4]);
+            },
+        }
+    }
+}
+
+test "session attention format is explicit and sparse indexer remains f16" {
+    try std.testing.expectEqual(KvFormat.f16, (Session.Options{}).kv);
+    var layers: [1]Layer = undefined;
+    layers[0].mixer = .{ .full = undefined };
+    layers[0].mixer.full.compress_ratio = 2;
+    var model: Model = undefined;
+    model.h = std.mem.zeroes(model_mod.Hparams);
+    model.h.n_embd = 2;
+    model.h.hc = 1;
+    model.h.n_head_kv = 1;
+    model.h.head_dim = 2;
+    model.h.idx_dim = 2;
+    model.h.ple_conv = 1;
+    model.h.ple_dilation = 1;
+    model.layers = &layers;
+    var pool: Pool = undefined; // Session initialization never submits work.
+    inline for (.{ KvFormat.f16, KvFormat.f32 }) |format| {
+        var session = try Session.init(std.testing.allocator, &model, &pool, 4, .{ .kv = format });
+        defer session.deinit();
+        try std.testing.expectEqual(format, std.meta.activeTag(session.full[0].kv));
+        try std.testing.expect(@TypeOf(session.full[0].idx_k) == []u16);
+        try std.testing.expectEqual(@as(usize, 8), session.full[0].idx_k.len);
+        session.full[0].pooled_valid = 1;
+        session.reset();
+        try std.testing.expectEqual(@as(usize, 0), session.full[0].pooled_valid);
+    }
+}
 
 const FullState = struct {
-    k: []u16, // ctx * kv_heads * head_dim, binary16
-    v: []u16,
+    kv: AttentionKv = .{ .f16 = .{} }, // ctx * kv_heads * head_dim for K and V
     idx_k: []u16, // ctx * idx_dim raw indexer keys, binary16
     pooled: []f32, // (ctx / ratio) * idx_dim normalized and rotated block keys
     pooled_valid: usize,
 };
 
 pub const Session = struct {
+    pub const Options = struct {
+        kv: KvFormat = .f16,
+    };
+
     allocator: Allocator,
     m: *const Model,
     pool: *Pool,
@@ -51,7 +153,7 @@ pub const Session = struct {
     observer: ?Observer = null,
     scratch: Scratch,
 
-    pub fn init(allocator: Allocator, m: *const Model, pool: *Pool, max_ctx: u32) !Session {
+    pub fn init(allocator: Allocator, m: *const Model, pool: *Pool, max_ctx: u32, options: Options) !Session {
         const h = m.h;
         var s = Session{
             .allocator = allocator,
@@ -75,7 +177,7 @@ pub const Session = struct {
         s.linear = try allocator.alloc(LinearState, n_linear);
         for (s.linear) |*ls| ls.* = .{ .conv = &.{}, .ssm = &.{} };
         s.full = try allocator.alloc(FullState, n_full);
-        for (s.full) |*fs| fs.* = .{ .k = &.{}, .v = &.{}, .idx_k = &.{}, .pooled = &.{}, .pooled_valid = 0 };
+        for (s.full) |*fs| fs.* = .{ .idx_k = &.{}, .pooled = &.{}, .pooled_valid = 0 };
         var li: u32 = 0;
         var fi: u32 = 0;
         for (m.layers, 0..) |l, i| switch (l.mixer) {
@@ -88,8 +190,7 @@ pub const Session = struct {
             .full => |f| {
                 s.layer_slot[i] = fi;
                 const kv = @as(usize, max_ctx) * h.n_head_kv * h.head_dim;
-                s.full[fi].k = try allocator.alloc(u16, kv);
-                s.full[fi].v = try allocator.alloc(u16, kv);
+                s.full[fi].kv = try AttentionKv.init(allocator, options.kv, kv);
                 s.full[fi].idx_k = try allocator.alloc(u16, @as(usize, max_ctx) * h.idx_dim);
                 s.full[fi].pooled = try allocator.alloc(f32, (@as(usize, max_ctx) / f.compress_ratio + 1) * h.idx_dim);
                 fi += 1;
@@ -106,8 +207,7 @@ pub const Session = struct {
             s.allocator.free(ls.ssm);
         }
         for (s.full) |fs| {
-            s.allocator.free(fs.k);
-            s.allocator.free(fs.v);
+            fs.kv.deinit(s.allocator);
             s.allocator.free(fs.idx_k);
             s.allocator.free(fs.pooled);
         }
@@ -418,10 +518,7 @@ pub const Session = struct {
                 kernels.rmsNorm(k, k, w.k_norm, h.eps);
                 kernels.ropeNeox(k, h.n_rot, pf, h.rope_base);
             }
-            for (0..KVW) |i| {
-                st.k[p * KVW + i] = f32ToF16(sc.kcur[t * KVW + i]);
-                st.v[p * KVW + i] = f32ToF16(sc.vcur[t * KVW + i]);
-            }
+            st.kv.store(p * KVW, sc.kcur[t * KVW ..][0..KVW], sc.vcur[t * KVW ..][0..KVW]);
         }
 
         // Cell selection per query token.
@@ -477,13 +574,20 @@ pub const Session = struct {
         const ctx = Ctx{ .s = s, .st = st, .n = n };
         s.pool.parallelFor(n * h.n_head, 1, 1, &ctx, struct {
             fn f(c: *const Ctx, start: usize, end: usize) void {
+                switch (c.st.kv) {
+                    .f16 => |data| run(u16, data.k, data.v, c, start, end),
+                    .f32 => |data| run(f32, data.k, data.v, c, start, end),
+                }
+            }
+
+            fn run(comptime T: type, k: []const T, v: []const T, c: *const Ctx, start: usize, end: usize) void {
                 const hp = c.s.m.h;
                 const sc2 = &c.s.scratch;
                 const Dd = hp.head_dim;
                 const kvw = hp.n_head_kv * Dd;
                 const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(Dd)));
                 var weights_buf: [8192]f32 = undefined;
-                var kbuf: [512]f32 = undefined;
+                var kbuf: [if (T == u16) 512 else 0]f32 = undefined;
                 for (start..end) |task| {
                     const t = task / hp.n_head;
                     const hh = task % hp.n_head;
@@ -494,9 +598,12 @@ pub const Session = struct {
                     const weights = weights_buf[0..sel.len];
                     var max: f32 = -std.math.inf(f32);
                     for (sel, 0..) |cell, i| {
-                        const krow = c.st.k[cell * kvw + kvh * Dd ..][0..Dd];
-                        for (0..Dd) |d| kbuf[d] = f16ToF32(krow[d]);
-                        const sdot = kernels.dotDense(q, kbuf[0..Dd]) * scale;
+                        const krow = k[cell * kvw + kvh * Dd ..][0..Dd];
+                        const key = if (T == u16) blk: {
+                            for (0..Dd) |d| kbuf[d] = f16ToF32(krow[d]);
+                            break :blk kbuf[0..Dd];
+                        } else krow;
+                        const sdot = kernels.dotDense(q, key) * scale;
                         weights[i] = sdot;
                         max = @max(max, sdot);
                     }
@@ -507,9 +614,9 @@ pub const Session = struct {
                     }
                     @memset(out, 0);
                     for (sel, weights) |cell, wv| {
-                        const vrow = c.st.v[cell * kvw + kvh * Dd ..][0..Dd];
+                        const vrow = v[cell * kvw + kvh * Dd ..][0..Dd];
                         const a = wv / sum;
-                        for (out, vrow) |*o, vv| o.* += a * f16ToF32(vv);
+                        for (out, vrow) |*o, vv| o.* += a * (if (T == u16) f16ToF32(vv) else vv);
                     }
                 }
             }

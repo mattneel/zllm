@@ -11,7 +11,8 @@ reference runtime, AgentionAI's llama.cpp fork.
    Every layer must choose the same experts; streams and logits must stay
    within the bounds below; every position's top-1 must agree, so the GPU's
    greedy choices are the runtime's 40 tokens. Forced prefill and decode
-   paths each match the CPU's f16 KV with the existing bounds below.
+   paths each use `--precision exact --kv f16` and match the CPU's f16 KV
+   with the existing bounds below.
    Step splits and fusion must be bitwise invariant separately within
    each path (the two paths may round differently). Prefill covers full
    and partial tiles, 7-token steps, and forced 1-token steps.
@@ -169,7 +170,7 @@ def main() -> int:
     # The last greedy token ends the turn: a stop token, not part of the text.
     want = hf.decode(long["greedy"][:-1], skip_special_tokens=False)
     context = str(1 << (len(long["prompt"]) + len(long["greedy"])).bit_length())
-    proc = zllm_on_host(args, paths, "generate", args.model, prompt, "--max-tokens", str(len(long["greedy"])), "--temperature", "0", "--ctx", context)
+    proc = zllm_on_host(args, paths, "generate", args.model, prompt, "--precision", "exact", "--kv", "f16", "--max-tokens", str(len(long["greedy"])), "--temperature", "0", "--ctx", context)
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout[-2000:] + proc.stderr[-2000:])
         raise SystemExit(f"generate failed ({args.host})")

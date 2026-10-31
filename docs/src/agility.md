@@ -5,9 +5,10 @@ and command stream as the WebGPU backend ([GPU backend](gpu.md)), with
 hand-written HLSL kernels compiled by DXC.
 
 DirectStorage model-file reads are implemented. On adapters supporting
-native LinAlg wave-matrix multiplication, dense float-activation Q8_0
-and grouped TQ2_T expert prefill GEMMs use tensor-core matrix operations.
-Other adapters retain the scalar HLSL implementations. Native wave
+native LinAlg wave-matrix multiplication, BF16/F16 projections, dense
+float-activation Q8_0 and grouped TQ2_T expert prefill have tensor-core
+variants. The native loader selects them only after model-quality calibration.
+Other adapters retain scalar HLSL. Native wave
 reductions and lane exchange also serve the decode expert and router
 kernels. See the [backend matrix](backends.md).
 
@@ -110,9 +111,10 @@ The load-time tuner renders the same twelve `MatvecVariant` candidates
 from the HLSL template. The shared fuser can fold `hc_act` into the
 quantized multiply's prologue under its single-reader and layout rules.
 Native tuning is cached through the same JSON cache as Dawn, with
-`agility` as the runtime identity. The key hashes both the scalar and LinAlg
-HLSL implementations, so either variant's source change invalidates its
-tuning entry. See [Plan cache](gpu.md#plan-cache).
+`agility` as the runtime identity. The key hashes scalar, single-product
+and compensated HLSL, native operand support and requested precision policy.
+The JSON stores the chosen precision rungs and calibration metrics as well
+as tuning; a hit skips both gates. See [Plan cache](gpu.md#plan-cache).
 
 ### Native optimizations
 
@@ -133,21 +135,26 @@ Agility is no longer only a translation of the initial WGSL algorithms:
 
 The prefill variants use wave32 16×16×16 FP16-input/FP32-accumulate
 matrices, compiled as `cs_6_10`. `host.cpp` queries that exact operation;
-`host.zig` selects variants only with experimental shader support, Shader
-Model 6.10, LinAlg tier 1.0 and native (not emulated) input/output support.
-Otherwise it compiles the scalar catalog as `cs_6_6`. Selection changes
-neither the plan nor its kernel contract, and decode still uses matvecs.
+`host.zig` accepts matrix variants only with experimental shader support,
+Shader Model 6.10, LinAlg tier 1.0 and native (not emulated) input/output
+support. `Set.create` is scalar/exact; the loader explicitly chooses a rung
+before building programs. A single-product FP16 rung, the compensated
+two-product rung and scalar f32 form the operand ladder. Capability alone
+never authorizes approximation. Kernel contracts and grids are unchanged;
+decode still uses matvecs.
 
-Activations are staged as FP16 high and residual components. Two matrix
-products accumulate high×weight and residual×weight in f32. Q8_0 signed
-bytes and TQ2_T codebook values are exact FP16 operands; each block's
-scale is applied to its dot product using register-local matrix element
-access. No model weights are expanded persistently. Grouped experts
-preserve each token's reduction order independently of tile occupancy,
-including empty and partial expert groups. The GPU checks compare original
-f32 operands at their unchanged
-1e-5 bounds and require whole/split-token results to match bitwise within
-each path. The full Gyro gates retain their existing bounds.
+The compensated Q8_0/TQ2_T rung stages activation high and residual parts,
+with exact signed-byte/codebook FP16 weight operands. Two f32-accumulating
+products are combined before each original block scale. Single-product
+variants instead round activations and scaled weights to FP16. BF16/F16
+projections have both activation variants with FP16-converted weights.
+The fixed model probe measures top-1, KL and logits relative L2, comparing
+the final combined KV/operand choice against scalar f32/f32-KV logits.
+Unsupported or rejected choices fall back without a tolerance change.
+No weights are expanded persistently. GPU checks compare each variant's
+actual operand contract at the existing 1e-5 bound and retain chunk/padding
+checks. Strict model parity runs explicitly select exact operands; diagnostic
+KV overrides still exercise their original formats and unchanged bounds.
 
 The grouped expert variant computes 64 output rows for 16 routed slots,
 with all four wave matrices doing useful work. Even x workgroups cover the
@@ -186,9 +193,11 @@ FP8 KV was added after the full port (`ecec4af`). The cache encoding is
 E4M3FN with a power-of-two scale per position and KV head, implemented in
 `fp8.hlsli` and checked byte-for-byte against the CPU encoder. That commit
 records 1233/1264 top-1 agreement with the f32 reference on Agility's
-small-model evaluation, versus 1231/1264 on Dawn. f16 remains the default.
-FP8 KV storage does not imply FP8 matrix compute or automatic
-quality-gated precision selection.
+small-model evaluation, versus 1231/1264 on Dawn. Those aggregate diagnostic
+results do not approve a default. Native loading now selects per model:
+the fixed 64-position probe rejects FP8 on both measured checkpoints.
+FP8 KV storage still does not imply FP8 matrix compute. See
+[Precision](precision.md) and [Performance](performance.md) for the ladder.
 
 The original full-port timing was 66 tok/s prefill and 28 tok/s decode on
 Gyro-Coder. Later commit messages record these narrower changes on the

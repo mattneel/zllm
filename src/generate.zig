@@ -10,6 +10,7 @@ const plan = zllm.plan;
 const plan_common = zllm.plan.common;
 const chat = zllm.chat;
 const sampler = zllm.sampler;
+const precision = zllm.precision;
 
 pub const usage =
     \\  generate <model.gguf> <prompt> [options]
@@ -20,8 +21,8 @@ pub const usage =
     \\generation options:
     \\  --max-tokens N        tokens to generate per turn (default 4096)
     \\  --ctx N               context capacity in tokens (default 8192)
-    \\  --kv f16|f32|fp8      KV cache format (default f16; fp8: E4M3 with a
-    \\                       power-of-two scale per position and KV head)
+    \\  --kv f16|f32|fp8      force the KV format instead of its quality-gated ladder
+    \\  --precision exact    f32 KV and scalar-f32 prefill operands (default: ladder)
     \\  --temperature F --top-k N --top-p F --min-p F
     \\  --repetition-penalty F --presence-penalty F --frequency-penalty F
     \\                        sampling, as in vLLM; unset, the model's defaults: the
@@ -44,7 +45,8 @@ pub const usage =
 pub const Options = struct {
     max_tokens: u32 = 4096,
     context: u32 = 8192,
-    kv: plan_common.KvFormat = .f16,
+    kv: ?plan_common.KvFormat = null,
+    precision: precision.Mode = .auto,
     temperature: ?f32 = null,
     top_k: ?u32 = null,
     top_p: ?f32 = null,
@@ -91,6 +93,8 @@ pub const Options = struct {
                 o.context = try int(u32, v);
             } else if (std.mem.eql(u8, flag, "--kv")) {
                 o.kv = std.meta.stringToEnum(plan_common.KvFormat, v) orelse return error.InvalidUsage;
+            } else if (std.mem.eql(u8, flag, "--precision")) {
+                o.precision = std.meta.stringToEnum(precision.Mode, v) orelse return error.InvalidUsage;
             } else if (std.mem.eql(u8, flag, "--temperature")) {
                 o.temperature = try float(v);
             } else if (std.mem.eql(u8, flag, "--top-k")) {
@@ -174,6 +178,11 @@ pub const Runtime = struct {
     tuned: [2]u32 = .{ 0, 0 },
     /// The tuning came from the plan cache.
     plan_cached: bool = false,
+    selection: precision.Selection = .{},
+    quality_observations: []const precision.Observation = &.{},
+    precision_cached: bool = false,
+    /// Continue the device's resource ID space for temporary quality programs.
+    next_objects: [3]u32 = @splat(0),
     /// What requests leave unset takes.
     defaults: sampler.Defaults,
     /// The model's own chat template, where chat's fixed one does not apply.
@@ -193,6 +202,8 @@ pub const Runtime = struct {
         weights: u64 = 0,
         /// The decode multiplies' tuning sweep.
         tuning: u64 = 0,
+        /// Device-reference quality calibration, skipped on a precision cache hit.
+        quality: u64 = 0,
         /// The step program: buffers and bind groups.
         program: u64 = 0,
         /// The engine's calibration batches (the first compiles nothing but
@@ -286,9 +297,10 @@ pub const Runtime = struct {
                 .webgpu => "dawn",
                 .agility => "agility",
             },
-            .limits = &.{ limits.max_binding, limits.offset_align },
+            .limits = &.{ limits.max_binding, limits.offset_align, @intFromBool(rt.device.supportsPrefill(.fp16_single)) },
             .model_header = bytes[0..@intCast(file.data_offset)],
             .backend = backend,
+            .policy = .{ .mode = o.precision, .kv = o.kv },
         });
         var rec: zllm.gpu.cmd.Recorder = .{};
         defer rec.deinit(gpa);
@@ -301,14 +313,27 @@ pub const Runtime = struct {
         try rt.executeTimed(&rec, &t, &rt.load.weights);
         const mtp = rt.model.canSpeculate(limits);
         var tuning: plan_common.Tuning = .{};
-        const cached = if (o.tune) if (o.plan_cache) |dir| readPlan(io, arena, dir, plan_key) else null else null;
+        const policy: precision.Policy = .{ .mode = o.precision, .kv = o.kv };
+        const cached = if (o.plan_cache) |dir| readPlan(io, arena, dir, plan_key) else null;
         if (cached) |found| {
-            tuning = found;
-            rt.plan_cached = true;
-            const now = Io.Timestamp.now(io, .awake);
-            rt.load.tuning = @intCast(t.durationTo(now).toNanoseconds());
-            t = now;
-        } else if (o.tune) {
+            const measured = valid: {
+                if (std.meta.eql(found.selection, policy.resolve(.{}))) break :valid true;
+                for (found.observations) |observation| {
+                    if (std.meta.eql(observation.selection, found.selection) and rt.qualityGate().accepts(observation.metrics)) break :valid true;
+                }
+                break :valid false;
+            };
+            if (measured and std.meta.eql(policy.resolve(found.selection), found.selection) and rt.device.supportsPrefill(found.selection.prefill)) {
+                rt.selection = found.selection;
+                rt.quality_observations = found.observations;
+                rt.precision_cached = true;
+            }
+            if (o.tune and found.tuned) {
+                tuning = found.tuning;
+                rt.plan_cached = true;
+            }
+        }
+        if (o.tune and !rt.plan_cached) {
             // Decoding mostly runs steps of two where it speculates.
             var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &rt.set, &rt.model, .{}, if (mtp and rt.model.speculationPays()) 2 else 1);
             while (try sweep.next()) |words| {
@@ -318,16 +343,30 @@ pub const Runtime = struct {
             }
             tuning = sweep.tuning();
             rt.tuned = .{ @intCast(sweep.shapes.len), @intCast(tuning.entries.len) };
-            if (o.plan_cache) |dir| writePlan(io, gpa, dir, plan_key, tuning) catch |err| {
+        }
+        const tuned_at = Io.Timestamp.now(io, .awake);
+        rt.load.tuning = @intCast(t.durationTo(tuned_at).toNanoseconds());
+        t = tuned_at;
+        rt.next_objects = rec.next;
+        if (!rt.precision_cached) try rt.choosePrecision(policy);
+        const gated_at = Io.Timestamp.now(io, .awake);
+        rt.load.quality = @intCast(t.durationTo(gated_at).toNanoseconds());
+        t = gated_at;
+        rec.next = rt.next_objects;
+        try rt.set.selectPrefill(gpa, arena, &rec, rt.selection.prefill);
+        if (!rt.precision_cached or (o.tune and !rt.plan_cached)) {
+            if (o.plan_cache) |dir| writePlan(io, gpa, dir, plan_key, .{
+                .tuning = if (o.tune) tuning else if (cached) |found| found.tuning else .{},
+                .tuned = o.tune or (cached != null and cached.?.tuned),
+                .selection = rt.selection,
+                .observations = rt.quality_observations,
+            }) catch |err| {
                 std.log.warn("plan cache: cannot write {s}: {t}", .{ dir, err });
             };
-            const now = Io.Timestamp.now(io, .awake);
-            rt.load.tuning = @intCast(t.durationTo(now).toNanoseconds());
-            t = now;
         }
         rt.program = try plan.Program.build(arena, gpa, &rec, &rt.set, &rt.model, .{
             .context = o.context,
-            .kv = o.kv,
+            .kv = rt.selection.kv,
             .mtp = mtp,
             .tuning = tuning,
         }, limits);
@@ -339,6 +378,129 @@ pub const Runtime = struct {
             rt.engine.calibrated(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()));
         }
         rt.load.calibration = @intCast(t.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds());
+        rt.next_objects = rec.next;
+    }
+
+    /// A fixed, versioned coding/language probe, never sampled or dependent
+    /// on the user's prompt. Tokenization is model-specific.
+    pub fn qualityPrompt(rt: *const Runtime, arena: Allocator) ![]const u32 {
+        var ids: std.ArrayList(u32) = .empty;
+        try rt.tok.encode(arena, "The capital of France is Paris. Two plus two equals four. " ++
+            "Explain why a binary search requires a sorted array. " ++
+            "Write a Python function that returns the sum of the even integers " ++
+            "in a list, and describe its time complexity. " ++
+            "A small red boat crossed the quiet lake at sunrise. " ++
+            "Translate the English word water into French. " ++
+            "In a database transaction, atomicity means that all changes succeed " ++
+            "together or none of the changes become visible.", &ids);
+        return ids.items[0..@min(ids.items.len, 64)];
+    }
+
+    pub fn qualityGate(rt: *const Runtime) precision.Gate {
+        const arch = rt.file.get("general.architecture");
+        const name = rt.file.get("general.name");
+        return .forModel(
+            if (arch != null and arch.? == .string) arch.?.string else "",
+            if (name != null and name.? == .string) name.?.string else "",
+        );
+    }
+
+    /// Reuses uploaded weights. Temporary program resources are destroyed
+    /// after readback; rung pipelines are retained for the final program.
+    pub fn qualityLogits(rt: *Runtime, arena: Allocator, selection: precision.Selection, prompt: []const u32) ![]f32 {
+        var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
+        defer scratch.deinit();
+        var rec: zllm.gpu.cmd.Recorder = .{ .next = rt.next_objects };
+        defer rec.deinit(rt.gpa);
+        defer rt.next_objects = rec.next;
+        try rt.set.selectPrefill(rt.gpa, scratch.allocator(), &rec, selection.prefill);
+        const buffers = rec.created(.buffer);
+        const groups = rec.created(.bind_group);
+        const dl = rt.device.limits();
+        var program = try plan.Program.build(scratch.allocator(), rt.gpa, &rec, &rt.set, &rt.model, .{
+            .context = @intCast(prompt.len),
+            .logit_rows = @intCast(prompt.len),
+            .kv = selection.kv,
+        }, .{ .max_binding = dl.max_binding, .offset_align = dl.offset_align });
+        const logits = try arena.alloc(f32, prompt.len * program.vocab());
+        try program.recordReset(rt.gpa, &rec);
+        try program.recordStep(rt.gpa, &rec, .{
+            .pos0 = 0,
+            .tokens = prompt,
+            .logit_rows = @intCast(prompt.len),
+            .logits = logits,
+            .path = .prefill,
+        });
+        try rec.submit(rt.gpa, 0);
+        try rt.execute(rec.batch());
+        rec.clear();
+        try rec.destroySince(rt.gpa, .bind_group, groups);
+        try rec.destroySince(rt.gpa, .buffer, buffers);
+        try rec.submit(rt.gpa, 0);
+        try rt.execute(rec.batch());
+        return logits;
+    }
+
+    pub fn qualityMetrics(exact: []const f32, candidate: []const f32, positions: usize) !precision.Metrics {
+        if (positions == 0 or exact.len != candidate.len or exact.len % positions != 0) return error.InvalidShape;
+        const vocab = exact.len / positions;
+        var metrics: precision.Metrics = .{};
+        for (0..positions) |pos| {
+            const off = pos * vocab;
+            metrics.add(exact[off..][0..vocab], candidate[off..][0..vocab]) catch |err| switch (err) {
+                error.NonFinite => return .{},
+                else => return err,
+            };
+        }
+        return metrics;
+    }
+
+    pub fn trial(rt: *Runtime, prompt: []const u32, exact: []const f32, candidate: precision.Selection) !precision.Metrics {
+        var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
+        defer scratch.deinit();
+        const logits = try rt.qualityLogits(scratch.allocator(), candidate, prompt);
+        return qualityMetrics(exact, logits, prompt.len);
+    }
+
+    fn choosePrecision(rt: *Runtime, policy: precision.Policy) !void {
+        rt.selection = policy.resolve(.{});
+        if (policy.mode == .exact) return;
+        var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        const prompt = try rt.qualityPrompt(arena);
+        // Forced KV opts that class out; isolate its operand gate against
+        // scalar arithmetic with that same cache format.
+        const reference: precision.Selection = .{ .kv = policy.kv orelse .f32 };
+        const exact = try rt.qualityLogits(arena, reference, prompt);
+        for (exact) |value| if (!std.math.isFinite(value)) return error.NonFinitePrecisionReference;
+        const gate = rt.qualityGate();
+        var observations: std.ArrayList(precision.Observation) = .empty;
+        if (policy.kv == null) {
+            for (precision.kv_rungs) |format| {
+                if (format == .f32) break;
+                const candidate: precision.Selection = .{ .kv = format };
+                const metrics = try rt.trial(prompt, exact, candidate);
+                try observations.append(rt.arena_state.allocator(), .{ .selection = candidate, .metrics = metrics });
+                if (gate.accepts(metrics)) {
+                    rt.selection = candidate;
+                    break;
+                }
+            }
+        }
+        for (precision.prefill_rungs) |rung| {
+            if (rung == .scalar_f32) break;
+            if (!rt.device.supportsPrefill(rung)) continue;
+            var candidate = rt.selection;
+            candidate.prefill = rung;
+            const metrics = try rt.trial(prompt, exact, candidate);
+            try observations.append(rt.arena_state.allocator(), .{ .selection = candidate, .metrics = metrics });
+            if (gate.accepts(metrics)) {
+                rt.selection = candidate;
+                break;
+            }
+        }
+        rt.quality_observations = observations.items;
     }
 
     /// After the device was lost (spec 8): a new device, and everything on
@@ -352,6 +514,9 @@ pub const Runtime = struct {
         rt.load = .{};
         rt.tuned = .{ 0, 0 };
         rt.plan_cached = false;
+        rt.precision_cached = false;
+        rt.selection = .{};
+        rt.quality_observations = &.{};
         try rt.open();
         errdefer rt.close();
         try rt.build();
@@ -552,7 +717,7 @@ pub fn chatLoop(rt: *Runtime, o: Options, in: *Io.Reader, out: *Io.Writer) !void
 
 /// The plan cache's tuning for `key`, from `dir`/<key>.json; null if there
 /// is none or it is unusable (plan.cache.parse).
-fn readPlan(io: Io, arena: Allocator, dir: []const u8, key: plan.cache.Key) ?plan_common.Tuning {
+fn readPlan(io: Io, arena: Allocator, dir: []const u8, key: plan.cache.Key) ?plan.cache.Entry {
     var name: [plan.cache.file_name_len]u8 = undefined;
     const d = Io.Dir.cwd().openDir(io, dir, .{}) catch return null;
     defer d.close(io);
@@ -562,10 +727,10 @@ fn readPlan(io: Io, arena: Allocator, dir: []const u8, key: plan.cache.Key) ?pla
 
 /// Stores `tuning` under `key` in `dir`, creating it; written to a
 /// temporary file first, so a reader never sees half of one.
-fn writePlan(io: Io, gpa: Allocator, dir: []const u8, key: plan.cache.Key, tuning: plan_common.Tuning) !void {
+fn writePlan(io: Io, gpa: Allocator, dir: []const u8, key: plan.cache.Key, entry: plan.cache.Entry) !void {
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(gpa);
-    try plan.cache.serialize(gpa, key, tuning, &bytes);
+    try plan.cache.serialize(gpa, key, entry, &bytes);
     try Io.Dir.cwd().createDirPath(io, dir);
     const d = try Io.Dir.cwd().openDir(io, dir, .{});
     defer d.close(io);

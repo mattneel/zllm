@@ -363,6 +363,91 @@ Agility's Gyro logits median/max rel L2 remain 2.02e-5/1.63e-4, with
 zero routing flips, 66/66 top-1, 40/40 greedy and bitwise split/unfused
 prefill results. No precision gate or tolerance changed.
 
+## Quality-gated native precision ladder
+
+The native loader now probes a fixed 64-position coding/language sequence,
+without sampling, against device scalar-f32 operands and f32 attention KV.
+It walks KV FP8/f16/f32 first, then supported single-product/compensated/
+scalar prefill operands with the selected KV. The combined choice is gated.
+Weights remain stored. Dawn has no FP16 matrix rung; Agility exposes real
+BF16/F16, float-Q8_0 and grouped TQ2_T LinAlg variants.
+
+On the RTX 5090 Laptop, Agility's isolated rung measurements are:
+
+| Model / changed rung (other class exact) | Top-1 | Mean KL, nats | Max logits rel L2 | Quality result |
+|---|---:|---:|---:|---|
+| Qwen3.5-0.8B BF16 / FP8 KV | 63/64 | 6.654813e-4 | 4.221842e-2 | Reject: agreement |
+| Qwen3.5-0.8B BF16 / f16 KV | 64/64 | 3.765059e-8 | 3.068764e-4 | Pass |
+| Qwen3.5-0.8B BF16 / single-product FP16 | 64/64 | 4.928418e-7 | 7.080552e-4 | Pass |
+| Qwen3.5-0.8B BF16 / compensated FP16 | 64/64 | 8.882968e-11 | 7.817629e-6 | Pass |
+| Gyro-Coder / FP8 KV | 62/64 | 2.063113e-2 | 1.822745e-1 | Reject |
+| Gyro-Coder / f16 KV | 62/64 | 4.219834e-3 | 9.464887e-2 | Reject |
+| Gyro-Coder / single-product FP16 | 64/64 | 4.823378e-3 | 1.000559e-1 | Reject |
+| Gyro-Coder / compensated FP16 | 64/64 | 3.875763e-11 | 2.803597e-6 | Pass |
+
+The policy is top-1 ≥99%, mean KL(P_exact || P_candidate) ≤0.001 and
+maximum relative logits L2 ≤0.1. The KL limit separates Gyro's materially
+shifted FP8/single-product distributions from compensated arithmetic;
+agreement independently rejects Qwen's FP8 candidate even though its mean
+KL passes. No existing strict implementation tolerance changes.
+
+Agility therefore chooses **f16 KV / single-product operands** for the
+0.8B checkpoint and **f32 KV / compensated operands** for Gyro. The combined
+0.8B choice measures 64/64, KL 5.079502e-7 and maximum relative L2 6.951167e-4
+against the exact device reference. Cold quality calibration took 1.498 s
+and 4.054 s respectively, including CPU metric reduction, not model-file
+upload or decode tuning. A valid plan-cache hit skips this work.
+
+`precision-check` audits lower rungs for reporting even after one passes;
+ordinary loading stops at the first passing rung. It exports the same
+probe tokens and chosen logits for the independent CPU ladder check.
+The native benchmark records selected rungs and quality-load time;
+`--precision exact` forces f32 KV and scalar-f32 operands.
+
+Independent CPU checks use a true f32 attention-cache oracle on both models.
+Gyro's legacy f16 CPU mode is retained for its unchanged strict gates;
+comparing its f16 reference with the new f32 choice would instead measure
+the KV-format change (62/64 and KL 0.0038077 on this probe), not backend
+implementation error. The optional CPU f32 cache fixes that mismatch
+without relaxing a bound; the sparse indexer remains f16.
+
+| Backend / model | Chosen KV / prefill | CPU top-1 | CPU mean KL | CPU max rel L2 |
+|---|---|---:|---:|---:|
+| Agility / Qwen3.5-0.8B | f16 / single | 64/64 | 5.081023e-7 | 6.957935e-4 |
+| Agility / Gyro-Coder | f32 / compensated | 64/64 | 1.19016e-11 | 4.18495e-6 |
+| Dawn D3D12 / Qwen3.5-0.8B | f16 / scalar | 64/64 | 3.719850e-8 | 3.066005e-4 |
+| Dawn D3D12 / Gyro-Coder | f32 / scalar | 64/64 | 4.221473e-11 | 4.897768e-6 |
+
+Dawn's FP8 rung also rejects: Qwen 63/64, KL 6.643438e-4, max relative
+L2 4.221790e-2; Gyro 62/64, KL 2.098070e-2, max relative L2 1.779240e-1.
+Native FP16 operand rungs are unsupported on Dawn, not scalar aliases.
+
+The same 1,024-token/128-decode-token benchmark at context 8192 gives:
+
+| Backend / mode | KV / prefill | Prefill tok/s | Decode tok/s | Plain decode tok/s |
+|---|---|---:|---:|---:|
+| Agility / default ladder | f32 / compensated | 167.59 | 57.92 | 58.40 |
+| Agility / `--precision exact` | f32 / scalar | 131.01 | 60.87 | 57.90 |
+| Dawn D3D12 / default ladder | f32 / scalar | 137.35 | 47.76 | 46.28 |
+| Dawn D3D12 / `--precision exact` | f32 / scalar | 149.41 | 47.61 | 49.37 |
+
+Agility's measured prefill improvement over exact is 27.92%. The earlier
+178.04 tok/s result used explicitly chosen f16 KV; the new default rejects
+that rung on its probe, so it is not the same precision policy. The
+default's remaining gap to 250 tok/s is 82.41 tok/s. These are individual
+runs with distinct policy/tuning cache keys; both exact loads retuned nine
+of eleven decode shapes. Dawn's selected algorithms are identical in the
+two modes, so its spread is not an algorithmic precision improvement.
+Default benchmark loads restored their recorded choices with zero quality
+milliseconds and reported a precision-cache hit.
+
+`zig fmt --check .`, build/test/wasm, the Python harness mutations,
+standalone Agility `gpu-check` and `check-fast` on Agility and Dawn D3D12
+all pass. `check-fast` now serializes kernel checks, strict exact forward
+parity, the CPU ladder check, and Gyro's strict f16-cache cases. Agility's
+strict Gyro prefill has zero routing flips, logits median/max relative
+L2 1.73e-5/1.24e-4 and bitwise split/unfused results; no old gate changed.
+
 ## Per-device records
 
 `benchmarks/rtx5090-laptop-d3d12.jsonl` stores the committed native benchmark

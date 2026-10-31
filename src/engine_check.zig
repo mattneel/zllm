@@ -35,7 +35,7 @@ const n_gen = 12;
 
 /// A load's total, in milliseconds.
 fn loadMs(l: gen.Runtime.Load) u64 {
-    return (l.pipelines + l.weights + l.tuning + l.program + l.calibration) / std.time.ns_per_ms;
+    return (l.pipelines + l.weights + l.tuning + l.quality + l.program + l.calibration) / std.time.ns_per_ms;
 }
 
 const Run = struct { tokens: []u32, logits: []f32, cached: u32, usage: zllm.sched.Usage };
