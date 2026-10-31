@@ -17,7 +17,7 @@ const cmd = @import("../gpu/cmd.zig");
 const ops = @import("../ref/ops.zig");
 const gguf = @import("../gguf/gguf.zig");
 const tmpl = @import("../tmpl/tmpl.zig");
-const Backend = @import("../backend/backend.zig").Backend;
+pub const Backend = @import("../backend/backend.zig").Backend;
 const velocity_kernels = @import("../velocity/kernels.zig");
 
 pub const Kernel = enum {
@@ -764,6 +764,16 @@ fn artifact(backend: Backend, arena: Allocator, k: Kernel, v: MatvecVariant) (Se
             const source = velocity_kernels.source(k) orelse return error.UnsupportedKernel;
             return if (k.isTemplate()) v.render(arena, source) else source;
         },
+    };
+}
+
+/// Kernel `k`'s source on `backend` (its template, for a templated
+/// kernel), or empty where the backend lacks it: what the plan cache's key
+/// hashes.
+pub fn backendSource(backend: Backend, k: Kernel) []const u8 {
+    return switch (backend) {
+        .webgpu => k.source(),
+        .velocity => velocity_kernels.source(k) orelse "",
     };
 }
 

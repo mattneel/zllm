@@ -288,6 +288,7 @@ pub const Runtime = struct {
             },
             .limits = &.{ limits.max_binding, limits.offset_align },
             .model_header = bytes[0..@intCast(file.data_offset)],
+            .backend = backend,
         });
         var rec: zllm.gpu.cmd.Recorder = .{};
         defer rec.deinit(gpa);

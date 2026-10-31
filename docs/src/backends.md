@@ -74,13 +74,12 @@ DXIL or serialized launch lists. A cache hit avoids the sweep, not weight
 upload or pipeline creation. Native Dawn and Velocity use different runtime
 strings in the key; the browser supplies its runtime and adapter strings.
 
-There is an important current limitation: `src/plan/cache.zig` hashes
-`Kernel.source()`, the WGSL/template catalog, plus the zllm version, adapter,
-runtime, plan limits and GGUF header/index. It does not hash Velocity's HLSL
-catalog. An HLSL-only change with an unchanged version can therefore leave
-a Velocity tuning cache valid under the existing key. The key also does not
-hash the model's tensor payload. The cache stores neither precision choices
-nor an automated model-quality verdict.
+The key hashes the zllm version, the adapter, the runtime, the plan limits,
+the GGUF header and index, the backend, and that backend's own kernel
+sources (`kernels.backendSource`: WGSL and its templates on WebGPU, HLSL on
+Velocity), so a change to any kernel a backend runs invalidates its tuning.
+It does not hash the model's tensor payload. The cache stores neither
+precision choices nor an automated model-quality verdict.
 
 ## Precision and hardware features
 
