@@ -172,6 +172,82 @@ flips, stream max rel L2 1.49e-4 and logits median/max 1.82e-5/1.32e-4.
 Dawn's unchanged prefill path has zero flips, stream max 1.12e-4 and logits
 median/max 1.86e-5/1.47e-4. See [Precision](precision.md) for operand details.
 
+## Removing Agility's per-row PLE storage waits
+
+After `91e7a65`, a 64-token step took 378.30 ms while the profiled kernels
+summed to 252.774 ms: an apparent 125.526 ms gap. That subtraction compares
+one unprofiled warm-up step with six profiled steps at later positions, so
+it is not by itself a measurement of GPU idle time.
+
+PIX-free attribution used temporary `QueryPerformanceCounter` timers around
+DirectStorage enqueue, storage-fence waits, command-list recording,
+`ExecuteCommandLists`, and the final compute-fence wait. Additional GPU
+timestamps bracketed each complete compute list, including barriers rather
+than only individual dispatches. The diagnostic code was removed before
+the final gates and measurements.
+
+The culprit was **1,024 separate DirectStorage submissions**: 16 PLE table
+rows for each of 64 tokens. The host waited for the previous storage
+ticket after every row, preventing compute submission while the GPU was
+idle. Routing and expert grouping do not read back during these prefill
+steps; neither model programs nor descriptors are rebuilt per step.
+
+Six profiled steps gave these mean diagnostic times:
+
+| Measurement | Per-row submissions | Batched submissions |
+|---|---:|---:|
+| Storage submissions / original row ranges per step | 1,024 / 1,024 | 3 / 1,024 |
+| CPU storage-fence waits | 112.016 ms | 10.834 ms |
+| CPU storage enqueue calls | 2.893 ms | 6.781 ms |
+| Native command-list recording | 1.693 ms | 1.584 ms |
+| Command-list submission | 0.126 ms | 0.089 ms |
+| Final compute-fence wait | 252.762 ms | 287.672 ms |
+| Complete compute-list GPU span | 252.610 ms | 287.502 ms |
+
+The final fence wait includes GPU execution and must not be counted as
+additional idle time. Before batching, the full-list GPU span exceeded the
+249.331 ms dispatch sum by only 3.279 ms: barriers were not the missing
+125 ms. The diagnostic run after batching had a different GPU execution
+time; its 275.834 ms dispatch sum and 307.46 ms wall time left 31.626 ms
+outside dispatches, versus 121.519 ms before. Enqueue calls can block when
+the bounded storage queue fills, so batching shifts some remaining storage
+time into enqueue rather than eliminating file I/O.
+
+The fix stages consecutive disjoint ranges for the same destination in a
+fixed 510-entry batch, retaining the existing 32 MiB request-size limit
+and two half-queue batches in flight. Buffer changes and non-monotonic or
+overlapping destinations end a batch. Overlapping writes wait for the
+earlier batch; pending reads flush before compute or a file change.
+No shader, plan, precision gate or PLE row byte changes.
+
+With diagnostic timers removed, the same model, commands, f16 KV,
+8,192-position context and cached tuning gave:
+
+| Measurement | Before (`91e7a65`) | Batched PLE reads |
+|---|---:|---:|
+| Unprofiled 64-token step | 378.30 ms | **277.56 ms** |
+| Profiled wall time, mean of six steps | 382.91 ms | 270.16 ms |
+| GPU kernel timestamp sum | 252.774 ms | 252.323 ms |
+| Unprofiled-step minus kernel-sum comparison | 125.526 ms | 25.237 ms |
+| Profiled wall minus kernel sum | 130.136 ms | 17.837 ms |
+| 1,024-token benchmark prefill, 65 steps | 118.71 tok/s | **154.07 tok/s** |
+| Greedy decode, 128 tokens | 54.49 tok/s | **61.53 tok/s** |
+| Plain decode, 128 tokens | 53.48 tok/s | **61.31 tok/s** |
+
+Prefill improves **29.78%**, and the unprofiled 64-token step falls
+**100.74 ms (26.63%)**. The remaining benchmark gap to 250 tok/s is
+95.93 tok/s, or another 1.623×. GPU arithmetic is unchanged; most of the
+wall-time gain comes from avoiding repeated CPU storage-fence waits.
+
+`zig fmt --check .`, `zig build`, `zig build test`, `zig build wasm`, and
+both Agility and Dawn D3D12 `check-fast` passed. Unit tests cover range
+preservation, the 510-request boundary, buffer changes, overlap/reversal
+mutations, and all 1,024 PLE rows reaching exactly three batches. The
+unchanged Gyro checks retain zero routing flips, 66/66 top-1 agreement and
+40/40 greedy tokens; prefill splits of seven and one token and unfused
+execution remain bitwise identical within each backend's prefill path.
+Agility's prefill logits median/max rel L2 remain 2.02e-5/1.63e-4.
+
 ## Per-device records
 
 `benchmarks/rtx5090-laptop-d3d12.jsonl` stores the committed native benchmark

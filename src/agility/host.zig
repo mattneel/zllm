@@ -22,7 +22,14 @@ const cmd = @import("../gpu/cmd.zig");
 const Timings = @import("../gpu/timings.zig").Timings;
 const Kernel = @import("../kernels/kernels.zig").Kernel;
 const hazards = @import("hazards.zig");
+const storage_reads = @import("storage.zig");
 pub const c = @import("agility_c");
+
+comptime {
+    if (@sizeOf(storage_reads.Range) != @sizeOf(c.vel_range) or
+        @alignOf(storage_reads.Range) != @alignOf(c.vel_range))
+        @compileError("DirectStorage range ABI mismatch");
+}
 
 pub const timeout_ms: u32 = 60_000;
 
@@ -177,6 +184,8 @@ pub const Host = struct {
     /// has been made to wait for.
     storage: u64 = 0,
     storage_waited: u64 = 0,
+    /// Consecutive disjoint file ranges share a storage queue submission.
+    file_reads: storage_reads.Reads = .{},
     /// The newest compute ticket, which DirectStorage writes wait for.
     compute: u64 = 0,
     /// Per-dispatch GPU times, while profiling (startProfile).
@@ -231,6 +240,7 @@ pub const Host = struct {
     pub fn setFile(h: *Host, gpa: Allocator, path: []const u8) Error!void {
         const z = try gpa.dupeSentinel(u8, path, 0);
         defer gpa.free(z);
+        try h.flushFileReads();
         if (h.file) |f| {
             try h.d.check(c.vel_release_file(h.d.ctx, f, timeout_ms));
             h.file = null;
@@ -269,6 +279,7 @@ pub const Host = struct {
         h.ops.clearRetainingCapacity();
         h.reads.clearRetainingCapacity();
         h.read_bytes = 0;
+        h.file_reads.clear();
     }
 
     fn run(h: *Host, command: cmd.Command, completions: *std.ArrayList(cmd.Completion)) Error!void {
@@ -298,7 +309,7 @@ pub const Host = struct {
             },
             .write_file => {
                 try need(a, 7);
-                try h.writeFile(try get(Buffer, h.buffers, a[0]), command.u64At(1), command.u64At(3), command.u64At(5));
+                try h.writeFile(a[0], try get(Buffer, h.buffers, a[0]), command.u64At(1), command.u64At(3), command.u64At(5));
             },
             .create_kernel => {
                 try need(a, 7);
@@ -419,7 +430,7 @@ pub const Host = struct {
                 switch (kind) {
                     .buffer => {
                         _ = try get(Buffer, h.buffers, a[1]);
-                        if (h.ops.items.len + h.writes.items.len > 0) {
+                        if (h.ops.items.len + h.writes.items.len + h.file_reads.count > 0) {
                             try h.released.append(h.gpa, a[1]);
                         } else try h.release(a[1]);
                     },
@@ -439,30 +450,36 @@ pub const Host = struct {
         try h.d.check(c.vel_release_buffer(h.d.ctx, b.b, timeout_ms));
     }
 
-    /// Enqueues DirectStorage reads of the file range into `dst`, after the
-    /// newest submitted compute work; the next submit waits for them.
-    fn writeFile(h: *Host, dst: Buffer, offset: u64, file_offset: u64, size: u64) Error!void {
-        const f = h.file orelse return error.BadCommand;
+    /// Stages file reads after the newest submitted compute work. Adjacent
+    /// destination ranges (the PLE rows) share a bounded storage submission.
+    fn writeFile(h: *Host, id: u32, dst: Buffer, offset: u64, file_offset: u64, size: u64) Error!void {
+        if (h.file == null) return error.BadCommand;
         if (file_offset > h.file_size or size > h.file_size - file_offset or offset + size > dst.size) return error.BadCommand;
-        // Requests stay within DirectStorage's staging buffer (host.cpp's
-        // default 32 MiB), and within half the queue per call so two calls
-        // in flight fit it.
         const chunk: u64 = 32 << 20;
-        const per_call = 510;
-        var ranges: [per_call]c.vel_range = undefined;
         var done: u64 = 0;
         while (done < size) {
-            var n: usize = 0;
-            while (n < per_call and done < size) : (n += 1) {
-                const len = @min(chunk, size - done);
-                ranges[n] = .{ .file_offset = file_offset + done, .buffer_offset = offset + done, .bytes = @intCast(len), .reserved = 0 };
-                done += len;
+            const len = @min(chunk, size - done);
+            const range: storage_reads.Range = .{ .file_offset = file_offset + done, .buffer_offset = offset + done, .bytes = @intCast(len) };
+            if (!h.file_reads.fits(id, range)) {
+                const ordered = h.file_reads.orderedAfter(id, range.buffer_offset);
+                try h.flushFileReads();
+                // Overlapping later writes must not race an earlier batch.
+                if (!ordered) try h.d.check(c.vel_wait_storage(h.d.ctx, h.storage, timeout_ms));
             }
-            const previous = h.storage;
-            try h.d.check(c.vel_read_ranges_after(h.d.ctx, f, dst.b, &ranges, @intCast(n), h.compute, &h.storage));
-            // At most two calls in flight.
-            if (previous > 0) try h.d.check(c.vel_wait_storage(h.d.ctx, previous, timeout_ms));
+            h.file_reads.append(id, range);
+            done += len;
         }
+    }
+
+    fn flushFileReads(h: *Host) Error!void {
+        if (h.file_reads.count == 0) return;
+        const f = h.file orelse return error.BadCommand;
+        const dst = try get(Buffer, h.buffers, h.file_reads.buffer);
+        const previous = h.storage;
+        try h.d.check(c.vel_read_ranges_after(h.d.ctx, f, dst.b, @ptrCast(&h.file_reads.ranges), @intCast(h.file_reads.count), h.compute, &h.storage));
+        h.file_reads.clear();
+        // Two half-queue batches fit; wait only once per batch, not per row.
+        if (previous > 0) try h.d.check(c.vel_wait_storage(h.d.ctx, previous, timeout_ms));
     }
 
     /// Grows host staging buffer `slot` to at least `bytes`.
@@ -484,6 +501,7 @@ pub const Host = struct {
     /// for it: reads are in place and timings collected on return.
     fn submit(h: *Host) Error!void {
         const ctx = h.d.ctx;
+        try h.flushFileReads();
         const upload = if (h.writes.items.len > 0) try h.staging(&h.upload, h.write_data.items.len) else null;
         const download = if (h.read_bytes > 0) try h.staging(&h.download, h.read_bytes) else null;
         if (upload) |u| {

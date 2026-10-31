@@ -55,6 +55,16 @@ The Zig host keeps WebGPU's semantics:
 - Dispatches are ordered by UAV barriers where buffer-range hazards require them.
 - Each `submit` blocks until the GPU has finished it.
 
+Consecutive disjoint `write_file` ranges for one destination buffer share
+a DirectStorage submission, up to 510 requests (half the 1,024-entry queue,
+reserving status/fence entries). The host keeps at most two batches in
+flight and waits once per batch rather than once per range. A 64-token
+Gyro step's 1,024 PLE row reads therefore use three submissions instead
+of 1,024. A destination change, reversal or overlap ends the batch; an
+overlapping later write waits for the earlier batch before overwriting it.
+Pending ranges flush before compute submission or a model-file change,
+and retain their destination resources until submission completes.
+
 Each kernel's contract (`Kernel.contract`) comes from its WGSL's binding
 declarations: how many bindings, and which it writes (`var<storage,
 read_write>`). `create_kernel` carries the write set. A unit test holds every

@@ -32,7 +32,7 @@ available backend, option or performance claim.
 | Automatic precision ladder | Not implemented; cache format is explicit | Same | Same | Not available |
 | Native tensor-core / matrix-intrinsic kernels | Not implemented in current WGSL kernels | Not implemented in current WGSL kernels | LinAlg wave-matrix Q8_0 float-activation and grouped TQ2_T prefill GEMMs, capability-gated with scalar HLSL fallback | No implementation |
 | Native wave optimizations | Current WGSL kernels do not use subgroup operations | Same WGSL path | Implemented in `gyro_matvec` and `moe_logits` | No implementation |
-| Model-file uploads | HTTP ranges or a local `File`, served by the shim | Ranges from a file mapping | DirectStorage range reads into GPU buffers | No file-upload path |
+| Model-file uploads | HTTP ranges or a local `File`, served by the shim | Ranges from a file mapping | DirectStorage range reads into GPU buffers, batching up to 510 consecutive disjoint ranges per destination | No file-upload path |
 | DirectStorage | No: browser has no native DirectStorage interface | No: Dawn host uses mapped bytes and queue writes | Implemented in `write_file` | Not integrated |
 | Device-lost recovery | Failed request rejects; next request rebuilds on a new owned device | Runtime rebuilds before returning the lost-device error | Same native runtime rebuild, with D3D12 error mapping and removed-device teardown | No error or recovery path |
 | CUDA Graphs | Not applicable to this API | Not applicable to this API | Not applicable to this API | Not implemented |
