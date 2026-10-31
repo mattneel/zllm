@@ -29,6 +29,46 @@ measurements distinguish HTTP loading, OPFS caching and picked files.
 These are different workloads; they should not be compared as though they
 were one benchmark.
 
+## Matched browser prefill
+
+On 2026-10-31, native Dawn D3D12 and Chrome **156.0.0.0** processed the
+same Qwen 3.5 0.8B BF16 seed-1 token prefix on the RTX 5090 Laptop GPU.
+Both used 8,192 context positions, f16 KV, stored weights, scalar-f32
+prefill, and disabled tuning/speculation. The timed workload is six
+64-token steps at positions 64–448, after a 64-token warmup, with
+**254 dispatches per step**. Browser scheduler feedback was controlled
+only in the measurement harness; real timings were recorded separately.
+
+| Matched, profiled prefill | Native Dawn | Chrome WebGPU |
+|---|---:|---:|
+| Wall ms per 64-token step | 29.480 | 30.433 |
+| Prefill tok/s | 2,171 | 2,103 |
+| Summed GPU dispatch ms per step | 26.706 | 26.957 |
+| Wall minus GPU sum, ms per step | 2.774 | 3.476 |
+
+Both profiles split dispatches into individual compute passes. The browser
+kernel sum is **0.94%** higher, not the large difference initially seen
+after idle periods. Its fixed-chunk wall time fell from roughly 48 ms to
+**28.494 ms unprofiled** after forty consecutive requests. GPU telemetry
+observed a 1,117–2,640 MHz graphics-clock ramp. These clocks were not
+locked, so this is not a clock-normalized shader-compiler comparison.
+
+There is no separate browser chunk planner: both hosts use the shared
+timing-adaptive scheduler. The earlier 1,024-token, four-native-versus-five-
+browser-step result mixed different schedules and boost states.
+Measured sustained browser replay is 0.367 ms/step, including 0.144 ms
+of API-call CPU. These prefill steps have no model `mapAsync` readback.
+The residual includes asynchronous submission/completion and profiling
+costs, which are not independently identified here.
+
+Warmed WebGPU commands now replay without per-command promise yields;
+pending compilation still waits in order. Short-run replay means of
+0.478 versus 0.450 ms do not demonstrate a material throughput gain.
+The shared scheduler and shader arithmetic remain unchanged.
+See [Browser execution](browser.md#matched-08b-prefill) for the command,
+limits and methodology; `benchmarks/qwen35-08b-browser-prefill.json`
+contains the committed per-step evidence and exact token prefix.
+
 ## Gyro-Coder Agility prefill cutover
 
 Measured on 2026-10-31 with the RTX 5090 Laptop, native Agility,

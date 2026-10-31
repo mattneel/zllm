@@ -122,7 +122,10 @@ export class Executor {
       if (op === Op.submit) {
         submits.push((await this.#submit()).done);
       } else {
-        await this.#run(op, a);
+        const pending = this.#run(op, a);
+        if (pending !== undefined) {
+          await pending;
+        }
       }
       this.#check();
     }
@@ -141,8 +144,8 @@ export class Executor {
     this.#buffers.length = 0;
   }
 
-  /** Runs one command other than `submit`. */
-  async #run(op: number, a: Uint32Array): Promise<void> {
+  /** Ready commands run synchronously; only a still-compiling pipeline suspends replay. */
+  #run(op: number, a: Uint32Array): void | Promise<void> {
     const d = this.#device;
     switch (op) {
       case Op.createBuffer:
@@ -167,41 +170,29 @@ export class Executor {
         const id = word(a, 0);
         const bytes = new Uint8Array(this.#memory.buffer, u64(a, 4), word(a, 6));
         const module = d.createShaderModule({ code: this.#decoder.decode(bytes) });
-        const pending = d.createComputePipelineAsync({
-          layout: "auto",
-          compute: { module, entryPoint: "main" },
-        });
-        put(this.#pipelines, id, pending);
-        void pending.then((p) => {
-          this.#ready[id] = p;
-        });
-        return;
-      }
-      case Op.createBindGroup: {
-        const pipeline = await get(this.#pipelines, word(a, 1), "pipeline");
-        const count = word(a, 3);
-        const entries: GPUBindGroupEntry[] = [];
-        for (let i = 0; i < count; i++) {
-          const e = a.subarray(4 + i * 6, 10 + i * 6);
-          entries.push({
-            binding: word(e, 0),
-            resource: { buffer: this.#buffer(word(e, 1)), offset: u64(e, 2), size: u64(e, 4) },
+        const pending = d
+          .createComputePipelineAsync({
+            layout: "auto",
+            compute: { module, entryPoint: "main" },
+          })
+          .then((p) => {
+            this.#ready[id] = p;
+            return p;
           });
-        }
-        const layout = pipeline.getBindGroupLayout(word(a, 2));
-        put(this.#bindGroups, word(a, 0), d.createBindGroup({ layout, entries }));
+        put(this.#pipelines, id, pending);
         return;
       }
+      case Op.createBindGroup:
       case Op.dispatch: {
-        const pipeline = await this.#pipeline(word(a, 0));
-        const pass = this.#computePass();
-        pass.setPipeline(pipeline);
-        const count = word(a, 4);
-        for (let i = 0; i < count; i++) {
-          pass.setBindGroup(i, get(this.#bindGroups, word(a, 5 + i), "bind group"));
+        const id = word(a, op === Op.createBindGroup ? 1 : 0);
+        const ready = this.#ready[id];
+        if (ready !== undefined) {
+          this.#runPipeline(op, a, ready);
+          return;
         }
-        pass.dispatchWorkgroups(word(a, 1), word(a, 2), word(a, 3));
-        return;
+        return get(this.#pipelines, id, "pipeline").then((pipeline) => {
+          this.#runPipeline(op, a, pipeline);
+        });
       }
       case Op.copyBuffer:
         this.#copyEncoder().copyBufferToBuffer(
@@ -345,9 +336,29 @@ export class Executor {
     return get(this.#buffers, id, "buffer");
   }
 
-  /** The compiled pipeline; awaits only the first use of one still compiling. */
-  async #pipeline(id: number): Promise<GPUComputePipeline> {
-    return this.#ready[id] ?? (await get(this.#pipelines, id, "pipeline"));
+  /** Runs a pipeline-dependent command after compilation, without a promise on the hot path. */
+  #runPipeline(op: number, a: Uint32Array, pipeline: GPUComputePipeline): void {
+    if (op === Op.createBindGroup) {
+      const count = word(a, 3);
+      const entries: GPUBindGroupEntry[] = [];
+      for (let i = 0; i < count; i++) {
+        const e = a.subarray(4 + i * 6, 10 + i * 6);
+        entries.push({
+          binding: word(e, 0),
+          resource: { buffer: this.#buffer(word(e, 1)), offset: u64(e, 2), size: u64(e, 4) },
+        });
+      }
+      const layout = pipeline.getBindGroupLayout(word(a, 2));
+      put(this.#bindGroups, word(a, 0), this.#device.createBindGroup({ layout, entries }));
+      return;
+    }
+    const pass = this.#computePass();
+    pass.setPipeline(pipeline);
+    const count = word(a, 4);
+    for (let i = 0; i < count; i++) {
+      pass.setBindGroup(i, get(this.#bindGroups, word(a, 5 + i), "bind group"));
+    }
+    pass.dispatchWorkgroups(word(a, 1), word(a, 2), word(a, 3));
   }
 
   #encoderOrNew(): GPUCommandEncoder {

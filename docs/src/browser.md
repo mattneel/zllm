@@ -297,6 +297,85 @@ ones don't.
 
 Source: `2acacac` (2026-10-29), the browser execution and readback report.
 
+### Matched 0.8B prefill
+
+The 2026-10-31 comparison uses Chrome **156.0.0.0**, the RTX 5090 Laptop
+GPU, and `Qwen3.5-0.8B-BF16.gguf` (1,557,662,496 bytes). Both hosts use
+8,192 context positions, f16 KV, stored BF16 weights, scalar-f32 prefill,
+and no tuning or speculation. Chrome reports the NVIDIA Blackwell adapter;
+its maximum storage binding is 2,147,483,644 bytes, maximum buffer is
+2,147,483,648 bytes, and binding alignment is 256 bytes. Both programs
+allow steps of up to 512 tokens: these limits do not explain this result.
+
+Native and wasm already use the same `sched.Engine.chunkSize` policy.
+Chunks target 90% of the 150 ms submission budget, follow the measured
+fixed and per-token costs, and stop at checkpoint and prompt boundaries.
+Consequently the same 1,024-token prompt took four native prefill steps
+but five browser steps in the initial run. That is intended timing
+adaptation, not a second browser planner or a different precision choice.
+The initial 3,472 versus 2,087 tok/s result does not isolate host overhead.
+
+For a like-for-like comparison, native `profile` and the browser process
+the same seed-1 random-token prefix: a 64-token warmup, then six 64-token
+steps covering positions 64–448. Each timed step has **254 dispatches**.
+The browser-only measurement harness controls scheduler feedback to hold
+this schedule while recording real elapsed times separately; those
+controlled feedback values are **not** the timings below. Its extra final
+sampled token is excluded. Production scheduling is unchanged.
+
+| Matched 64-token steps, per step | Native Dawn D3D12 | Chrome WebGPU |
+|---|---:|---:|
+| Profiled wall time | 29.480 ms | 30.433 ms |
+| Profiled prefill throughput | 2,171 tok/s | 2,103 tok/s |
+| Sum of dispatch timestamp intervals | 26.706 ms | 26.957 ms |
+| Wall minus dispatch sum | 2.774 ms | 3.476 ms |
+| Dispatches | 254 | 254 |
+
+Both profilers split consecutive dispatches into separate compute passes.
+The browser GPU sum is only **0.94%** higher; its profiled wall time is
+**3.23%** higher. These are profiling results, not unprofiled throughput.
+Chrome timestamps were quantized in 65,536 ns increments.
+
+GPU boost state matters much more than that remaining kernel difference.
+After idle periods, browser steps initially took 43–48 ms and a profile
+summed to about 45 ms of GPU work. Forty back-to-back requests brought the
+last six requests to **28.494 ms per unprofiled step** (2,246 tok/s);
+the immediately following profile produced the table above. Concurrent
+`nvidia-smi` telemetry observed graphics clocks rising from 1,117 to
+2,640 MHz during sustained work. Clocks were not locked. The initial
+large kernel gap is therefore not evidence of worse shader translation;
+the sustained measurements do not establish a compiler regression.
+
+The sustained unprofiled browser steps spent **0.367 ms** replaying
+commands, including **0.144 ms** inside measured WebGPU API calls:
+about **0.222 ms** remained in JS replay and its bookkeeping. These steps
+have **no model readback or `mapAsync`**: completion uses
+`onSubmittedWorkDone`. Profiling adds a timestamp-buffer readback.
+The profiled residual includes submission, completion delivery, copies
+and profiling overhead; it cannot be split into exclusive asynchronous
+IPC and callback costs from these timers.
+
+Ready command replay now stays synchronous until submission or a genuinely
+pending pipeline compilation. It no longer creates/awaits promises for
+each warmed dispatch; cold compilation still suspends dependent commands
+in order and propagates failures. Short-run replay means changed from
+0.478 to 0.450 ms per step, within timing noise. No material prefill
+throughput gain is claimed for this change; the GPU work dominates.
+
+Reproduce the native side with:
+
+```bash
+ZLLM_BACKEND=webgpu scripts/d3d12.sh profile \
+  "$(wslpath -w "$PWD/.fixtures/models/Qwen3.5-0.8B-BF16.gguf")" \
+  64 0 --no-tune --kv f16
+```
+
+The browser used `bun src/dev/serve.ts --port 8080` from `web/`, the local
+model URL, and the wasm build. `benchmarks/qwen35-08b-browser-prefill.json`
+records the exact token prefix, controlled-feedback protocol, settings,
+per-step observations, and cold-to-sustained sequence. See also
+[Performance](performance.md#matched-browser-prefill).
+
 ### The 27B
 
 Qwen 3.8 27B at Q3_K_M (13.75 GB) runs in Chrome on the same GPU:
