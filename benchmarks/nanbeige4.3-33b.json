@@ -14,92 +14,217 @@
         "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
         "model_bytes": 21161159680,
         "load_ms": {
-          "total": 144626,
-          "pipelines": 1262,
-          "weights": 133343,
-          "quality": 1408,
-          "program": 483,
-          "calibration": 3155
+          "total": 142546,
+          "pipelines": 1232,
+          "weights": 134623,
+          "quality": 1365,
+          "program": 129,
+          "calibration": 227
         },
         "precision": {
-          "kv": "f32",
+          "kv": "f16",
           "prefill": "scalar_f32",
           "weights": "stored"
         },
+        "context": 8192,
+        "memory_plan": {
+          "budget_bytes": 25309478912,
+          "headroom_bytes": 1265473945,
+          "weight_bytes": 21418672128,
+          "program_bytes": [
+            1315438592,
+            2160590848,
+            3905421312
+          ]
+        },
         "prefill": {
           "tokens": 1024,
-          "steps": 95,
-          "ms": 27842.8798,
-          "tok_s": 36.777804859108
+          "steps": 33,
+          "ms": 5176.5164,
+          "tok_s": 197.81643114276616
         },
         "decode": {
           "tokens": 128,
-          "ms": 13163.0786,
-          "tok_s": 9.724168934158001,
+          "ms": 5542.2412,
+          "tok_s": 23.095349946155356,
           "drafted": 0,
           "accepted": 0
         },
         "decode_plain": {
           "tokens": 128,
-          "ms": 14049.7211,
-          "tok_s": 9.110501133008256,
+          "ms": 5542.4632,
+          "tok_s": 23.094424875928812,
           "drafted": 0,
           "accepted": 0
         },
         "memory_observation": {
           "unit": "MiB",
           "scope": "nvidia-smi device total (includes desktop and other processes)",
-          "baseline": 970,
-          "peak": 23667,
+          "baseline": 1044,
+          "peak": 23435,
           "interval_ms": 200
         },
-        "context": 8192
+        "calibration": {
+          "selection": {
+            "kv": "f16",
+            "prefill": "scalar_f32",
+            "weights": "stored"
+          },
+          "observations": [
+            {
+              "selection": {
+                "kv": "fp8",
+                "prefill": "scalar_f32",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 61,
+                "mean_kl": 0.012766571351195464,
+                "max_rel_l2": 0.11199561229164443
+              }
+            },
+            {
+              "selection": {
+                "kv": "f16",
+                "prefill": "scalar_f32",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 60,
+                "mean_kl": 0.005895596177019826,
+                "max_rel_l2": 0.10207160146793902
+              }
+            }
+          ],
+          "memory": {
+            "budget_bytes": 25309478912,
+            "headroom_bytes": 1265473945,
+            "weight_bytes": 21418672128,
+            "program_bytes": [
+              1315438592,
+              2160590848,
+              3905421312
+            ]
+          }
+        },
+        "quality_gate_satisfied": false
       },
       "agility": {
         "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (agility)",
         "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
         "model_bytes": 21161159680,
         "load_ms": {
-          "total": 145093,
-          "pipelines": 1349,
-          "weights": 135715,
-          "quality": 2714,
-          "program": 255,
-          "calibration": 137
+          "total": 102885,
+          "pipelines": 1657,
+          "weights": 94306,
+          "quality": 2139,
+          "program": 79,
+          "calibration": 84
         },
         "precision": {
-          "kv": "f32",
-          "prefill": "fp16_single",
+          "kv": "fp8",
+          "prefill": "scalar_f32",
           "weights": "stored"
+        },
+        "context": 8192,
+        "memory_plan": {
+          "budget_bytes": 24504172544,
+          "headroom_bytes": 1225208627,
+          "weight_bytes": 21418672128,
+          "program_bytes": [
+            1315438592,
+            2160590848,
+            3905421312
+          ]
         },
         "prefill": {
           "tokens": 1024,
-          "steps": 129,
-          "ms": 45151.3511,
-          "tok_s": 22.67927703275307
+          "steps": 33,
+          "ms": 5012.334,
+          "tok_s": 204.29604252230598
         },
         "decode": {
           "tokens": 128,
-          "ms": 10404.4476,
-          "tok_s": 12.302431125704357,
+          "ms": 6032.9789,
+          "tok_s": 21.216716007410533,
           "drafted": 0,
           "accepted": 0
         },
         "decode_plain": {
           "tokens": 128,
-          "ms": 10310.1193,
-          "tok_s": 12.414987283415817,
+          "ms": 5862.0032,
+          "tok_s": 21.83553908670674,
           "drafted": 0,
           "accepted": 0
         },
         "memory_observation": {
           "unit": "MiB",
           "scope": "nvidia-smi device total (includes desktop and other processes)",
-          "baseline": 1315,
-          "peak": 23865,
+          "baseline": 900,
+          "peak": 22716,
           "interval_ms": 200
         },
-        "context": 8192
+        "calibration": {
+          "selection": {
+            "kv": "fp8",
+            "prefill": "scalar_f32",
+            "weights": "stored"
+          },
+          "observations": [
+            {
+              "selection": {
+                "kv": "fp8",
+                "prefill": "scalar_f32",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 61,
+                "mean_kl": 0.012766571351195464,
+                "max_rel_l2": 0.11199561229164443
+              }
+            },
+            {
+              "selection": {
+                "kv": "fp8",
+                "prefill": "fp16_single",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 61,
+                "mean_kl": 0.012766571351195464,
+                "max_rel_l2": 0.11199561229164443
+              }
+            },
+            {
+              "selection": {
+                "kv": "fp8",
+                "prefill": "fp16_compensated",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 61,
+                "mean_kl": 0.012766571351195464,
+                "max_rel_l2": 0.11199561229164443
+              }
+            }
+          ],
+          "memory": {
+            "budget_bytes": 24504172544,
+            "headroom_bytes": 1225208627,
+            "weight_bytes": 21418672128,
+            "program_bytes": [
+              1315438592,
+              2160590848,
+              3905421312
+            ]
+          }
+        },
+        "quality_gate_satisfied": false
       }
     },
     "context4096": {
@@ -108,110 +233,243 @@
         "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
         "model_bytes": 21161159680,
         "load_ms": {
-          "total": 144380,
-          "pipelines": 1313,
-          "weights": 139626,
-          "quality": 0,
-          "program": 1513,
-          "calibration": 1471
+          "total": 134729,
+          "pipelines": 1290,
+          "weights": 126882,
+          "quality": 1377,
+          "program": 113,
+          "calibration": 158
         },
         "precision": {
           "kv": "f32",
           "prefill": "scalar_f32",
           "weights": "stored"
         },
+        "context": 4096,
+        "memory_plan": {
+          "budget_bytes": 25309478912,
+          "headroom_bytes": 1265473945,
+          "weight_bytes": 21418672128,
+          "program_bytes": [
+            803864576,
+            1226440704,
+            2098855936
+          ]
+        },
         "prefill": {
           "tokens": 1024,
           "steps": 33,
-          "ms": 5274.3452,
-          "tok_s": 194.14732278046574
+          "ms": 5253.5441,
+          "tok_s": 194.91603772775028
         },
         "decode": {
           "tokens": 128,
-          "ms": 5618.6359,
-          "tok_s": 22.781330251351577,
+          "ms": 5729.6023,
+          "tok_s": 22.340119487874407,
           "drafted": 0,
           "accepted": 0
         },
         "decode_plain": {
           "tokens": 128,
-          "ms": 5649.9277,
-          "tok_s": 22.6551571624536,
+          "ms": 5709.9857,
+          "tok_s": 22.41686874977638,
           "drafted": 0,
           "accepted": 0
         },
-        "context": 4096,
         "memory_observation": {
           "unit": "MiB",
           "scope": "nvidia-smi device total (includes desktop and other processes)",
-          "baseline": 903,
-          "peak": 23447,
+          "baseline": 930,
+          "peak": 23399,
           "interval_ms": 200
-        }
+        },
+        "calibration": {
+          "selection": {
+            "kv": "f32",
+            "prefill": "scalar_f32",
+            "weights": "stored"
+          },
+          "observations": [
+            {
+              "selection": {
+                "kv": "fp8",
+                "prefill": "scalar_f32",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 61,
+                "mean_kl": 0.012766571351195464,
+                "max_rel_l2": 0.11199561229164443
+              }
+            },
+            {
+              "selection": {
+                "kv": "f16",
+                "prefill": "scalar_f32",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 60,
+                "mean_kl": 0.005895596177019826,
+                "max_rel_l2": 0.10207160146793902
+              }
+            },
+            {
+              "selection": {
+                "kv": "f32",
+                "prefill": "scalar_f32",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 64,
+                "mean_kl": 0,
+                "max_rel_l2": 0
+              }
+            }
+          ],
+          "memory": {
+            "budget_bytes": 25309478912,
+            "headroom_bytes": 1265473945,
+            "weight_bytes": 21418672128,
+            "program_bytes": [
+              803864576,
+              1226440704,
+              2098855936
+            ]
+          }
+        },
+        "quality_gate_satisfied": true
       },
       "agility": {
         "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (agility)",
         "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
         "model_bytes": 21161159680,
         "load_ms": {
-          "total": 99504,
-          "pipelines": 1177,
-          "weights": 96703,
-          "quality": 0,
-          "program": 455,
-          "calibration": 142
+          "total": 100174,
+          "pipelines": 1226,
+          "weights": 92013,
+          "quality": 2681,
+          "program": 62,
+          "calibration": 83
         },
         "precision": {
-          "kv": "f32",
-          "prefill": "fp16_single",
+          "kv": "f16",
+          "prefill": "scalar_f32",
           "weights": "stored"
+        },
+        "context": 4096,
+        "memory_plan": {
+          "budget_bytes": 24504172544,
+          "headroom_bytes": 1225208627,
+          "weight_bytes": 21418672128,
+          "program_bytes": [
+            803864576,
+            1226440704,
+            2098855936
+          ]
         },
         "prefill": {
           "tokens": 1024,
-          "steps": 129,
-          "ms": 30845.8298,
-          "tok_s": 33.19735622738864
+          "steps": 33,
+          "ms": 5066.1661,
+          "tok_s": 202.12523233298646
         },
         "decode": {
           "tokens": 128,
-          "ms": 5983.0659,
-          "tok_s": 21.393713881707374,
+          "ms": 5700.303,
+          "tok_s": 22.454946693184556,
           "drafted": 0,
           "accepted": 0
         },
         "decode_plain": {
           "tokens": 128,
-          "ms": 6043.5646,
-          "tok_s": 21.179553536997023,
+          "ms": 5677.9596,
+          "tok_s": 22.543309395861147,
           "drafted": 0,
           "accepted": 0
         },
-        "context": 4096,
         "memory_observation": {
           "unit": "MiB",
           "scope": "nvidia-smi device total (includes desktop and other processes)",
-          "baseline": 1002,
-          "peak": 23561,
+          "baseline": 900,
+          "peak": 22678,
           "interval_ms": 200
-        }
-      }
-    },
-    "chat": {
-      "webgpu": {
-        "prompt": "Explain grouped-query attention in four concise sentences.",
-        "context": 4096,
-        "temperature": 0,
-        "thinking": false,
-        "response_stdout": "> **Grouped-Query Attention (GQA)** is an architectural variation of attention used in Transformer models that strikes a balance between computational efficiency and model quality. \n\nHere is the explanation in four concise sentences:\n\n1. **Definition & Mechanism:** Grouped-Query Attention reduces the number of key and value (K, V) projection heads relative to the query (Q) heads, allowing multiple query heads to share the same grouped key and value heads.\n2. **Efficiency Gain:** By sharing K and V weights, GQA significantly lowers the memory footprint and computational cost of the attention mechanism during both training and inference compared to standard Multi-Head Attention (MHA).\n3. **Quality Retention:** Unlike pure Multi-Query Attention (MQA), which uses only a\n> ",
-        "stderr": "anyzig: .minimum_zig_version '0.18.0-dev.738+ae9a8acc7' pulled from '/home/autark/src/zllm/build.zig.zon'\nanyzig: appdata '/home/autark/.local/share/anyzig'\nanyzig: zig '0.18.0-dev.738+ae9a8acc7' already exists at '/home/autark/.cache/zig/p/N-V-__8AADgW3Bb5lb-jBsyiB_zzQz3M1k3M5zPf2XNm1GGX'\nError: DynamicLib.Open: d3dcompiler_47.dll Windows Error: 87\r\n    at EnsureFXC (D:\\a\\dawn\\dawn\\src\\dawn\\native\\d3d\\PlatformFunctions.cpp:119)\r\n\r\nWarning: Couldn't load Vulkan: DynamicLib.Open: vulkan-1.dll Windows Error: 87\r\n    at operator () (D:\\a\\dawn\\dawn\\src\\dawn\\native\\vulkan\\BackendVk.cpp:321)\r\n\r\n[NVIDIA GeForce RTX 5090 Laptop GPU (d3d12); loaded in 144569 ms (pipelines 1417, weights 140011, tuning 1, quality 0, program 1281, calibration 1343); context 4096, f32 KV; prefill scalar_f32; weights stored; tuning from the plan cache; precision from the plan cache]\n\n[length; prompt 45 tokens (0 reused), prefill 45 in 3 steps, 617 ms (73 tok/s); 160 generated in 6823 ms (23.3 tok/s)]\n"
-      },
-      "agility": {
-        "prompt": "Explain grouped-query attention in four concise sentences.",
-        "context": 4096,
-        "temperature": 0,
-        "thinking": false,
-        "response_stdout": "> **Grouped-Query Attention (GQA)** is an architectural variation of attention used in Transformer models that strikes a balance between computational efficiency and model quality. \n\nHere is the explanation in four concise sentences:\n\n1. **Definition & Mechanism:** Grouped-Query Attention reduces the number of key and value (K, V) projection heads relative to the query (Q) heads, allowing multiple query heads to share the same grouped key and value heads.\n2. **Efficiency Gain:** By sharing K and V weights, GQA significantly lowers the memory footprint and computational cost of the attention mechanism during both training and inference compared to standard Multi-Head Attention (MHA).\n3. **Quality Retention:** Unlike pure Multi-Query Attention (MQA), which uses only a\n> ",
-        "stderr": "anyzig: .minimum_zig_version '0.18.0-dev.738+ae9a8acc7' pulled from '/home/autark/src/zllm/build.zig.zon'\nanyzig: appdata '/home/autark/.local/share/anyzig'\nanyzig: zig '0.18.0-dev.738+ae9a8acc7' already exists at '/home/autark/.cache/zig/p/N-V-__8AADgW3Bb5lb-jBsyiB_zzQz3M1k3M5zPf2XNm1GGX'\n[NVIDIA GeForce RTX 5090 Laptop GPU (agility); loaded in 94744 ms (pipelines 1162, weights 91913, tuning 10, quality 0, program 609, calibration 76); context 4096, f32 KV; prefill fp16_single; weights stored; tuning from the plan cache; precision from the plan cache]\n\n[length; prompt 45 tokens (0 reused), prefill 45 in 5 steps, 959 ms (47 tok/s); 160 generated in 7334 ms (21.7 tok/s)]\n"
+        },
+        "calibration": {
+          "selection": {
+            "kv": "f16",
+            "prefill": "scalar_f32",
+            "weights": "stored"
+          },
+          "observations": [
+            {
+              "selection": {
+                "kv": "fp8",
+                "prefill": "scalar_f32",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 61,
+                "mean_kl": 0.012766571351195464,
+                "max_rel_l2": 0.11199561229164443
+              }
+            },
+            {
+              "selection": {
+                "kv": "f16",
+                "prefill": "scalar_f32",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 60,
+                "mean_kl": 0.005895596177019826,
+                "max_rel_l2": 0.10207160146793902
+              }
+            },
+            {
+              "selection": {
+                "kv": "f16",
+                "prefill": "fp16_single",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 60,
+                "mean_kl": 0.005895596177019826,
+                "max_rel_l2": 0.10207160146793902
+              }
+            },
+            {
+              "selection": {
+                "kv": "f16",
+                "prefill": "fp16_compensated",
+                "weights": "stored"
+              },
+              "metrics": {
+                "positions": 64,
+                "top1_matches": 60,
+                "mean_kl": 0.005895596177019826,
+                "max_rel_l2": 0.10207160146793902
+              }
+            }
+          ],
+          "memory": {
+            "budget_bytes": 24504172544,
+            "headroom_bytes": 1225208627,
+            "weight_bytes": 21418672128,
+            "program_bytes": [
+              803864576,
+              1226440704,
+              2098855936
+            ]
+          }
+        },
+        "quality_gate_satisfied": false
       }
     }
   },
@@ -455,5 +713,514 @@
       877,
       901
     ]
+  },
+  "native_before_memory_aware": {
+    "default_context8192": {
+      "webgpu": {
+        "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (d3d12)",
+        "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+        "model_bytes": 21161159680,
+        "load_ms": {
+          "total": 144626,
+          "pipelines": 1262,
+          "weights": 133343,
+          "quality": 1408,
+          "program": 483,
+          "calibration": 3155
+        },
+        "precision": {
+          "kv": "f32",
+          "prefill": "scalar_f32",
+          "weights": "stored"
+        },
+        "prefill": {
+          "tokens": 1024,
+          "steps": 95,
+          "ms": 27842.8798,
+          "tok_s": 36.777804859108
+        },
+        "decode": {
+          "tokens": 128,
+          "ms": 13163.0786,
+          "tok_s": 9.724168934158001,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "decode_plain": {
+          "tokens": 128,
+          "ms": 14049.7211,
+          "tok_s": 9.110501133008256,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "memory_observation": {
+          "unit": "MiB",
+          "scope": "nvidia-smi device total (includes desktop and other processes)",
+          "baseline": 970,
+          "peak": 23667,
+          "interval_ms": 200
+        },
+        "context": 8192
+      },
+      "agility": {
+        "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (agility)",
+        "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+        "model_bytes": 21161159680,
+        "load_ms": {
+          "total": 145093,
+          "pipelines": 1349,
+          "weights": 135715,
+          "quality": 2714,
+          "program": 255,
+          "calibration": 137
+        },
+        "precision": {
+          "kv": "f32",
+          "prefill": "fp16_single",
+          "weights": "stored"
+        },
+        "prefill": {
+          "tokens": 1024,
+          "steps": 129,
+          "ms": 45151.3511,
+          "tok_s": 22.67927703275307
+        },
+        "decode": {
+          "tokens": 128,
+          "ms": 10404.4476,
+          "tok_s": 12.302431125704357,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "decode_plain": {
+          "tokens": 128,
+          "ms": 10310.1193,
+          "tok_s": 12.414987283415817,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "memory_observation": {
+          "unit": "MiB",
+          "scope": "nvidia-smi device total (includes desktop and other processes)",
+          "baseline": 1315,
+          "peak": 23865,
+          "interval_ms": 200
+        },
+        "context": 8192
+      }
+    },
+    "context4096": {
+      "webgpu": {
+        "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (d3d12)",
+        "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+        "model_bytes": 21161159680,
+        "load_ms": {
+          "total": 144380,
+          "pipelines": 1313,
+          "weights": 139626,
+          "quality": 0,
+          "program": 1513,
+          "calibration": 1471
+        },
+        "precision": {
+          "kv": "f32",
+          "prefill": "scalar_f32",
+          "weights": "stored"
+        },
+        "prefill": {
+          "tokens": 1024,
+          "steps": 33,
+          "ms": 5274.3452,
+          "tok_s": 194.14732278046574
+        },
+        "decode": {
+          "tokens": 128,
+          "ms": 5618.6359,
+          "tok_s": 22.781330251351577,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "decode_plain": {
+          "tokens": 128,
+          "ms": 5649.9277,
+          "tok_s": 22.6551571624536,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "context": 4096,
+        "memory_observation": {
+          "unit": "MiB",
+          "scope": "nvidia-smi device total (includes desktop and other processes)",
+          "baseline": 903,
+          "peak": 23447,
+          "interval_ms": 200
+        }
+      },
+      "agility": {
+        "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (agility)",
+        "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+        "model_bytes": 21161159680,
+        "load_ms": {
+          "total": 99504,
+          "pipelines": 1177,
+          "weights": 96703,
+          "quality": 0,
+          "program": 455,
+          "calibration": 142
+        },
+        "precision": {
+          "kv": "f32",
+          "prefill": "fp16_single",
+          "weights": "stored"
+        },
+        "prefill": {
+          "tokens": 1024,
+          "steps": 129,
+          "ms": 30845.8298,
+          "tok_s": 33.19735622738864
+        },
+        "decode": {
+          "tokens": 128,
+          "ms": 5983.0659,
+          "tok_s": 21.393713881707374,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "decode_plain": {
+          "tokens": 128,
+          "ms": 6043.5646,
+          "tok_s": 21.179553536997023,
+          "drafted": 0,
+          "accepted": 0
+        },
+        "context": 4096,
+        "memory_observation": {
+          "unit": "MiB",
+          "scope": "nvidia-smi device total (includes desktop and other processes)",
+          "baseline": 1002,
+          "peak": 23561,
+          "interval_ms": 200
+        }
+      }
+    },
+    "chat": {
+      "webgpu": {
+        "prompt": "Explain grouped-query attention in four concise sentences.",
+        "context": 4096,
+        "temperature": 0,
+        "thinking": false,
+        "response_stdout": "> **Grouped-Query Attention (GQA)** is an architectural variation of attention used in Transformer models that strikes a balance between computational efficiency and model quality. \n\nHere is the explanation in four concise sentences:\n\n1. **Definition & Mechanism:** Grouped-Query Attention reduces the number of key and value (K, V) projection heads relative to the query (Q) heads, allowing multiple query heads to share the same grouped key and value heads.\n2. **Efficiency Gain:** By sharing K and V weights, GQA significantly lowers the memory footprint and computational cost of the attention mechanism during both training and inference compared to standard Multi-Head Attention (MHA).\n3. **Quality Retention:** Unlike pure Multi-Query Attention (MQA), which uses only a\n> ",
+        "stderr": "anyzig: .minimum_zig_version '0.18.0-dev.738+ae9a8acc7' pulled from '/home/autark/src/zllm/build.zig.zon'\nanyzig: appdata '/home/autark/.local/share/anyzig'\nanyzig: zig '0.18.0-dev.738+ae9a8acc7' already exists at '/home/autark/.cache/zig/p/N-V-__8AADgW3Bb5lb-jBsyiB_zzQz3M1k3M5zPf2XNm1GGX'\nError: DynamicLib.Open: d3dcompiler_47.dll Windows Error: 87\r\n    at EnsureFXC (D:\\a\\dawn\\dawn\\src\\dawn\\native\\d3d\\PlatformFunctions.cpp:119)\r\n\r\nWarning: Couldn't load Vulkan: DynamicLib.Open: vulkan-1.dll Windows Error: 87\r\n    at operator () (D:\\a\\dawn\\dawn\\src\\dawn\\native\\vulkan\\BackendVk.cpp:321)\r\n\r\n[NVIDIA GeForce RTX 5090 Laptop GPU (d3d12); loaded in 144569 ms (pipelines 1417, weights 140011, tuning 1, quality 0, program 1281, calibration 1343); context 4096, f32 KV; prefill scalar_f32; weights stored; tuning from the plan cache; precision from the plan cache]\n\n[length; prompt 45 tokens (0 reused), prefill 45 in 3 steps, 617 ms (73 tok/s); 160 generated in 6823 ms (23.3 tok/s)]\n"
+      },
+      "agility": {
+        "prompt": "Explain grouped-query attention in four concise sentences.",
+        "context": 4096,
+        "temperature": 0,
+        "thinking": false,
+        "response_stdout": "> **Grouped-Query Attention (GQA)** is an architectural variation of attention used in Transformer models that strikes a balance between computational efficiency and model quality. \n\nHere is the explanation in four concise sentences:\n\n1. **Definition & Mechanism:** Grouped-Query Attention reduces the number of key and value (K, V) projection heads relative to the query (Q) heads, allowing multiple query heads to share the same grouped key and value heads.\n2. **Efficiency Gain:** By sharing K and V weights, GQA significantly lowers the memory footprint and computational cost of the attention mechanism during both training and inference compared to standard Multi-Head Attention (MHA).\n3. **Quality Retention:** Unlike pure Multi-Query Attention (MQA), which uses only a\n> ",
+        "stderr": "anyzig: .minimum_zig_version '0.18.0-dev.738+ae9a8acc7' pulled from '/home/autark/src/zllm/build.zig.zon'\nanyzig: appdata '/home/autark/.local/share/anyzig'\nanyzig: zig '0.18.0-dev.738+ae9a8acc7' already exists at '/home/autark/.cache/zig/p/N-V-__8AADgW3Bb5lb-jBsyiB_zzQz3M1k3M5zPf2XNm1GGX'\n[NVIDIA GeForce RTX 5090 Laptop GPU (agility); loaded in 94744 ms (pipelines 1162, weights 91913, tuning 10, quality 0, program 609, calibration 76); context 4096, f32 KV; prefill fp16_single; weights stored; tuning from the plan cache; precision from the plan cache]\n\n[length; prompt 45 tokens (0 reused), prefill 45 in 5 steps, 959 ms (47 tok/s); 160 generated in 7334 ms (21.7 tok/s)]\n"
+      }
+    }
+  },
+  "memory_aware_policy": {
+    "headroom": "5% of device budget, minimum 512 MiB",
+    "buffer_alignment_bytes": 65536,
+    "budget_sources": {
+      "webgpu": "largest device-local Dawn adapter memory heap",
+      "agility": "DXGI QueryVideoMemoryInfo LOCAL Budget"
+    },
+    "fallback": "most accurate fitting KV / scalar f32 if no fitting rung passes unchanged quality gate; explicit stderr warning",
+    "program_bytes_order": [
+      "fp8",
+      "f16",
+      "f32"
+    ]
+  },
+  "agility4096_prefill_control": {
+    "adapter": "NVIDIA GeForce RTX 5090 Laptop GPU (agility)",
+    "model": "Nanbeige4.3-33B-AD-Q4_K_M.gguf",
+    "model_bytes": 21161159680,
+    "load_ms": {
+      "total": 95846,
+      "pipelines": 1086,
+      "weights": 87085,
+      "quality": 3492,
+      "program": 60,
+      "calibration": 84
+    },
+    "precision": {
+      "kv": "f16",
+      "prefill": "scalar_f32",
+      "weights": "stored"
+    },
+    "context": 4096,
+    "memory_plan": {
+      "budget_bytes": 24504172544,
+      "headroom_bytes": 1225208627,
+      "weight_bytes": 21418672128,
+      "program_bytes": [
+        803864576,
+        1226440704,
+        2098855936
+      ]
+    },
+    "prefill": {
+      "tokens": 1024,
+      "steps": 126,
+      "ms": 30152.8205,
+      "tok_s": 33.960338801472986
+    },
+    "decode": {
+      "tokens": 128,
+      "ms": 5666.5823,
+      "tok_s": 22.588571598086556,
+      "drafted": 0,
+      "accepted": 0
+    },
+    "decode_plain": {
+      "tokens": 128,
+      "ms": 5883.5281,
+      "tok_s": 21.755653720766624,
+      "drafted": 0,
+      "accepted": 0
+    },
+    "memory_observation": {
+      "unit": "MiB",
+      "scope": "nvidia-smi device total (includes desktop and other processes)",
+      "baseline": 947,
+      "peak": 22678,
+      "interval_ms": 200
+    },
+    "change": "Memory-aware ladder retained; only packed dot helper temporarily restored to manual unpack/multiply/sum. Final intrinsic uses dot4add_i8packed(a,b,0).",
+    "conclusion": "Not memory pressure: same f16 KV, scalar prefill, allocations, device budget and 22678 MiB peak; manual dot 33.9603 tok/s in 126 steps versus native packed dot 202.1252 tok/s in 33 steps."
+  },
+  "reference_model_rungs": [
+    {
+      "model": "Qwen3.5-0.8B-BF16.gguf",
+      "backend": "agility",
+      "context": 8192,
+      "selection": {
+        "kv": "f16",
+        "prefill": "fp16_compensated",
+        "weights": "stored"
+      },
+      "quality_limited": false,
+      "metrics": {
+        "positions": 64,
+        "top1_matches": 64,
+        "mean_kl": 3.7443249876986107e-08,
+        "max_rel_l2": 0.0003121196439177267
+      },
+      "memory_plan": {
+        "budget_bytes": 24504172544,
+        "headroom_bytes": 1225208627,
+        "weight_bytes": 1555038208,
+        "program_bytes": [
+          306184192,
+          363986944,
+          481427456
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf",
+      "backend": "agility",
+      "context": 8192,
+      "selection": {
+        "kv": "f32",
+        "prefill": "fp16_compensated",
+        "weights": "stored"
+      },
+      "quality_limited": false,
+      "metrics": {
+        "positions": 64,
+        "top1_matches": 64,
+        "mean_kl": 3.759944971104107e-11,
+        "max_rel_l2": 2.3572257753624467e-06
+      },
+      "memory_plan": {
+        "budget_bytes": 24504172544,
+        "headroom_bytes": 1225208627,
+        "weight_bytes": 21445672960,
+        "program_bytes": [
+          1186988032,
+          1286078464,
+          1487405056
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.5-0.8B-BF16.gguf",
+      "backend": "agility",
+      "context": 4096,
+      "selection": {
+        "kv": "f16",
+        "prefill": "fp16_compensated",
+        "weights": "stored"
+      },
+      "quality_limited": false,
+      "metrics": {
+        "positions": 64,
+        "top1_matches": 64,
+        "mean_kl": 3.7443249876986107e-08,
+        "max_rel_l2": 0.0003121196439177267
+      },
+      "memory_plan": {
+        "budget_bytes": 24504172544,
+        "headroom_bytes": 1225208627,
+        "weight_bytes": 1555038208,
+        "program_bytes": [
+          257818624,
+          286261248,
+          344981504
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf",
+      "backend": "agility",
+      "context": 4096,
+      "selection": {
+        "kv": "f32",
+        "prefill": "fp16_compensated",
+        "weights": "stored"
+      },
+      "quality_limited": false,
+      "metrics": {
+        "positions": 64,
+        "top1_matches": 64,
+        "mean_kl": 3.759944971104107e-11,
+        "max_rel_l2": 2.3572257753624467e-06
+      },
+      "memory_plan": {
+        "budget_bytes": 24504172544,
+        "headroom_bytes": 1225208627,
+        "weight_bytes": 21445672960,
+        "program_bytes": [
+          1061814272,
+          1110573056,
+          1211236352
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.5-0.8B-BF16.gguf",
+      "backend": "webgpu",
+      "context": 8192,
+      "selection": {
+        "kv": "f16",
+        "prefill": "scalar_f32",
+        "weights": "stored"
+      },
+      "quality_limited": false,
+      "metrics": {
+        "positions": 64,
+        "top1_matches": 64,
+        "mean_kl": 3.6988294431300985e-08,
+        "max_rel_l2": 0.0003067154109537649
+      },
+      "memory_plan": {
+        "budget_bytes": 25309478912,
+        "headroom_bytes": 1265473945,
+        "weight_bytes": 1555038208,
+        "program_bytes": [
+          306184192,
+          363986944,
+          481427456
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf",
+      "backend": "webgpu",
+      "context": 8192,
+      "selection": {
+        "kv": "f32",
+        "prefill": "scalar_f32",
+        "weights": "stored"
+      },
+      "quality_limited": false,
+      "metrics": {
+        "positions": 64,
+        "top1_matches": 64,
+        "mean_kl": 0,
+        "max_rel_l2": 0
+      },
+      "memory_plan": {
+        "budget_bytes": 25309478912,
+        "headroom_bytes": 1265473945,
+        "weight_bytes": 21445672960,
+        "program_bytes": [
+          1186988032,
+          1286078464,
+          1487405056
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.5-0.8B-BF16.gguf",
+      "backend": "webgpu",
+      "context": 4096,
+      "selection": {
+        "kv": "f16",
+        "prefill": "scalar_f32",
+        "weights": "stored"
+      },
+      "quality_limited": false,
+      "metrics": {
+        "positions": 64,
+        "top1_matches": 64,
+        "mean_kl": 3.6988294431300985e-08,
+        "max_rel_l2": 0.0003067154109537649
+      },
+      "memory_plan": {
+        "budget_bytes": 25309478912,
+        "headroom_bytes": 1265473945,
+        "weight_bytes": 1555038208,
+        "program_bytes": [
+          257818624,
+          286261248,
+          344981504
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf",
+      "backend": "webgpu",
+      "context": 4096,
+      "selection": {
+        "kv": "f32",
+        "prefill": "scalar_f32",
+        "weights": "stored"
+      },
+      "quality_limited": false,
+      "metrics": {
+        "positions": 64,
+        "top1_matches": 64,
+        "mean_kl": 0,
+        "max_rel_l2": 0
+      },
+      "memory_plan": {
+        "budget_bytes": 25309478912,
+        "headroom_bytes": 1265473945,
+        "weight_bytes": 21445672960,
+        "program_bytes": [
+          1061814272,
+          1110573056,
+          1211236352
+        ]
+      }
+    }
+  ],
+  "verification": {
+    "commands_passed": [
+      "zig fmt --check .",
+      "zig build",
+      "zig build test",
+      "zig build wasm",
+      "zig build check-fast -Dgpu-host=agility -Dgyro-model=/mnt/c/models/Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf",
+      "zig build check-fast -Dgpu-host=d3d12 -Dgyro-model=/mnt/c/models/Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf"
+    ],
+    "mutation": "Replacing the fits predicate in precision.fastestPassing with an unconditional true caused the non-fitting-rung unit test to fail; restored production predicate."
   }
 }

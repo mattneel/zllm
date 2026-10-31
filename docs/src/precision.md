@@ -152,14 +152,29 @@ ladder. Each class is ordered fastest-first:
 - weight storage: **stored** only. There are no unimplemented weight rungs
   or automatic persistent requantization.
 
+Before calibration, the loader checks each rung at the requested serving
+context. It counts the model's resident GPU weight buffers and the actual
+program allocations (KV, activations, recurrent state, checkpoints and
+parameters), rounding each buffer up to 64 KiB. The device budget comes
+from Agility's live DXGI local-memory budget or Dawn's largest device-local
+adapter memory heap. Headroom is **5% of that budget, with a 512 MiB
+minimum**. A rung whose allocations plus headroom exceed the budget is
+unsupported and skipped before its quality trial. If memory information
+is unavailable, loading explicitly warns that fit filtering is disabled.
+
 The loader runs a fixed coding/language text (the first 64 model-tokenized
 positions) through the exact device path, with f32 KV and scalar operands.
-It tries KV candidates first with scalar operands, then supported operand
-candidates with the chosen KV. The latter comparison uses the same exact
-logits, so the combined choice must pass, not merely its isolated classes.
-No tokens are sampled. Unsupported operand rungs are skipped; Dawn currently
-has only scalar-f32 prefill. Browser loading still uses its explicit KV
-option and does not run the native calibration.
+The oracle uses only the short probe context, not a full-size f32 serving
+cache. It tries fitting KV candidates first with scalar operands, then
+supported operand candidates with the chosen KV. The latter comparison uses
+the same exact logits, so the combined choice must pass, not merely its
+isolated classes. If no quality-passing KV rung fits, the loader uses the
+most accurate fitting rung and emits an explicit warning that the unchanged
+quality gate was not satisfied; it never silently allocates a non-fitting
+f32 fallback. If no rung fits at all, loading fails with the budget and
+context in the error. Explicit KV/exact requests also must fit. Dawn
+currently has only scalar-f32 prefill. Browser loading still uses its
+explicit KV option and does not run native calibration.
 
 The model policy in `src/precision.zig` requires top-1 agreement ≥99%,
 mean **KL(P_exact || P_candidate) ≤0.001 nats**, and maximum per-position
@@ -178,10 +193,49 @@ gates are separate and are not relaxed.
 
 The native JSON plan cache records selected rungs and gate observations
 alongside tuning. A valid hit restores the same choice and skips the gate.
-The key includes requested overrides, model/header identity, native operand
-capability, all backend shader variants and the versioned gate policy.
+The key includes requested context, device memory budget, requested
+overrides, model/header identity, native operand capability, all backend
+shader variants and the versioned gate and memory policies. Its JSON also
+records the budget, headroom, resident weights and each KV rung's program
+allocation estimate.
 `--no-tune` skips only the decode sweep, not quality selection; cache metadata
 distinguishes a quality-only entry from completed empty tuning.
+
+### Memory-aware selections on the RTX 5090 Laptop
+
+The 2026-10-31 runs used the unchanged 64-position quality gate, stored
+weights and the requested full serving context. Each cell is **KV /
+prefill operands**:
+
+| Model / backend | Context 8,192 | Context 4,096 |
+|---|---|---|
+| Qwen3.5-0.8B BF16 / Dawn D3D12 | f16 / scalar | f16 / scalar |
+| Qwen3.5-0.8B BF16 / Agility | f16 / compensated | f16 / compensated |
+| Gyro-Coder TQ2_0 / Dawn D3D12 | f32 / scalar | f32 / scalar |
+| Gyro-Coder TQ2_0 / Agility | f32 / compensated | f32 / compensated |
+| Nanbeige4.3-33B AD-Q4_K_M / Dawn D3D12 | **f16 / scalar, warned fallback** | f32 / scalar |
+| Nanbeige4.3-33B AD-Q4_K_M / Agility | **FP8 / scalar, warned fallback** | **f16 / scalar, warned fallback** |
+
+Nanbeige's f16 probe has 60/64 top-1 matches, mean KL 0.00589560 and
+maximum relative L2 0.102072; FP8 has 61/64, KL 0.0127666 and maximum
+relative L2 0.111996. Neither passes. At 8,192, f32 does not fit on either
+backend; Agility's smaller live DXGI budget also excludes f16 with the
+stated headroom. At 4,096, f32 fits Dawn's physical-heap budget but not
+Agility's live budget. The warnings explicitly disclose these quality
+failures, rather than relabeling the fallbacks as quality-approved.
+
+Measured budgets were 25,309,478,912 bytes on Dawn and 24,504,172,544 on
+Agility. The resident uploaded weights use 21,418,672,128 aligned bytes.
+Nanbeige's FP8/f16/f32 program footprints are respectively
+1,315,438,592 / 2,160,590,848 / 3,905,421,312 bytes at 8,192, and
+803,864,576 / 1,226,440,704 / 2,098,855,936 bytes at 4,096.
+Budgets can change; these selections are measurements, not model aliases.
+`precision-check --ctx N` honors an explicit serving context; its default
+remains the lightweight 128-position diagnostic program. Full observations
+and the reference-model context matrix are retained in
+`benchmarks/nanbeige4.3-33b.json`; throughput and the independent Agility
+prefill fix are described in [Performance](performance.md#nanbeige-memory-aware-ladder-and-packed-dot-prefill).
+
 
 `--kv f16|f32|fp8` opts the KV class out and forces that format. Its operand
 gate compares against scalar arithmetic with the same forced cache format.

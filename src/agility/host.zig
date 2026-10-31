@@ -108,6 +108,14 @@ pub const Device = struct {
         return std.mem.sliceTo(&d.caps.adapter_name, 0);
     }
 
+    /// The live DXGI local-memory budget, including our existing usage.
+    /// Dedicated adapter capacity is not a substitute for an OS budget.
+    pub fn memoryBudget(d: *const Device) ?u64 {
+        var caps = std.mem.zeroes(c.vel_caps);
+        if (c.vel_get_caps(d.ctx, &caps) < 0) return null;
+        return if (caps.local_budget_bytes > 0) caps.local_budget_bytes else null;
+    }
+
     /// Approximate prefill is available only for the exact native FP16/F32
     /// wave32 matrix operation queried at device creation.
     pub fn supportsPrefill(d: *const Device, rung: precision.Prefill) bool {

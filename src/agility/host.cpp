@@ -402,6 +402,8 @@ extern "C" vel_result vel_create(const vel_options *options, vel_context **out) 
 
 extern "C" vel_result vel_get_caps(vel_context *c, vel_caps *out) {
     if (!c || !out) return E_INVALIDARG;
+    c->caps.local_budget_bytes = 0;
+    c->caps.local_usage_bytes = 0;
     Com<IDXGIAdapter3> adapter3;
     if (SUCCEEDED(c->adapter->QueryInterface(IID_PPV_ARGS(adapter3.put())))) {
         DXGI_QUERY_VIDEO_MEMORY_INFO memory{};

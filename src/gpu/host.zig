@@ -85,6 +85,15 @@ pub const Device = union(Backend) {
         };
     }
 
+    /// Total usable device-memory budget, not the currently free bytes.
+    /// Null means the backend cannot report a budget; per-buffer limits
+    /// remain separate from this aggregate bound.
+    pub fn memoryBudget(d: Device) ?u64 {
+        return switch (d) {
+            inline else => |x| x.memoryBudget(),
+        };
+    }
+
     /// The adapter's description, copied into `arena`.
     pub fn adapter(d: Device, arena: Allocator) Allocator.Error!Adapter {
         switch (d) {
@@ -188,4 +197,11 @@ test "WebGPU supports only scalar prefill operands" {
     try std.testing.expect(device.supportsPrefill(.scalar_f32));
     try std.testing.expect(!device.supportsPrefill(.fp16_single));
     try std.testing.expect(!device.supportsPrefill(.fp16_compensated));
+}
+
+test "unbuilt Agility has no memory budget" {
+    if (build_options.agility) return;
+    var raw: agility.Device = undefined;
+    const device: Device = .{ .agility = &raw };
+    try std.testing.expectEqual(@as(?u64, null), device.memoryBudget());
 }

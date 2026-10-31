@@ -102,6 +102,25 @@ pub const Program = union(enum) {
 
     pub const BuildError = common.BuildError;
     pub const StepError = Allocator.Error || error{InvalidToken};
+    pub const MemoryError = BuildError || cmd.DecodeError || error{Overflow};
+    /// Conservative D3D12 placement granularity, applied to each buffer.
+    pub const memory_alignment: u64 = 64 * 1024;
+
+    /// Resident bytes of every buffer `build` creates, excluding the model's
+    /// already-uploaded weights and backend pipeline/command metadata.
+    /// Uses the real allocation path, including KV, recurrent checkpoints,
+    /// sampler, scratch and packed uniform pages; no GPU work is executed.
+    /// The temporary CPU plan and any lazily selected kernel variants are
+    /// discarded, leaving the caller's kernel set unchanged.
+    pub fn memoryBytes(gpa: Allocator, set: *const kernels.Set, m: *const Model, cfg: Config, limits: common.Limits) MemoryError!u64 {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var rec: cmd.Recorder = .{};
+        defer rec.deinit(gpa);
+        var planning_set = set.*;
+        _ = try build(arena.allocator(), gpa, &rec, &planning_set, m, cfg, limits);
+        return cmd.bufferBytes(gpa, rec.batch(), memory_alignment);
+    }
 
     pub fn build(arena: Allocator, gpa: Allocator, rec: *cmd.Recorder, set: *kernels.Set, m: *const Model, cfg: Config, limits: common.Limits) BuildError!Program {
         return switch (m.*) {
@@ -277,4 +296,95 @@ test "program capacity and tile expose each architecture's built values" {
     p.qwen35.prefill_tile = 32;
     try std.testing.expectEqual(@as(u32, 257), p.maxTokens());
     try std.testing.expectEqual(@as(u32, 32), p.prefillTile());
+}
+
+test "memory planning matches real allocations for dense hybrid and MTP layouts" {
+    const gpa = std.testing.allocator;
+    const arg: kernels.Arg = .{ .buffer = @fromBackingInt(10000), .size = 256 * 256 * 2 };
+    const matrix: common.Matrix = .{
+        .n = 256,
+        .k = 256,
+        .chunks = &.{.{ .arg = arg, .row0 = 0, .rows = 256, .type = .bf16 }},
+    };
+    const gate_up: common.Matrix = .{
+        .n = 512,
+        .k = 256,
+        .chunks = &.{.{ .arg = .{ .buffer = @fromBackingInt(10001), .size = 512 * 256 * 2 }, .row0 = 0, .rows = 512, .type = .bf16 }},
+    };
+    var m: Model = .{ .qwen35 = .{
+        .hp = .{
+            .vocab = 256,
+            .n_embd = 256,
+            .n_ff = 256,
+            .n_layer = 1,
+            .n_layer_nextn = 0,
+            .rms_eps = 1e-6,
+            .n_head = 1,
+            .n_head_kv = 1,
+            .head_dim = 32,
+            .n_rot = 32,
+            .rope_base = 10000,
+            .rope_sections = @splat(0),
+            .conv_kernel = 1,
+            .gdn_head_dim = 0,
+            .gdn_k_heads = 0,
+            .gdn_v_heads = 0,
+            .gdn_inner = 0,
+            .layer_kinds = @splat(.attention),
+        },
+        .attn = .{ .gated = false, .qk_norm = false },
+        .tok_embd = matrix,
+        .output = matrix,
+        .output_norm = arg,
+        .layers = &.{.{
+            .attn_norm = arg,
+            .post_norm = arg,
+            .ffn_gu = gate_up,
+            .ffn_down = matrix,
+            .mixer = .{ .attention = .{ .wqkv = matrix, .wo = matrix, .q_norm = arg, .k_norm = arg } },
+        }},
+        .mtp = null,
+    } };
+    var set: kernels.Set = .{ .pipelines = undefined, .backend = .webgpu };
+    for (std.enums.values(kernels.Kernel)) |k| set.pipelines.set(k, @fromBackingInt(0));
+    const limits: common.Limits = .{ .max_binding = 1 << 30, .offset_align = 256 };
+    var cfg: Config = .{ .context = 4096, .kv = .f32 };
+    const attention = m.qwen35.layers[0];
+    var hybrid_layers = [_]@TypeOf(attention){ attention, attention };
+    var previous_bytes: u64 = 0;
+    for (0..3) |layout| {
+        if (layout == 1) {
+            m.qwen35.hp.n_layer = 2;
+            m.qwen35.hp.layer_kinds[1] = .delta_net;
+            m.qwen35.hp.conv_kernel = 4;
+            m.qwen35.hp.gdn_head_dim = 32;
+            m.qwen35.hp.gdn_k_heads = 1;
+            m.qwen35.hp.gdn_v_heads = 1;
+            m.qwen35.hp.gdn_inner = 32;
+            hybrid_layers[1].mixer = .{ .delta_net = .{ .wproj = matrix, .wout = matrix, .conv = arg, .dt_bias = arg, .a = arg, .norm = arg } };
+            m.qwen35.layers = &hybrid_layers;
+        } else if (layout == 2) {
+            m.qwen35.mtp = .{ .enorm = arg, .hnorm = arg, .eh_proj = matrix, .block = attention, .head_norm = arg };
+            cfg.mtp = true;
+        }
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var rec: cmd.Recorder = .{};
+        defer rec.deinit(gpa);
+        _ = try Program.build(arena.allocator(), gpa, &rec, &set, &m, cfg, limits);
+        const bytes = try Program.memoryBytes(gpa, &set, &m, cfg, limits);
+        try std.testing.expectEqual(try cmd.bufferBytes(gpa, rec.batch(), Program.memory_alignment), bytes);
+        try std.testing.expect(bytes > previous_bytes);
+        previous_bytes = bytes;
+        const cache_count: u64 = if (cfg.mtp) 4 else 2;
+        var smaller = cfg;
+        smaller.kv = .f16;
+        const half_bytes = try Program.memoryBytes(gpa, &set, &m, smaller, limits);
+        try std.testing.expectEqual(cache_count * 262144, bytes - half_bytes);
+        smaller.kv = .fp8;
+        const fp8_bytes = try Program.memoryBytes(gpa, &set, &m, smaller, limits);
+        try std.testing.expectEqual(cache_count * 65536, half_bytes - fp8_bytes);
+        try std.testing.expectEqual(@as(usize, 0), set.n_variants);
+    }
+    try std.testing.expectError(error.BadConfig, Program.memoryBytes(gpa, &set, &m, .{ .context = 0 }, limits));
 }

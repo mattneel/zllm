@@ -386,3 +386,11 @@ test "grouped Gyro HLSL writes exactly its WGSL write set" {
 test "IQ4_XS embedding keeps the WGSL write contract" {
     try std.testing.expectEqual(Kernel.embed_iq4_xs.contract().writes, hlslWrites(source(.embed_iq4_xs).?[common.len..]));
 }
+
+test "quantized prefill uses native signed packed-byte dot products" {
+    inline for (.{ Kernel.matmul_q8_0, Kernel.matmul_q3_k, Kernel.matmul_q4_k, Kernel.matmul_q5_k, Kernel.matmul_q6_k }) |k| {
+        const code = source(k).?;
+        try std.testing.expect(std.mem.indexOf(u8, code, "return dot4add_i8packed(a, b, 0);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, code, "int4 p = unpack_i8(a) * unpack_i8(b);") == null);
+    }
+}

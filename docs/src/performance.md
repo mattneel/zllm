@@ -703,6 +703,76 @@ Both strict Gyro runs retain zero expert-set flips, 66/66 top-1 and
 | Dawn D3D12 decode | 1.36e-4 | 1.97e-5 / 1.53e-4 |
 
 
+## Nanbeige memory-aware ladder and packed-dot prefill
+
+The 2026-10-31 remeasurement uses
+`Nanbeige4.3-33B-AD-Q4_K_M.gguf` (21,161,159,680 bytes; fixture revision and
+SHA-256 in `benchmarks/nanbeige4.3-33b.json`) on the RTX 5090 Laptop GPU.
+Each native benchmark warms up, then prefills the same seed-7 1,024-token
+prompt and greedily decodes 128 tokens; default load-time tuning remains
+enabled. Only one GPU job ran at a time, through `scripts/d3d12.sh`.
+
+The ladder now counts actual aligned resident weight and program buffers
+at the requested context and reserves **5% of the device budget, minimum
+512 MiB**. It skips non-fitting rungs before quality trials. The cache key
+includes context and budget; JSON retains the estimates. The gate, its
+thresholds and rung order are unchanged. See [Precision](precision.md#memory-aware-selections-on-the-rtx-5090-laptop)
+for every measured selection and the disclosed quality-limited fallbacks.
+
+| Backend / context | KV before → after | Prefill tok/s before → after | Decode tok/s before → after | Peak device MiB before → after |
+|---|---|---:|---:|---:|
+| Dawn D3D12 / 8,192 | f32 → f16, warned fallback | 36.78 → **197.82** | 9.72 → **23.10** | 23,667 → **23,435** |
+| Agility / 8,192 | f32 → FP8, warned fallback | 22.68 → **204.30** | 12.30 → **21.22** | 23,865 → **22,716** |
+| Dawn D3D12 / 4,096 | f32 → f32 | 194.15 → **194.92** | 22.78 → **22.34** | 23,447 → **23,399** |
+| Agility / 4,096 | f32 → f16, warned fallback | 33.20 → **202.13** | 21.39 → **22.45** | 23,561 → **22,678** |
+
+All after selections use scalar-f32 prefill operands. These Nanbeige
+fallbacks are **not quality passes**: both f16 and FP8 fail the unchanged
+calibration gate, and the most accurate fitting rung is used with a clear
+warning. Dawn's physical-heap bound and Agility's live DXGI budget differ,
+so their fitting rungs need not agree.
+
+Peaks are `nvidia-smi` whole-device used memory sampled every 200 ms,
+including desktop/other processes and load-time allocations; they are not
+process-only allocation measurements. Before/after baselines are retained
+in JSON. Residency/eviction can limit the observed peak, so the small Dawn
+peak difference is not the f32-to-f16 allocation saving. Browser f16's
+previous 22.6 decode tok/s remains a separate browser workload, not a
+substitute for these native results.
+
+### Agility 4,096 prefill cause
+
+The residual anomaly was **not memory pressure**. Agility's ordinary
+quantized matmul helper expanded each packed signed-byte dot into two
+`int4` unpacks, four multiplies and three additions, while WGSL used
+`dot4I8Packed`. The retained HLSL helper uses the exact SM 6.4
+`dot4add_i8packed(a, b, 0)` operation; the existing Agility baseline is
+SM 6.6. This changes no quantizer, rounding or precision policy.
+
+A controlled rollback changed **only that helper** back to its manual
+implementation while retaining the memory-aware ladder, 4,096 context,
+f16 KV, scalar operands, identical allocation estimates and DXGI budget:
+
+| Controlled Agility run | 1,024-token prefill | Steps | Decode | Peak device MiB |
+|---|---:|---:|---:|---:|
+| Memory fix + old manual packed dot | 33.96 tok/s | 126 | 22.59 tok/s | 22,678 |
+| Memory fix + native packed dot | **202.13 tok/s** | **33** | 22.45 tok/s | **22,678** |
+
+The **5.95×** prefill gain at identical peak memory isolates the integer-dot
+implementation. The slow fixed-cost 32-token tiles also kept the existing
+submission scheduler on smaller partial chunks, multiplying the wasted
+tile work; no submission-budget threshold was relaxed. The temporary
+rollback was removed. A source regression test requires the native signed
+packed-dot intrinsic for all five ordinary quantized matmul identities.
+
+Acceptance passed `zig fmt --check .`, `zig build`, `zig build test`,
+`zig build wasm`, and `check-fast` on both Agility and Dawn D3D12 with
+`-Dgyro-model=/mnt/c/models/Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf`.
+The new non-fitting-rung unit test also killed an actual mutation replacing
+its fit predicate with unconditional acceptance; production filtering was
+restored. Strict Gyro checks retain zero routing flips, 66/66 top-1,
+40/40 greedy agreement, and bitwise split/unfused results on both backends.
+
 ## Per-device records
 
 `benchmarks/rtx5090-laptop-d3d12.jsonl` stores the committed native benchmark

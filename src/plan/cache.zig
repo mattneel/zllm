@@ -23,6 +23,7 @@ pub const Entry = struct {
     tuning: Tuning,
     selection: precision.Selection,
     observations: []const precision.Observation = &.{},
+    memory: precision.Memory = .{},
     /// A completed tuning sweep may legitimately produce no entries. False
     /// means this cache contains precision observations only (--no-tune).
     tuned: bool = false,
@@ -40,6 +41,8 @@ pub const KeyInputs = struct {
     /// kernel sources, so a change to any of them invalidates the cache.
     backend: kernels.Backend = .webgpu,
     policy: precision.Policy = .{},
+    context: u32 = 0,
+    memory_budget: ?u64 = null,
 };
 
 /// The cache file's name for `k`: its hex and ".json".
@@ -58,10 +61,12 @@ pub fn key(in: KeyInputs) Key {
             hh.update(b);
         }
     };
-    Feed.bytes(&h, "zllm plan cache 2");
+    Feed.bytes(&h, "zllm plan cache 3: memory headroom 5% minimum 512MiB");
     Feed.bytes(&h, std.mem.asBytes(&precision.gate_policy_version));
     Feed.bytes(&h, @tagName(in.policy.mode));
     Feed.bytes(&h, if (in.policy.kv) |kv| @tagName(kv) else "automatic");
+    Feed.bytes(&h, std.mem.asBytes(&in.context));
+    Feed.bytes(&h, std.mem.asBytes(&@as(u64, in.memory_budget orelse 0)));
     Feed.bytes(&h, version);
     for (in.adapter) |s| Feed.bytes(&h, s);
     Feed.bytes(&h, in.runtime);
@@ -89,6 +94,7 @@ const Json = struct {
     // a cache hit, even though the runtime-facing types have safe defaults.
     selection: JsonSelection,
     observations: []const JsonObservation,
+    memory: precision.Memory = .{},
 };
 
 const JsonSelection = struct {
@@ -128,10 +134,11 @@ pub fn serialize(gpa: Allocator, k: Key, entry: Entry, out: *std.ArrayList(u8)) 
             if (i == 0) "" else ",", e.type, e.n, e.k, e.variant.wg, e.variant.lanes, e.variant.rows,
         }) catch return error.OutOfMemory;
     }
-    w.print("],\"tuned\":{},\"selection\":{f},\"observations\":{f}}}\n", .{
+    w.print("],\"tuned\":{},\"selection\":{f},\"observations\":{f},\"memory\":{f}}}\n", .{
         entry.tuned,
         std.json.fmt(entry.selection, .{}),
         std.json.fmt(entry.observations, .{}),
+        std.json.fmt(entry.memory, .{}),
     }) catch return error.OutOfMemory;
 }
 
@@ -160,7 +167,7 @@ pub fn parse(arena: Allocator, bytes: []const u8, k: Key) ?Entry {
         if (!metrics.valid()) return null;
         observation.* = .{ .selection = j.selection.selection(), .metrics = metrics };
     }
-    return .{ .tuning = .{ .entries = entries }, .selection = json.selection.selection(), .observations = observations, .tuned = json.tuned };
+    return .{ .tuning = .{ .entries = entries }, .selection = json.selection.selection(), .observations = observations, .tuned = json.tuned, .memory = json.memory };
 }
 
 test "round trip, and a cache made under another key is ignored" {
@@ -186,6 +193,7 @@ test "round trip, and a cache made under another key is ignored" {
         .selection = .{ .kv = .f16, .prefill = .fp16_single },
         .observations = &observations,
         .tuned = true,
+        .memory = .{ .budget_bytes = 24 << 30, .headroom_bytes = 1 << 30, .weight_bytes = 20 << 30, .program_bytes = .{ 1 << 28, 1 << 29, 1 << 30 } },
     };
     try serialize(gpa, k, entry, &bytes);
     const back = parse(arena, bytes.items, k).?;
@@ -193,6 +201,7 @@ test "round trip, and a cache made under another key is ignored" {
     try std.testing.expectEqualDeep(entry.selection, back.selection);
     try std.testing.expectEqualDeep(entry.observations, back.observations);
     try std.testing.expectEqual(entry.tuned, back.tuned);
+    try std.testing.expectEqualDeep(entry.memory, back.memory);
 
     var other = inputs;
     other.adapter = &.{ "nvidia", "blackwell", "RTX", "driver 2", "d3d12" };
@@ -327,4 +336,17 @@ test "tuning completion metadata must be an explicit boolean" {
         const bytes = try std.fmt.allocPrint(arena, "{{\"key\":\"{x}\",{s}\"tuning\":[],\"selection\":{{\"kv\":\"f32\",\"prefill\":\"scalar_f32\",\"weights\":\"stored\"}},\"observations\":[]}}", .{ &k, field });
         try std.testing.expect(parse(arena, bytes, k) == null);
     }
+}
+
+test "context and memory budget invalidate cached precision" {
+    var inputs: KeyInputs = .{ .adapter = &.{}, .runtime = "dawn", .limits = &.{}, .model_header = "", .context = 8192 };
+    const unknown = key(inputs);
+    inputs.memory_budget = 24 << 30;
+    const known = key(inputs);
+    try std.testing.expect(!std.mem.eql(u8, &unknown, &known));
+    inputs.context = 4096;
+    try std.testing.expect(!std.mem.eql(u8, &known, &key(inputs)));
+    inputs.context = 8192;
+    inputs.memory_budget = (24 << 30) - 1;
+    try std.testing.expect(!std.mem.eql(u8, &known, &key(inputs)));
 }

@@ -154,7 +154,12 @@ pub fn main(init: std.process.Init) !void {
             else => return err,
         };
         try applyPrecisionEnv(&opts, init.environ_map, args[fixed..]);
-        if (is_precision_check) opts.context = 128;
+        if (is_precision_check) {
+            const explicit_context = for (args[fixed..]) |arg| {
+                if (std.mem.eql(u8, arg, "--ctx")) break true;
+            } else false;
+            if (!explicit_context) opts.context = 128;
+        }
         if (is_check) opts.context = 2048;
         opts.plan_cache = try planCacheDir(arena, init.environ_map);
         var mapped = try FileBytes.open(io, args[2]);
@@ -532,6 +537,9 @@ fn precisionCheck(rt: *gen.Runtime, token_path: []const u8, logits_path: []const
     try json.write(.{
         .selection = rt.selection,
         .gate = rt.qualityGate(),
+        .context = rt.program.context(),
+        .memory_plan = rt.precision_memory,
+        .quality_limited = rt.precision_quality_limited,
         .observations = observations.items,
         .metrics = metrics,
         .precision_cached = rt.precision_cached,

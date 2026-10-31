@@ -27,6 +27,9 @@ pub const Device = struct {
     pub fn supportsPrefill(_: *const Device, rung: precision.Prefill) bool {
         return rung == .scalar_f32;
     }
+    pub fn memoryBudget(_: *const Device) ?u64 {
+        return null;
+    }
     pub fn forceLoss(_: *Device) void {
         unreachable;
     }

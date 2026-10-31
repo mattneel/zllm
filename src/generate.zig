@@ -181,6 +181,8 @@ pub const Runtime = struct {
     selection: precision.Selection = .{},
     quality_observations: []const precision.Observation = &.{},
     precision_cached: bool = false,
+    precision_memory: precision.Memory = .{},
+    precision_quality_limited: bool = false,
     /// Continue the device's resource ID space for temporary quality programs.
     next_objects: [3]u32 = @splat(0),
     /// What requests leave unset takes.
@@ -286,6 +288,9 @@ pub const Runtime = struct {
         const dl = rt.device.limits();
         const limits: plan_common.Limits = .{ .max_binding = dl.max_binding, .offset_align = dl.offset_align };
         const info = try rt.device.adapter(arena);
+        rt.precision_memory = .init(rt.device.memoryBudget());
+        if (rt.precision_memory.budget_bytes == null)
+            std.log.warn("precision: adapter memory budget unavailable; memory-fit filtering disabled", .{});
         rt.adapter = switch (backend) {
             .webgpu => try std.fmt.allocPrint(arena, "{s} ({s})", .{ info.device, info.api }),
             .agility => try std.fmt.allocPrint(arena, "{s} (agility)", .{info.device}),
@@ -301,6 +306,8 @@ pub const Runtime = struct {
             .model_header = bytes[0..@intCast(file.data_offset)],
             .backend = backend,
             .policy = .{ .mode = o.precision, .kv = o.kv },
+            .context = o.context,
+            .memory_budget = rt.precision_memory.budget_bytes,
         });
         var rec: zllm.gpu.cmd.Recorder = .{};
         defer rec.deinit(gpa);
@@ -310,8 +317,16 @@ pub const Runtime = struct {
         try rt.executeTimed(&rec, &t, &rt.load.pipelines);
         try rt.host.setFile(gpa, bytes, rt.path);
         rt.model = try plan.Model.upload(arena, gpa, &rec, &rt.set, file, limits);
+        rt.precision_memory.weight_bytes = try zllm.gpu.cmd.bufferBytes(gpa, rec.batch(), 64 * 1024);
         try rt.executeTimed(&rec, &t, &rt.load.weights);
         const mtp = rt.model.canSpeculate(limits);
+        for (precision.kv_rungs, 0..) |format, index| {
+            rt.precision_memory.program_bytes[index] = try plan.Program.memoryBytes(gpa, &rt.set, &rt.model, .{
+                .context = o.context,
+                .kv = format,
+                .mtp = mtp,
+            }, limits);
+        }
         var tuning: plan_common.Tuning = .{};
         const policy: precision.Policy = .{ .mode = o.precision, .kv = o.kv };
         const cached = if (o.plan_cache) |dir| readPlan(io, arena, dir, plan_key) else null;
@@ -323,9 +338,16 @@ pub const Runtime = struct {
                 }
                 break :valid false;
             };
-            if (measured and std.meta.eql(policy.resolve(found.selection), found.selection) and rt.device.supportsPrefill(found.selection.prefill)) {
+            const fallback = policy.mode == .auto and policy.kv == null and
+                rt.precision_memory.mostAccurateFitting() != null and
+                std.meta.eql(found.selection, rt.precision_memory.mostAccurateFitting().?) and
+                precision.fastestPassing(found.observations, rt.qualityGate(), rt.precision_memory) == null;
+            if ((measured or fallback) and rt.precision_memory.fits(found.selection) and
+                std.meta.eql(policy.resolve(found.selection), found.selection) and rt.device.supportsPrefill(found.selection.prefill))
+            {
                 rt.selection = found.selection;
                 rt.quality_observations = found.observations;
+                rt.precision_quality_limited = fallback;
                 rt.precision_cached = true;
             }
             if (o.tune and found.tuned) {
@@ -349,6 +371,7 @@ pub const Runtime = struct {
         t = tuned_at;
         rt.next_objects = rec.next;
         if (!rt.precision_cached) try rt.choosePrecision(policy);
+        if (rt.precision_quality_limited) rt.warnMemoryQualityFallback();
         const gated_at = Io.Timestamp.now(io, .awake);
         rt.load.quality = @intCast(t.durationTo(gated_at).toNanoseconds());
         t = gated_at;
@@ -360,6 +383,7 @@ pub const Runtime = struct {
                 .tuned = o.tune or (cached != null and cached.?.tuned),
                 .selection = rt.selection,
                 .observations = rt.quality_observations,
+                .memory = rt.precision_memory,
             }) catch |err| {
                 std.log.warn("plan cache: cannot write {s}: {t}", .{ dir, err });
             };
@@ -462,28 +486,64 @@ pub const Runtime = struct {
         return qualityMetrics(exact, logits, prompt.len);
     }
 
+    fn warnMemoryQualityFallback(rt: *const Runtime) void {
+        std.log.warn("precision: no quality-gate-passing KV rung fits context {d} in the device budget ({d} MiB, {d} MiB reserved headroom); using most accurate fitting rung {t} KV / {t}; quality gate NOT satisfied", .{
+            rt.options.context,
+            (rt.precision_memory.budget_bytes orelse 0) >> 20,
+            rt.precision_memory.headroom_bytes >> 20,
+            rt.selection.kv,
+            rt.selection.prefill,
+        });
+    }
+
     fn choosePrecision(rt: *Runtime, policy: precision.Policy) !void {
         rt.selection = policy.resolve(.{});
-        if (policy.mode == .exact) return;
+        rt.precision_quality_limited = false;
+        if (policy.mode == .exact or policy.kv != null) {
+            if (!rt.precision_memory.fits(rt.selection)) {
+                std.log.err("precision: forced {t} KV at context {d} requires {d} MiB including headroom, exceeds device budget {d} MiB", .{
+                    rt.selection.kv, rt.options.context, rt.precision_memory.required(rt.selection) >> 20, (rt.precision_memory.budget_bytes orelse 0) >> 20,
+                });
+                return error.PrecisionMemoryBudgetExceeded;
+            }
+            if (policy.mode == .exact) return;
+        } else {
+            rt.selection = rt.precision_memory.mostAccurateFitting() orelse {
+                std.log.err("precision: no KV rung fits context {d} in device budget {d} MiB including {d} MiB headroom", .{
+                    rt.options.context, (rt.precision_memory.budget_bytes orelse 0) >> 20, rt.precision_memory.headroom_bytes >> 20,
+                });
+                return error.PrecisionMemoryBudgetExceeded;
+            };
+        }
         var scratch: std.heap.ArenaAllocator = .init(rt.gpa);
         defer scratch.deinit();
         const arena = scratch.allocator();
         const prompt = try rt.qualityPrompt(arena);
-        // Forced KV opts that class out; isolate its operand gate against
-        // scalar arithmetic with that same cache format.
+        // The oracle uses only the short probe context, even when f32 cannot
+        // fit at the requested serving context. Forced KV retains its oracle.
         const reference: precision.Selection = .{ .kv = policy.kv orelse .f32 };
         const exact = try rt.qualityLogits(arena, reference, prompt);
         for (exact) |value| if (!std.math.isFinite(value)) return error.NonFinitePrecisionReference;
         const gate = rt.qualityGate();
         var observations: std.ArrayList(precision.Observation) = .empty;
         if (policy.kv == null) {
+            rt.precision_quality_limited = true;
             for (precision.kv_rungs) |format| {
-                if (format == .f32) break;
                 const candidate: precision.Selection = .{ .kv = format };
-                const metrics = try rt.trial(prompt, exact, candidate);
+                if (!rt.precision_memory.fits(candidate)) {
+                    std.log.info("precision: skipping {t} KV at context {d}: {d} MiB including headroom exceeds {d} MiB device budget", .{
+                        format, rt.options.context, rt.precision_memory.required(candidate) >> 20, (rt.precision_memory.budget_bytes orelse 0) >> 20,
+                    });
+                    continue;
+                }
+                const metrics: precision.Metrics = if (format == .f32)
+                    .{ .positions = prompt.len, .top1_matches = prompt.len }
+                else
+                    try rt.trial(prompt, exact, candidate);
                 try observations.append(rt.arena_state.allocator(), .{ .selection = candidate, .metrics = metrics });
-                if (gate.accepts(metrics)) {
-                    rt.selection = candidate;
+                if (precision.fastestPassing(observations.items, gate, rt.precision_memory)) |selected| {
+                    rt.selection = selected;
+                    rt.precision_quality_limited = false;
                     break;
                 }
             }
@@ -493,10 +553,12 @@ pub const Runtime = struct {
             if (!rt.device.supportsPrefill(rung)) continue;
             var candidate = rt.selection;
             candidate.prefill = rung;
+            if (!rt.precision_memory.fits(candidate)) continue;
             const metrics = try rt.trial(prompt, exact, candidate);
             try observations.append(rt.arena_state.allocator(), .{ .selection = candidate, .metrics = metrics });
             if (gate.accepts(metrics)) {
                 rt.selection = candidate;
+                rt.precision_quality_limited = false;
                 break;
             }
         }
@@ -517,6 +579,8 @@ pub const Runtime = struct {
         rt.precision_cached = false;
         rt.selection = .{};
         rt.quality_observations = &.{};
+        rt.precision_memory = .{};
+        rt.precision_quality_limited = false;
         try rt.open();
         errdefer rt.close();
         try rt.build();

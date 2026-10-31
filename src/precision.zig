@@ -37,6 +37,47 @@ pub const Policy = struct {
 /// The plan cache hashes this version together with the requested policy.
 pub const gate_policy_version: u32 = 1;
 
+/// The device budget is total usable local memory, not free bytes after the
+/// model upload. Reserve 5% (at least 512 MiB) for driver allocations, uploads
+/// and other device users. An unavailable budget explicitly disables filtering.
+pub const Memory = struct {
+    budget_bytes: ?u64 = null,
+    headroom_bytes: u64 = 0,
+    weight_bytes: u64 = 0,
+    /// Program allocations in the same fastest-first order as kv_rungs.
+    program_bytes: [kv_rungs.len]u64 = @splat(0),
+
+    pub fn init(budget: ?u64) Memory {
+        return .{
+            .budget_bytes = budget,
+            .headroom_bytes = if (budget) |bytes| @max(512 << 20, bytes / 20) else 0,
+        };
+    }
+
+    pub fn required(memory: Memory, selection: Selection) u64 {
+        const index: usize = switch (selection.kv) {
+            .fp8 => 0,
+            .f16 => 1,
+            .f32 => 2,
+        };
+        return memory.weight_bytes +| memory.program_bytes[index] +| memory.headroom_bytes;
+    }
+
+    pub fn fits(memory: Memory, selection: Selection) bool {
+        return if (memory.budget_bytes) |budget| memory.required(selection) <= budget else true;
+    }
+
+    pub fn mostAccurateFitting(memory: Memory) ?Selection {
+        var index = kv_rungs.len;
+        while (index != 0) {
+            index -= 1;
+            const selection: Selection = .{ .kv = kv_rungs[index] };
+            if (memory.fits(selection)) return selection;
+        }
+        return null;
+    }
+};
+
 pub const Gate = struct {
     min_top1_agreement: f64 = 0.99,
     max_mean_kl: f64 = 0.001,
@@ -196,9 +237,9 @@ pub const Observation = struct {
 
 /// Observations must be supplied in fastest-first order for the tensor class
 /// being tuned. A rejected or unsupported rung cannot mask a later valid one.
-pub fn fastestPassing(observations: []const Observation, gate: Gate) ?Selection {
+pub fn fastestPassing(observations: []const Observation, gate: Gate, memory: Memory) ?Selection {
     for (observations) |observation| {
-        if (gate.accepts(observation.metrics)) return observation.selection;
+        if (memory.fits(observation.selection) and gate.accepts(observation.metrics)) return observation.selection;
     }
     return null;
 }
@@ -289,11 +330,34 @@ test "fastest passing rung wins, not the most accurate rung" {
         .{ .selection = .{}, .metrics = .{ .positions = 100, .top1_matches = 100 } },
     };
     const gate = Gate.forModel("qwen35", "Qwen3.5-0.8B");
-    try std.testing.expectEqual(common.KvFormat.f16, fastestPassing(&observations, gate).?.kv);
-    try std.testing.expect(fastestPassing(observations[0..1], gate) == null);
-    try std.testing.expect(fastestPassing(&.{}, gate) == null);
+    try std.testing.expectEqual(common.KvFormat.f16, fastestPassing(&observations, gate, .{}).?.kv);
+    try std.testing.expect(fastestPassing(observations[0..1], gate, .{}) == null);
+    try std.testing.expect(fastestPassing(&.{}, gate, .{}) == null);
     try std.testing.expectEqualDeep(gate, Gate.forModel("unknown", "unknown"));
     for (model_policies) |rule| {
         try std.testing.expectEqualDeep(rule.gate, Gate.forModel(rule.architecture, "unmeasured checkpoint"));
     }
+}
+
+test "non-fitting rung is skipped and budget mutation changes the winner" {
+    const observations = [_]Observation{
+        .{ .selection = .{ .kv = .fp8 }, .metrics = .{ .positions = 64, .top1_matches = 63 } },
+        .{ .selection = .{ .kv = .f16 }, .metrics = .{ .positions = 64, .top1_matches = 64 } },
+        .{ .selection = .{ .kv = .f32 }, .metrics = .{ .positions = 64, .top1_matches = 64 } },
+    };
+    var memory: Memory = .{ .budget_bytes = 1000, .headroom_bytes = 100, .weight_bytes = 700, .program_bytes = .{ 100, 201, 300 } };
+    try std.testing.expect(fastestPassing(&observations, .{}, memory) == null);
+    try std.testing.expectEqual(common.KvFormat.fp8, memory.mostAccurateFitting().?.kv);
+    // A one-byte budget mutation makes f16 fit exactly, without changing its
+    // gate metrics. Removing the fit check makes the first assertion fail.
+    memory.budget_bytes = 1001;
+    try std.testing.expectEqual(common.KvFormat.f16, fastestPassing(&observations, .{}, memory).?.kv);
+    try std.testing.expectEqual(common.KvFormat.f16, memory.mostAccurateFitting().?.kv);
+    memory.budget_bytes = 899;
+    try std.testing.expect(memory.mostAccurateFitting() == null);
+    memory.budget_bytes = null;
+    try std.testing.expectEqual(common.KvFormat.f16, fastestPassing(&observations, .{}, memory).?.kv);
+    try std.testing.expectEqual(common.KvFormat.f32, memory.mostAccurateFitting().?.kv);
+    try std.testing.expectEqual(@as(u64, 512 << 20), Memory.init(1 << 30).headroom_bytes);
+    try std.testing.expectEqual(@as(u64, (24 << 30) / 20), Memory.init(24 << 30).headroom_bytes);
 }

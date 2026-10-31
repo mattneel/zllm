@@ -250,6 +250,38 @@ pub const Iterator = struct {
     }
 };
 
+/// Bytes of buffers created in this batch and still resident at its end.
+/// Destroys of older buffers are ignored; submits do not end a lifetime.
+/// Round each allocation separately (64 KiB is conservative for D3D12).
+/// This inspects commands only: it never creates or executes GPU resources.
+pub fn bufferBytes(gpa: Allocator, words: []const u32, alignment: u64) (Allocator.Error || DecodeError || error{Overflow})!u64 {
+    std.debug.assert(std.math.isPowerOfTwo(alignment));
+    var sizes: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+    defer sizes.deinit(gpa);
+    var bytes: u64 = 0;
+    var it: Iterator = .{ .words = words };
+    while (try it.next()) |c| {
+        switch (c.op) {
+            .create_buffer => {
+                if (c.args.len != 4) return error.BadLength;
+                const rounded = (try std.math.add(u64, c.u64At(1), alignment - 1)) & ~(alignment - 1);
+                const entry = try sizes.getOrPut(gpa, c.args[0]);
+                if (entry.found_existing) return error.BadLength;
+                entry.value_ptr.* = rounded;
+                bytes = try std.math.add(u64, bytes, rounded);
+            },
+            .destroy => {
+                if (c.args.len != 2) return error.BadLength;
+                if (c.args[0] == @backingInt(Kind.buffer)) {
+                    if (sizes.fetchRemove(c.args[1])) |entry| bytes -= entry.value;
+                }
+            },
+            else => {},
+        }
+    }
+    return bytes;
+}
+
 test "recorder output decodes back to the same commands" {
     const gpa = std.testing.allocator;
     var r: Recorder = .{};
@@ -327,4 +359,34 @@ test "iterator rejects zero-length and truncated commands" {
     try std.testing.expectError(error.BadLength, it.next());
     it = .{ .words = &.{ header(.submit, 3), 1 } };
     try std.testing.expectError(error.Truncated, it.next());
+}
+
+test "buffer footprint counts resident allocations across submits" {
+    const gpa = std.testing.allocator;
+    var r: Recorder = .{};
+    defer r.deinit(gpa);
+    const older = try r.createBuffer(gpa, 8, .{ .storage = true });
+    r.clear();
+    const weights = try r.createBuffer(gpa, (1 << 32) + 4, .{ .storage = true });
+    const staging = try r.createBuffer(gpa, 65537, .{ .copy_dst = true });
+    try r.submit(gpa, 0);
+    try r.destroy(gpa, .buffer, @backingInt(staging));
+    try r.destroy(gpa, .buffer, @backingInt(older));
+    try r.destroy(gpa, .pipeline, @backingInt(weights));
+    _ = try r.createBuffer(gpa, 16, .{ .uniform = true });
+    try std.testing.expectEqual(@as(u64, (1 << 32) + 20), try bufferBytes(gpa, r.batch(), 1));
+    try std.testing.expectEqual(@as(u64, (1 << 32) + 2 * 65536), try bufferBytes(gpa, r.batch(), 65536));
+    try std.testing.expectEqual(@as(u64, 0), try bufferBytes(gpa, &.{}, 65536));
+}
+
+test "buffer footprint rejects malformed allocations and overflow" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.BadLength, bufferBytes(gpa, &.{ header(.create_buffer, 2), 0 }, 1));
+    try std.testing.expectError(error.BadLength, bufferBytes(gpa, &.{ header(.destroy, 2), 0 }, 1));
+    var r: Recorder = .{};
+    defer r.deinit(gpa);
+    _ = try r.createBuffer(gpa, std.math.maxInt(u64), .{ .storage = true });
+    try std.testing.expectError(error.Overflow, bufferBytes(gpa, r.batch(), 65536));
+    _ = try r.createBuffer(gpa, 1, .{ .storage = true });
+    try std.testing.expectError(error.Overflow, bufferBytes(gpa, r.batch(), 1));
 }

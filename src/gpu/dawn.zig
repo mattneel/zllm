@@ -18,6 +18,8 @@ pub const Procs = struct {
     InstanceRelease: Proc(c.WGPUProcInstanceRelease),
     AdapterGetInfo: Proc(c.WGPUProcAdapterGetInfo),
     AdapterInfoFreeMembers: Proc(c.WGPUProcAdapterInfoFreeMembers),
+    /// Optional native extension: older libraries can still open devices.
+    AdapterPropertiesMemoryHeapsFreeMembers: c.WGPUProcAdapterPropertiesMemoryHeapsFreeMembers,
     AdapterGetLimits: Proc(c.WGPUProcAdapterGetLimits),
     AdapterHasFeature: Proc(c.WGPUProcAdapterHasFeature),
     AdapterRequestDevice: Proc(c.WGPUProcAdapterRequestDevice),
@@ -66,7 +68,10 @@ pub const Procs = struct {
         var p: Procs = undefined;
         const info = @typeInfo(Procs).@"struct";
         inline for (info.field_names, info.field_types) |name, T| {
-            @field(p, name) = lib.lookup(T, "wgpu" ++ name) orelse return error.MissingSymbol;
+            @field(p, name) = if (@typeInfo(T) == .optional)
+                lib.lookup(Proc(T), "wgpu" ++ name)
+            else
+                lib.lookup(T, "wgpu" ++ name) orelse return error.MissingSymbol;
         }
         return p;
     }
@@ -223,6 +228,25 @@ pub const Device = struct {
         return d.error_message[0..d.error_len];
     }
 
+    /// Conservative physical budget: the largest device-local heap.
+    /// Dawn exposes capacity, not a live OS residency budget. Do not add
+    /// host-only heaps or assume allocations can span several local heaps.
+    /// maxBufferSize and maxStorageBufferBindingSize constrain individual
+    /// resources, not the aggregate memory footprint.
+    pub fn memoryBudget(d: *const Device) ?u64 {
+        const free_heaps = d.p.AdapterPropertiesMemoryHeapsFreeMembers orelse return null;
+        if (d.p.AdapterHasFeature(d.adapter, c.WGPUFeatureName_AdapterPropertiesMemoryHeaps) == 0) return null;
+        var heaps = std.mem.zeroes(c.WGPUAdapterPropertiesMemoryHeaps);
+        heaps.chain.sType = c.WGPUSType_AdapterPropertiesMemoryHeaps;
+        var raw = std.mem.zeroes(c.WGPUAdapterInfo);
+        raw.nextInChain = &heaps.chain;
+        const status = d.p.AdapterGetInfo(d.adapter, &raw);
+        defer d.p.AdapterInfoFreeMembers(raw);
+        defer free_heaps(heaps);
+        if (status != c.WGPUStatus_Success or heaps.heapInfo == null) return null;
+        return heapBudget(heaps.heapInfo[0..heaps.heapCount]);
+    }
+
     pub const Info = struct {
         vendor: []const u8,
         architecture: []const u8,
@@ -290,6 +314,35 @@ pub const Device = struct {
         d.error_len = n;
     }
 };
+
+fn heapBudget(heaps: []const c.WGPUMemoryHeapInfo) ?u64 {
+    var largest: u64 = 0;
+    for (heaps) |heap| {
+        if (heap.properties & c.WGPUHeapProperty_DeviceLocal != 0)
+            largest = @max(largest, heap.size);
+    }
+    return if (largest > 0) largest else null;
+}
+
+test "memory budget uses one device-local heap without host memory" {
+    const heaps = [_]c.WGPUMemoryHeapInfo{
+        .{ .properties = c.WGPUHeapProperty_HostVisible, .size = 32 << 30 },
+        .{ .properties = c.WGPUHeapProperty_DeviceLocal, .size = 8 << 30 },
+        .{ .properties = c.WGPUHeapProperty_DeviceLocal | c.WGPUHeapProperty_HostVisible, .size = 2 << 30 },
+    };
+    try std.testing.expectEqual(@as(?u64, 8 << 30), heapBudget(&heaps));
+    try std.testing.expectEqual(@as(?u64, null), heapBudget(heaps[0..1]));
+    try std.testing.expectEqual(@as(?u64, null), heapBudget(&.{}));
+    try std.testing.expectEqual(@as(?u64, null), heapBudget(&.{
+        .{ .properties = c.WGPUHeapProperty_DeviceLocal, .size = 0 },
+    }));
+}
+
+test "missing memory heap extension leaves budget unknown" {
+    var d: Device = undefined;
+    d.p.AdapterPropertiesMemoryHeapsFreeMembers = null;
+    try std.testing.expectEqual(@as(?u64, null), d.memoryBudget());
+}
 
 /// Receives the object from a request callback.
 fn Result(comptime T: type) type {

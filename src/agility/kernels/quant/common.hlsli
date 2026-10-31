@@ -17,8 +17,8 @@ uint w32(uint i) {
 uint byte12(uint3 s, uint j) { return (s[j / 4u] >> (8u * (j % 4u))) & 0xffu; }
 uint4 unpack_u8(uint v) { return (v.xxxx >> uint4(0u, 8u, 16u, 24u)) & 0xffu; }
 int4 unpack_i8(uint v) { return asint(v.xxxx << uint4(24u, 16u, 8u, 0u)) >> 24u; }
-// Integer products and sums are exact; match WGSL dot4I8Packed without waves.
+// SM 6.4 packed signed-byte dot; the host's baseline is SM 6.6.
+// This is the exact integer operation WGSL dot4I8Packed performs.
 int dot_i8(uint a, uint b) {
-    int4 p = unpack_i8(a) * unpack_i8(b);
-    return p.x + p.y + p.z + p.w;
+    return dot4add_i8packed(a, b, 0);
 }
