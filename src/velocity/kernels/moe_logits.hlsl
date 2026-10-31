@@ -1,44 +1,33 @@
-// Router and shared-gate logits, eight 32-lane dot products per group
-// (kernels/moe_logits.wgsl). Bindings: router, shared_gate, x, logits.
+// Router and shared-gate logits (kernels/moe_logits.wgsl): group (e, t) takes
+// row e of token t, its threads striding over the inputs four at a time; wave
+// sums, then the eight waves' sums in order. Waves are 32. Bindings: router,
+// shared_gate (read-only), x, logits.
 
 #define WG 256
-#define LANES 32
-#define GROUPS (WG / LANES)
-#define MAX_COLS 2560
 
-groupshared float xs[MAX_COLS];
-groupshared float red[WG];
+groupshared float wsum[WG / 32];
 
+[WaveSize(32)]
 [numthreads(WG, 1, 1)]
 void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
     const uint n_expert = param(0);
-    const uint cols = param(2);
+    const uint c4 = param(2) / 4u;
+    const uint e = wg.x;
     const uint t = wg.y;
-    const uint lane = li % LANES;
-    const uint group = li / LANES;
-    for (uint i = li; i < cols; i += WG) {
-        xs[i] = ldf(3, t * param(3) + i);
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    const uint e = wg.x * GROUPS + group;
+    const uint xb = base(3) + 16u * t * (param(3) / 4u);
     precise float acc = 0.0f;
     if (e < n_expert) {
-        for (uint i = lane; i < cols; i += LANES) {
-            acc += ldwf(1, e * cols + i) * xs[i];
-        }
-    } else if (e == n_expert) {
-        for (uint i = lane; i < cols; i += LANES) {
-            acc += ldwf(2, i) * xs[i];
-        }
+        const uint wb = base(1) + 16u * e * c4;
+        for (uint i = li; i < c4; i += WG) acc += dot(asfloat(ro(1).Load4(wb + 16u * i)), asfloat(rw(3).Load4(xb + 16u * i)));
+    } else {
+        for (uint i = li; i < c4; i += WG) acc += dot(asfloat(ro(2).Load4(base(2) + 16u * i)), asfloat(rw(3).Load4(xb + 16u * i)));
     }
-    red[li] = acc;
+    const float s = WaveActiveSum(acc);
+    if (WaveIsFirstLane()) wsum[li / 32u] = s;
     GroupMemoryBarrierWithGroupSync();
-    for (uint s = LANES / 2u; s > 0u; s /= 2u) {
-        if (lane < s) red[li] += red[li + s];
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (lane == 0u && e <= n_expert) {
-        stf(4, t * (n_expert + 1u) + e, red[li]);
+    if (li == 0u) {
+        precise float total = 0.0f;
+        for (uint w = 0u; w < WG / 32u; w++) total += wsum[w];
+        stf(4, t * (n_expert + 1u) + e, total);
     }
 }

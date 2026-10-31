@@ -1814,7 +1814,7 @@ fn checkMoeRoute(c: *Ctx) !Result {
     const logits = try c.output(tokens * (n_expert + 1));
     const params: P.MoeRoute = .{ .n_expert = n_expert, .n_used = used, .cols = cols, .x_stride = cols };
     const l = c.launcher();
-    try l.launch(.moe_logits, params, &.{ try c.upload(router), try c.upload(shared), try c.upload(x), logits }, .{ (n_expert + 1 + 7) / 8, tokens, 1 });
+    try l.launch(.moe_logits, params, &.{ try c.upload(router), try c.upload(shared), try c.upload(x), logits }, .{ n_expert + 1, tokens, 1 });
     try l.launch(.moe_route, params, &.{ logits, ids, weights, logit }, .{ tokens, 1, 1 });
     const got_ids = try c.readWords(ids);
     const got_w = try c.read(weights);

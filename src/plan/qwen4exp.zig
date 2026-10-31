@@ -650,7 +650,7 @@ pub const Program = struct {
             // The experts.
             try Mix.build(&body, &b, mm, arena, &layer.hc_ffn, hp, bufs);
             const route: P.MoeRoute = .{ .n_expert = hp.n_expert, .n_used = hp.n_expert_used, .cols = hp.n_embd, .x_stride = hp.n_embd, .scale = hp.expert_weights_scale };
-            try body.append(arena, .{ .launch = try b.add(.moe_logits, route, &.{ layer.router, layer.shared_gate, cur, route_logits }, .{ .rows_y = std.math.divCeil(u32, hp.n_expert + 1, 8) catch unreachable }) });
+            try body.append(arena, .{ .launch = try b.add(.moe_logits, route, &.{ layer.router, layer.shared_gate, cur, route_logits }, .{ .rows_y = hp.n_expert + 1 }) });
             try body.append(arena, .{ .launch = try b.add(.moe_route, route, &.{ route_logits, ids, weights, shared_logit }, .rows_x) });
             re.* = body.items.len;
             try body.append(arena, .{ .launch = try b.add(.rotate128, P.Rotate128{ .width = hp.n_embd, .x_stride = hp.n_embd, .y_stride = hp.n_embd }, &.{ cur, m.signs_embd, xh }, .{ .rows_y = hp.n_embd / 128 }) });
