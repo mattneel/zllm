@@ -612,6 +612,9 @@ runtime's, kept in `tools/corpus/gyro_*.json`. It requires:
 - every position's top-1 agreeing, which makes the greedy tokens the
   runtime's 40;
 - one-token and four-token steps bitwise identical;
+- the program with and without the fusion pass bitwise identical, every
+  layer's streams and experts and the logits (97 records; a fused prologue
+  with the wrong divisor changes all 97);
 - the long prompt's 10 tokens through `generate`.
 
 The bounds leave room for another backend's summation order, but not for a

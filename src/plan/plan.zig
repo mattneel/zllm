@@ -67,6 +67,8 @@ pub const Config = struct {
     tuning: common.Tuning = .{},
     /// Qwen 3.5: build the MTP block's steps (qwen35.Config.mtp).
     mtp: bool = false,
+    /// The fusion pass (fuse.lower); off for the unfused reference.
+    fuse: bool = true,
 };
 
 /// A step as the engine records it (each program's own Step has more for
@@ -113,6 +115,7 @@ pub const Program = union(enum) {
                 .context = @min(cfg.context, qwen4exp.max_context),
                 .kv = cfg.kv,
                 .tuning = cfg.tuning,
+                .fuse = cfg.fuse,
             }, limits) },
         };
     }

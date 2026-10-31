@@ -22,6 +22,7 @@ const gyro = @import("../ref/gyro/gyro.zig");
 const ple = @import("../ref/qwen4exp/ple.zig");
 const sampler = @import("../sampler/sampler.zig");
 const common = @import("common.zig");
+const fuse = @import("../fuse/fuse.zig");
 const Arg = kernels.Arg;
 const P = kernels.params;
 const Matrix = common.Matrix;
@@ -321,6 +322,8 @@ pub const Config = struct {
     /// Recurrent-state checkpoint slots.
     checkpoints: u32 = 3,
     tuning: common.Tuning = .{},
+    /// Run the fusion pass (fuse.lower); off, every op is its own launch.
+    fuse: bool = true,
 };
 
 /// One launch of the step body, and how its grid scales with the step's m
@@ -519,23 +522,20 @@ pub const Program = struct {
             /// mix into `cur`.
             fn build(list: *std.ArrayList(Item), bb: *kernels.Builder, m_: Mm, al_: Allocator, h: *const Hc, hp_: Hparams, bufs: anytype) Program.BuildError!void {
                 try list.append(al_, .{ .launch = try bb.add(.rmsnorm, P.RmsNorm{ .rows = 0, .dim = hp_.n_embd, .eps = hp_.eps, .w_rows = hp_.hc }, &.{ bufs.res, h.norm, bufs.xn }, .rows_x), .mul = hp_.hc });
-                try add(list, al_, try m_.vector(bufs.down, bufs.xn, &h.down, .{}));
-                // hc_act runs as the up multiply's prologue where its weights
-                // are quantized (no `lo` round trip, one dispatch fewer).
-                const fusable = for (h.up.chunks) |ch| {
-                    if (kernels.isHalf(ch.type)) break false;
-                } else h.down.n % 4 == 0 and hp_.hc_rank % 4 == 0;
-                if (fusable) {
-                    try add(list, al_, try m_.vector(bufs.gate, bufs.down, &h.up, .{ .act = .{ .stride = @intCast(h.down.n), .div = hp_.hc } }));
-                } else {
-                    const silu: P.HcAct = .{ .count = kernels.decode_max_rows * hp_.hc_rank, .hc = hp_.hc, .rank = hp_.hc_rank, .stride = @intCast(h.down.n) };
-                    try list.append(al_, .{ .launch = try bb.add(.hc_act, silu, &.{ bufs.down, bufs.lo }, .{ .elems = hp_.hc_rank }) });
-                    try add(list, al_, try m_.vector(bufs.gate, bufs.lo, &h.up, .{}));
-                }
+                // The down projection, its activation and the up projection,
+                // through the fusion pass: `lo` is read only by the up
+                // multiply, so hc_act can become its prologue.
+                const ops = [_]fuse.Op{
+                    .{ .vector = .{ .out = bufs.down, .x = bufs.xn, .w = &h.down } },
+                    .{ .act = .{ .src = bufs.down, .dst = bufs.lo, .stride = @intCast(h.down.n), .rank = hp_.hc_rank, .div = hp_.hc } },
+                    .{ .vector = .{ .out = bufs.gate, .x = bufs.lo, .w = &h.up } },
+                };
+                // `down` stays live: hc_combine reads its inject columns.
+                try add(list, al_, try fuse.lower(al_, m_, &ops, .{ .enabled = bufs.fuse, .live_out = &.{bufs.down} }, null));
                 try list.append(al_, .{ .launch = try bb.add(.hc_mix, P.Hc{ .dim = hp_.n_embd, .hc = hp_.hc }, &.{ bufs.xn, bufs.gate, bufs.cur }, .{ .rows_y = bufs.col_groups }) });
             }
         };
-        const bufs = .{ .res = res, .xn = xn, .down = hc_down, .lo = lo, .gate = gate, .cur = cur, .col_groups = col_groups };
+        const bufs = .{ .res = res, .xn = xn, .down = hc_down, .lo = lo, .gate = gate, .cur = cur, .col_groups = col_groups, .fuse = cfg.fuse };
         // hc_combine reads the inject weights the last mix left in `down`.
         const combine: P.HcCombine = .{ .dim = hp.n_embd, .hc = hp.hc, .stride = hp.hc_rank + hp.hc, .offset = hp.hc_rank };
 

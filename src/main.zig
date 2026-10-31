@@ -48,7 +48,7 @@ const usage =
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16]
-    \\              [--path prefill|decode] [--mtp] [--tune]
+    \\              [--path prefill|decode] [--mtp] [--tune] [--no-fuse]
     \\                                       as `forward`, on the GPU through Dawn, in
     \\                                       steps of N tokens (default 512; f32 KV;
     \\                                       the decode kernels for steps of up to 4).
@@ -472,13 +472,19 @@ const ForwardOptions = struct {
     mtp: bool = false,
     /// Tune the decode multiplies first, as loading for generation does.
     tune: bool = false,
+    /// Skip the fusion pass: the unfused reference for fused-path checks.
+    no_fuse: bool = false,
 
     fn parse(args: []const []const u8) !ForwardOptions {
         var o: ForwardOptions = .{};
         var i: usize = 0;
         while (i < args.len) : (i += 2) {
-            if (std.mem.eql(u8, args[i], "--mtp") or std.mem.eql(u8, args[i], "--tune")) {
-                if (args[i][2] == 'm') o.mtp = true else o.tune = true;
+            if (std.mem.eql(u8, args[i], "--mtp") or std.mem.eql(u8, args[i], "--tune") or std.mem.eql(u8, args[i], "--no-fuse")) {
+                switch (args[i][2]) {
+                    'm' => o.mtp = true,
+                    't' => o.tune = true,
+                    else => o.no_fuse = true,
+                }
                 i -= 1;
                 continue;
             }
@@ -528,7 +534,7 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, host: *zllm.gpu.Host, file
     var set = try zllm.kernels.Set.create(gpa, arena, &rec);
     host.file = bytes;
     const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
-    var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{ .context = @max(n, 1), .kv = opts.kv }, limits);
+    var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{ .context = @max(n, 1), .kv = opts.kv, .fuse = !opts.no_fuse }, limits);
     try program.recordReset(gpa, &rec);
     try rec.submit(gpa, 0);
     try runBatch(host, &rec, &completions);

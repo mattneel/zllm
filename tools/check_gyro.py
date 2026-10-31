@@ -11,7 +11,8 @@ reference runtime, AgentionAI's llama.cpp fork.
    Every layer must choose the same experts; streams and logits must stay
    within the bounds below; every position's top-1 must agree, so the GPU's
    greedy choices are the runtime's 40 tokens. One-token and four-token steps
-   must give bitwise identical results.
+   must give bitwise identical results, and so must the program with and
+   without the fusion pass (fuse.lower), record by record.
 2. The runtime's 6,430-token prompt (a fact buried in filler, past the sparse
    attention's 2,051-cell width), greedy through `zllm generate` on the host:
    the runtime's 10 tokens.
@@ -75,11 +76,11 @@ def main() -> int:
         subprocess.run([args.zllm, "forward", str(args.model), str(tok), str(cpu_path)], check=True)
         cpu = read_records(cpu_path)
         runs = {}
-        for chunk in ("4", "1"):
-            out = work / f"gpu{chunk}.bin"
-            timing = run_gpu(args, paths, args.model, tok, out, "--chunk", chunk, "--kv", "f16")
+        for name, opts in (("4", ("--chunk", "4")), ("1", ("--chunk", "1")), ("unfused", ("--chunk", "4", "--no-fuse"))):
+            out = work / f"gpu{name}.bin"
+            timing = run_gpu(args, paths, args.model, tok, out, *opts, "--kv", "f16")
             print(f"  [{timing}]")
-            runs[chunk] = read_records(out)
+            runs[name] = read_records(out)
         gpu = runs["4"]
 
         n = len(tokens)
@@ -100,12 +101,17 @@ def main() -> int:
         top1 = int((g.argmax(1) == c.argmax(1)).sum())
         greedy = int((g[n_prompt - 1 : -1].argmax(1) == tokens[n_prompt:]).sum())
         same = sorted(runs["1"]) == sorted(gpu) and all(np.array_equal(runs["1"][k].view(np.uint32), gpu[k].view(np.uint32)) for k in gpu)
+        # The fusion pass against the unfused program, layer by layer: its
+        # fused kernels stage exactly what the separate kernels wrote.
+        unfused = runs["unfused"]
+        differ = [k for k in sorted(gpu) if k not in unfused or not np.array_equal(unfused[k].view(np.uint32), gpu[k].view(np.uint32))]
         print(f"{args.host}, ref1 ({n} positions, {len(layers)} layers):")
         print(f"  expert sets differing from the CPU reference: {flips} (want 0)")
         print(f"  streams max rel L2 {streams_max:.2e} (max {STREAMS_MAX})")
         print(f"  logits rel L2 median {np.median(logits):.2e} (max {LOGITS_MEDIAN_MAX}), max {logits.max():.2e} (max {LOGITS_MAX})")
         print(f"  top-1 agreement {top1}/{n}; greedy {greedy}/{len(ref1['greedy'])} of the runtime's tokens")
         print(f"  1-token vs 4-token steps: {'bitwise identical' if same else 'DIFFER'}")
+        print(f"  fused vs unfused, {len(gpu)} records (every layer's streams and experts, the logits): {'bitwise identical' if not differ else 'first differing: ' + differ[0]}")
         fail.expect("expert routing", flips == 0, f"{flips} (position, layer) expert sets differ")
         fail.expect("streams", streams_max <= STREAMS_MAX, f"{streams_max:.2e}")
         fail.expect("logits median", float(np.median(logits)) <= LOGITS_MEDIAN_MAX, f"{np.median(logits):.2e}")
@@ -113,6 +119,7 @@ def main() -> int:
         fail.expect_eq("top-1", top1, n)
         fail.expect_eq("greedy tokens", greedy, len(ref1["greedy"]))
         fail.expect("step splits", same, "1-token and 4-token steps differ")
+        fail.expect("fusion", not differ, f"{len(differ)} records differ from the unfused program, first {differ[0] if differ else ''}")
 
     # The long prompt, greedy, end to end.
     long = json.loads((CORPUS / "gyro_reflong.json").read_text())
