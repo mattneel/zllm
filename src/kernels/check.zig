@@ -55,7 +55,7 @@ pub fn run(gpa: Allocator, device: platform.Device, host: *Host, out: *std.Io.Wr
         Quant(.q3_k).embed,   Quant(.q4_k).matvec,    Quant(.q4_k).matmul,      Quant(.q4_k).embed,     Quant(.q5_k).matvec,
         Quant(.q5_k).matmul,  Quant(.q5_k).embed,     Quant(.q6_k).matvec,      Quant(.q6_k).matmul,    Quant(.q6_k).embed,
         checkQuantTiles,      checkQuantSiluPair,     checkQuantAct,            checkQuantizeQ8K,       checkQuantizeQ80,
-        checkQuantizeNorm,    checkQuantizeSilu,      checkGyroMatmul,          checkMatmulQ80Float,
+        checkQuantizeNorm,    checkQuantizeSilu,      checkGyroMatmul,          checkMatmulQ80Float,    checkQuantQ80Tiles,
     }) |f| {
         ok = try report(&ctx, f, out) and ok;
         _ = arena_state.reset(.retain_capacity);
@@ -783,6 +783,7 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
     const xa = try c.upload(x);
     const wa = try gpuWeights(c, t, w.bytes, k);
     const na = try c.upload(nw);
+    var split_exact = true;
     var got: [kernels.MatvecVariant.candidates.len][]f32 = @splat(&.{});
     for (kernels.MatvecVariant.candidates, &got) |v, *g| {
         if (!v.suits(t)) continue;
@@ -797,6 +798,19 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
             .half = if (pair) n else 0,
         }, &.{ xa, wa, out, na }, .{ std.math.divCeil(u32, n, v.groupRows()) catch unreachable, rows, 1 });
         g.* = try c.read(out);
+        for (0..rows) |tk| {
+            const single = try c.upload(init[tk * n ..][0..n]);
+            try c.launcher().launchPipeline(try c.set.matvec(c.gpa, c.arena, &c.rec, kernel, v), P.MatvecBf16{
+                .n = n,
+                .k = k,
+                .col0 = 0,
+                .out_stride = n,
+                .eps = eps,
+                .flags = .{ .norm = true, .accumulate = !pair, .silu_pair = pair },
+                .half = if (pair) n else 0,
+            }, &.{ try c.upload(x[tk * k ..][0..k]), wa, single, na }, .{ std.math.divCeil(u32, n, v.groupRows()) catch unreachable, 1, 1 });
+            split_exact = matvecExact(g.*[tk * n ..][0..n], try c.read(single)) and split_exact;
+        }
     }
     const want = try c.arena.alloc(f64, rows * n);
     const xn = try c.arena.alloc(f64, k);
@@ -816,7 +830,23 @@ fn quantMatvec(c: *Ctx, comptime t: gguf.TensorType, name: []const u8, k: u32, p
     for (got) |g| if (g.len > 0) {
         worst = @max(worst, relErr(g, want));
     };
-    return .{ .name = name, .err = worst, .tolerance = 1e-5 };
+    return .{ .name = name, .err = if (split_exact) worst else 1, .tolerance = 1e-5 };
+}
+
+fn checkQuantQ80Tiles(c: *Ctx) !Result {
+    return quantMatvec(c, .q8_0, "matvec q8_0 norm+silu (tile tail, bitwise splits)", 4160, true);
+}
+
+fn matvecExact(whole: []const f32, split: []const f32) bool {
+    return std.mem.eql(u8, std.mem.sliceAsBytes(whole), std.mem.sliceAsBytes(split));
+}
+
+test "matvec split checker rejects missing, reordered and rounded outputs" {
+    const whole = [_]f32{ 0.0, -0.0, 1.0, 2.0 };
+    try std.testing.expect(matvecExact(&whole, &whole));
+    try std.testing.expect(!matvecExact(&whole, whole[0..3]));
+    try std.testing.expect(!matvecExact(&whole, &.{ -0.0, 0.0, 1.0, 2.0 }));
+    try std.testing.expect(!matvecExact(&whole, &.{ 0.0, -0.0, 1.0, 2.0000002 }));
 }
 
 /// hc_act fused into the multiply after it: each input staged as

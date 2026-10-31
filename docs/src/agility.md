@@ -73,9 +73,12 @@ HLSL kernel to it: a kernel may write only the bindings its contract
 declares. The host orders operations by it: a UAV barrier goes between two
 operations only where the later one touches a buffer range one since the
 last barrier wrote, or writes a range one of them read. While profiling,
-every operation is serialized, so each dispatch's time is its own. On the
-RTX 5090 the elided barriers are not measurable: decode chains dependent
-kernels, and a barrier between dependent dispatches costs next to nothing.
+every operation is serialized, so each dispatch's time is its own. A
+Gyro-Coder sampler step recorded 1,127 normal barriers versus 1,240 while
+profiling. Complete-list timestamps left 0.386 ms outside the profiled
+kernel intervals, including copies and barriers—not a barrier-only cost.
+See the [decode study](performance.md#agility-decode-matvec-study) for the
+full-list attribution and comparison with gyro-dx.
 
 Copies, clears, uploads and readbacks are the host's own kernels
 (`copy.hlsl`, `fill.hlsl`), so every GPU access in a submission is a
@@ -107,9 +110,9 @@ coverage test for that catalog. A missing artifact is explicit:
 `error.UnsupportedKernel`, `gpu-check` reports `MISSING`, and native model
 loads call `requireAll()` to reject an incomplete backend.
 
-The load-time tuner renders the same twelve `MatvecVariant` candidates
-from the HLSL template. The shared fuser can fold `hc_act` into the
-quantized multiply's prologue under its single-reader and layout rules.
+The load-time tuner renders sixteen `MatvecVariant` candidates from the
+HLSL template. The shared fuser can fold `hc_act` into the quantized
+multiply's prologue under its single-reader and layout rules.
 Native tuning is cached through the same JSON cache as Dawn, with
 `agility` as the runtime identity. The key hashes scalar, single-product
 and compensated HLSL, native operand support and requested precision policy.
@@ -130,6 +133,12 @@ Agility is no longer only a translation of the initial WGSL algorithms:
 - Both backends repack Q8_0 matrix rows at load into i8 values followed
   by f16 scales, padded for aligned vector reads. Per-step PLE reads
   retain their original file layout.
+- The native Q8_0 decode dot retains aligned 16-byte weight loads and
+  transposes its shared float4 activation plane. Consecutive lanes read
+  adjacent vectors rather than striding 64 bytes. Its finish uses an
+  explicit descending `WaveReadLaneAt` tree; 64-lane rows exchange the high
+  wave through shared memory once before that tree. This preserves the
+  reduction order instead of delegating it to `WaveActiveSum`.
 - Kernel contracts let the host omit barriers between independent accesses;
   profiling deliberately serializes operations for isolated timings.
 

@@ -448,6 +448,221 @@ parity, the CPU ladder check, and Gyro's strict f16-cache cases. Agility's
 strict Gyro prefill has zero routing flips, logits median/max relative
 L2 1.73e-5/1.24e-4 and bitwise split/unfused results; no old gate changed.
 
+## Agility decode matvec study
+
+On 2026-10-31, the RTX 5090 Laptop ran Gyro-Coder with context 8,192,
+f32 KV, compensated prefill operands and stored weights. Before and after
+used the same model and commands, with one D3D12 job at a time:
+
+```sh
+ZLLM_BACKEND=agility scripts/d3d12.sh benchmark 'C:\models\Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf'
+ZLLM_BACKEND=agility scripts/d3d12.sh profile 'C:\models\Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf' 4
+```
+
+Both benchmark runs restored their tuning and precision caches. These are
+individual runs, not confidence intervals; profile positions 29–45 and
+the benchmark's 1,024-token context are different workloads.
+
+| Measurement | Before | Retained Q8_0 cutover |
+|---|---:|---:|
+| 1,024-token benchmark prefill | 158.43 tok/s | 171.65 tok/s |
+| Greedy decode, 128 tokens | 58.61 tok/s; 17.061 ms/token | 62.64 tok/s; 15.965 ms/token |
+| Plain decode, 128 tokens | 59.45 tok/s; 16.822 ms/token | 61.10 tok/s; 16.367 ms/token |
+| `profile ... 4`, unprofiled four-token step | 36.24 ms | 31.71 ms |
+| Same profile's unprofiled one-token decode | 19.87 ms | 18.11 ms |
+| One-token decode GPU timestamp sum | 17.573 ms | 16.894 ms |
+
+Greedy and plain decode improve **6.87%** and **2.78%**, respectively.
+Q8_0 decode GPU time falls **6.28%**; its four-token time falls **19.57%**.
+Large prefill kernels are unchanged, so the benchmark prefill movement is
+not attributed to this decode optimization. No expert-kernel speedup is
+claimed.
+
+The retained change transposes the Q8_0 shared activation plane: each
+lane's four float4 reads become contiguous across the wave rather than
+64-byte-strided. Aligned 16-byte weight loads, arithmetic and allocation
+sizes remain unchanged. The finish uses the original descending tree via
+explicit wave lane reads, not an unspecified wave sum. A 64-lane row
+exchanges its high half through shared memory once before that tree.
+With tuning disabled to hold WG256/32 lanes/one row fixed, Q8_0 decode
+measured 10.136 → 9.749 ms for the transpose, then 9.341 ms with the tree;
+four-token Q8_0 measured 18.548 → 16.192 → 14.908 ms.
+
+### Decode kernel table
+
+Dispatch counts are unchanged. Other kernels' timing movements are not
+claimed as code improvements:
+
+| Kernel | Dispatches/step | Before GPU ms | After GPU ms |
+|---|---:|---:|---:|
+| `matvec_q8_0` | 389 | 9.591 | 8.989 |
+| `gyro_matvec` | 96 | 3.130 | 3.175 |
+| `rmsnorm` | 97 | 0.906 | 0.904 |
+| `attn_split_sparse` | 12 | 0.621 | 0.621 |
+| `moe_route` | 48 | 0.581 | 0.548 |
+| `delta_rule` | 36 | 0.430 | 0.462 |
+| `hc_combine` | 96 | 0.382 | 0.303 |
+| `rotate128` | 96 | 0.371 | 0.389 |
+| `moe_logits` | 48 | 0.328 | 0.326 |
+| `hc_mix` | 97 | 0.240 | 0.233 |
+| `sample` | 12 | 0.186 | 0.182 |
+| `delta_prep` | 36 | 0.156 | 0.154 |
+| `moe_combine` | 48 | 0.144 | 0.150 |
+| `matvec_bf16` | 12 | 0.119 | 0.114 |
+| `gated_norm` | 36 | 0.102 | 0.102 |
+| `qsa_keys` | 12 | 0.073 | 0.047 |
+| `rope_append` | 12 | 0.056 | 0.053 |
+| `qsa_pool` | 12 | 0.043 | 0.031 |
+| `attn_combine` | 12 | 0.037 | 0.036 |
+| `qsa_select` | 12 | 0.022 | 0.022 |
+| `qsa_score` | 12 | 0.021 | 0.021 |
+| `ple_mix` | 1 | 0.015 | 0.015 |
+| `embed_q8_0` | 2 | 0.011 | 0.011 |
+| `ple_conv` | 1 | 0.007 | 0.008 |
+| **Sum** | **1,235** | **17.573** | **16.894** |
+
+### Per-shape catalog
+
+The existing sixteen-candidate sweep remains; no RTX-specific heuristic
+or new candidate survived the measurements. The retained run's Q8_0
+catalog is below. `n` is the full matrix's row count, including both
+halves of fused gate/up weights; the launch may produce half that many
+outputs. Default rows are shown explicitly even though the cache omits them.
+
+| n | k | WG | Lanes/row | Rows/lane group |
+|---:|---:|---:|---:|---:|
+| 248,320 | 2,560 | 128 | 32 | 2 |
+| 320 | 10,240 | 256 | 64 | 1 |
+| 10,240 | 320 | 256 | 8 | 1 |
+| 324 | 10,240 | 256 | 64 | 1 |
+| 16,480 | 2,560 | 256 | 16 | 1 |
+| 2,560 | 6,144 | 256 | 32 | 1 |
+| 1,280 | 2,560 | 256 | 32 | 1 |
+| 2,560 | 640 | 256 | 16 | 1 |
+| 10,240 | 2,560 | 256 | 16 | 2 |
+| 2,560 | 2,560 | 128 | 16 | 1 |
+| 13,312 | 2,560 | 256 | 16 | 1 |
+
+These are measured cache entries for this device/model/source combination,
+not portable defaults. Changing HLSL invalidates the existing source-keyed
+cache. WGSL and its variant contracts remain unchanged.
+
+### Rejected experiments
+
+Trials below used `profile ... 4`; times are the decode section unless
+noted. Uncontrolled catalog sweeps and device timing vary, so small
+movements were not sufficient reason to retain extra code.
+
+| Experiment | Observed GPU ms/step | Disposition |
+|---|---:|---|
+| Q8_0 direct global activation loads, no staged tile | Q8_0 10.934; four-token 27.201 | Reject: baseline 9.591 / 16.690 |
+| Three signed-byte residual digits with DP4a | Q8_0 9.344; four-token 16.672 | Reject: no clear gain over scalar trials, which reached 7.897 |
+| Wave tree without transposed staging | Q8_0 8.046 | No isolated win against that 7.897 scalar trial; retain only the later fixed-variant combined win above |
+| 36 candidates: add WG64 and four rows/lane group | Q8_0 9.494; tuning 7.791 s | Reject: none of the eleven shapes selected a new candidate |
+| Four interleaved expert-row accumulators | Experts 3.111 | Reject: immaterial against 3.130 baseline |
+| WG1024, one expert row per wave | Experts 3.816 | Reject |
+| Vector-load/vector-store expert activation staging | Experts 4.482 | Reject |
+| Pad one scalar per 32 expert activations | Experts 3.250 | Reject |
+| Transpose expert activations and rotate layer matrices during tuning | Q8_0 8.994; experts 3.085 | Reject combination: benchmark 50.90 greedy / 58.64 plain tok/s |
+
+The DP4a prototype passed the unchanged 1e-5 kernel gate: Q8_0 norm
+relative L2 7.44e-7 and long tile-tail/pair relative L2 6.49e-7, including
+bitwise token splits. It was removed for performance before running the
+full model gate; it is not claimed to have passed that gate. Expert
+activation transposition alone was not a repeatable decode win and was
+also removed. The final expert shader and tuner are unchanged.
+
+### Dispatch graph versus gyro-dx
+
+Source inspection of `gyro-dx/shaders/engine/mv.hlsl` found the same
+aligned 16-byte-per-lane Q8_0 weight loads; its expert kernel in
+`moe.hlsl` already matches zllm's 32-row/four-rows-per-wave organization
+closely. Merely substituting its wave sum or increasing load width was
+not a demonstrated improvement.
+
+For a resident-expert, one-token, logits-producing step with this model's
+36 recurrent and 12 full-attention layers, source-derived counts are:
+
+| Implementation | Actual D3D12 dispatches | Global UAV barriers |
+|---|---:|---:|
+| gyro-dx | 1,556 + P + 2S | 966 + P + S |
+| zllm Agility, normal hazard elision | 1,231 | 1,115 |
+
+`P` counts full-attention layers completing a pooled indexer block and
+`S` counts those needing sparse selection; each is 0–12. Thus gyro-dx's
+range is 1,556–1,592 dispatches and 966–990 barriers. zllm's figure
+includes eight compute-copy dispatches beyond its 1,223 model kernels.
+The stochastic sampler used by `profile` adds twelve launches: counters
+observed 1,241 operations in the main compute list, two upload copies in
+the preceding list, and 1,127 normal barriers. Profiling forces 1,240
+barriers in the main list to isolate dispatch times.
+
+Temporary timestamps around the **complete** main compute list, including
+copies and barriers, measured the retained kernel/catalog combination:
+
+| Diagnostic measurement | Normal one-token step | Mean of 16 profiled steps |
+|---|---:|---:|
+| Wall time, including host work | 18.07 ms | 18.62 ms |
+| Complete main-list GPU span | 15.930 ms | 17.200 ms |
+| Sum of individually timed model kernels | Not instrumented | 16.815 ms |
+| GPU span outside those kernel intervals | Not isolated | 0.386 ms |
+| Wall time outside the main-list GPU span | 2.140 ms | 1.420 ms |
+
+The 0.386 ms includes six untimed compute-copy operations, barriers and
+timestamp/dispatch gaps; it is **not** an isolated barrier-cost estimate.
+The wall remainder also includes uploads, DirectStorage dependencies,
+command handling and diagnostic logging, not just GPU idle time. No
+comparison of one unprofiled step with a later kernel sum is used to
+attribute idle time. All temporary counters and timestamps were removed;
+the original host implementation was restored exactly.
+
+
+Both implementations re-record command lists every step; neither replays
+a D3D12 bundle. Both keep pipelines and bindless descriptors. Resident
+gyro-dx submits one compute list and waits once; zllm submits an upload
+list plus the main list and waits for the final ticket. Its hazard
+tracking already elides independent accesses, but its four-dispatch
+hyperconnection mixer has more boundaries than gyro-dx's fused two-pass
+`hc_pre`/`hc_post`. Conversely, zllm has five recurrent dispatches versus
+twelve, ten full-attention dispatches versus at least seventeen, and nine
+FFN dispatches versus thirteen. Fewer total launches do not imply fewer
+barriers.
+
+Nonresident gyro-dx is a different dispatch graph: it removes the 48
+resident `moe_resolve` launches but synchronizes after every layer's
+routing. Prediction disabled/enabled gives 1,508/1,602 + P + 2S
+dispatches and 966/1,013 + P + S barrier calls, respectively, with
+**49 compute submit/wait pairs per token** before any storage-miss waits.
+These are source-derived branches, not the established settings of the
+external 17.6 ms measurement.
+
+
+The cited gyro-dx 17.6 ms/step uses another harness; it is not used as the
+before baseline above or claimed to have identical KV, context, sampling
+and residency settings. No speculative barrier removal was retained.
+
+### Acceptance
+
+The retained implementation passed `zig fmt --check .`, `zig build`,
+`zig build test`, `zig build wasm`, standalone Agility `gpu-check`, and
+both required `check-fast` runs with the Gyro model on Agility and Dawn
+D3D12. No gate or tolerance changed. The new Q8_0 4,160-wide norm/SiLU
+tile-tail case has relative L2 2.29e-7 at the existing 1e-5 kernel bound.
+Every supported quantized matvec candidate now checks multi-token versus
+single-token results bitwise; a fixture-free mutation test rejects
+missing, reordered and rounded checker outputs.
+
+Both strict Gyro runs retain zero expert-set flips, 66/66 top-1 and
+40/40 greedy agreement, with bitwise split-step and unfused results:
+
+| Backend/path, strict f16-KV reference | Streams max rel L2 | Logits median / max rel L2 |
+|---|---:|---:|
+| Agility prefill | 1.11e-4 | 1.73e-5 / 1.24e-4 |
+| Agility decode | 1.49e-4 | 1.82e-5 / 1.32e-4 |
+| Dawn D3D12 prefill | 1.12e-4 | 1.86e-5 / 1.47e-4 |
+| Dawn D3D12 decode | 1.36e-4 | 1.97e-5 / 1.53e-4 |
+
+
 ## Per-device records
 
 `benchmarks/rtx5090-laptop-d3d12.jsonl` stores the committed native benchmark

@@ -7,6 +7,9 @@ static const uint R = {{rows}}u;
 static const uint ROWS = WG / LANES;
 static const uint TILE_ONE = 2048u, TILE_PAIR = 1024u, MAX_M = 4u;
 // xs[512] and XT = TILE_PAIR / 4 are declared in the preceding dot fragment.
+#ifndef STAGE_X
+#define STAGE_X(i, v) xs[i] = v
+#endif
 groupshared float partial[WG * R];
 groupshared float partial2[WG * R];
 float4 load_x(uint v) { return asfloat(rw(1).Load4(base(1) + 16u * v)); }
@@ -30,35 +33,38 @@ float norm_scale(uint t, uint li, uint k4) {
 void finish(uint t, uint li, uint j0, float acc[R], float acc2[R]) {
     uint lane = li % LANES;
     bool pair = (param(5) & SILU_PAIR) != 0u;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint q = 0u; q < R; q++) {
-        partial[q * WG + li] = acc[q];
-        partial2[q * WG + li] = acc2[q];
-    }
-    GroupMemoryBarrierWithGroupSync();
-    for (uint s = LANES / 2u; s > 0u; s /= 2u) {
-        if (lane < s) {
-            for (uint q = 0u; q < R; q++) {
-                precise float v = partial[q * WG + li] + partial[q * WG + li + s];
-                precise float v2 = partial2[q * WG + li] + partial2[q * WG + li + s];
-                partial[q * WG + li] = v;
-                partial2[q * WG + li] = v2;
-            }
+    // Keep the descending tree, not WaveActiveSum's unspecified order.
+    // A 64-lane row exchanges its high wave once before the wave32 tree.
+    if (LANES > 32u) {
+        GroupMemoryBarrierWithGroupSync();
+        for (uint q = 0u; q < R; q++) {
+            partial[q * WG + li] = acc[q];
+            partial2[q * WG + li] = acc2[q];
         }
         GroupMemoryBarrierWithGroupSync();
     }
-    if (lane == 0u) {
-        for (uint q = 0u; q < R; q++) {
-            uint j = j0 + q;
-            if (j >= param(0)) break;
+    for (uint q = 0u; q < R; q++) {
+        precise float a = acc[q], b = acc2[q];
+        if (LANES > 32u && lane < 32u) {
+            a += partial[q * WG + li + 32u];
+            b += partial2[q * WG + li + 32u];
+        }
+        for (uint s = min(LANES, 32u) / 2u; s > 0u; s /= 2u) {
+            float other = WaveReadLaneAt(a, (WaveGetLaneIndex() + s) & 31u);
+            float other2 = WaveReadLaneAt(b, (WaveGetLaneIndex() + s) & 31u);
+            if (lane < s) { a += other; b += other2; }
+        }
+        uint j = j0 + q;
+        if (lane == 0u && j < param(0)) {
             uint o = t * param(3) + param(2) + j;
-            precise float v = partial[q * WG + li];
-            if (pair) v = v / (1.0 + exp(-v)) * partial2[q * WG + li];
+            precise float v = a;
+            if (pair) v = v / (1.0 + exp(-v)) * b;
             if ((param(5) & ACCUMULATE) != 0u) v += ldf(3, o);
             stf(3, o, v);
         }
     }
 }
+[WaveSize(32)]
 [numthreads(WG, 1, 1)]
 void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
     if (wg.y != 0u) return;
@@ -94,7 +100,7 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
                 v = v / {{act_div}}.0;
                 v = v / (1.0 + exp(-v));
                 {{/if}}
-                xs[i] = v;
+                STAGE_X(i, v);
                 if (two) {
                     precise float4 v2 = load_x((t + 1u) * xr + g);
                     if (norm) v2 = v2 * scale1 * load_norm(g);
@@ -102,7 +108,7 @@ void main(uint3 wg : SV_GroupID, uint li : SV_GroupIndex) {
                     v2 = v2 / {{act_div}}.0;
                     v2 = v2 / (1.0 + exp(-v2));
                     {{/if}}
-                    xs[XT + i] = v2;
+                    STAGE_X(XT + i, v2);
                 }
             }
             GroupMemoryBarrierWithGroupSync();
