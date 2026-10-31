@@ -126,7 +126,8 @@ jobs:
   deploy:
     name: Deploy book to GitHub Pages
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: [zig, tokenizer, gpu-kernels, web, book]
+    # The llvmpipe tier (gpu-kernels) runs on its own: the book does not wait.
+    needs: [zig, tokenizer, web, book]
     runs-on: ubuntu-24.04
     permissions:
       pages: write

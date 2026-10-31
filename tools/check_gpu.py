@@ -79,6 +79,12 @@ HOSTS = ["native", "d3d12", "velocity"]
 
 def zllm_on_host(args, paths, command: str, *argv: Path | str) -> subprocess.CompletedProcess:
     """Runs a zllm command on the selected host; Path arguments are mapped to the host."""
+    cmd, env = host_command(args, paths, command, *argv)
+    return subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+
+def host_command(args, paths, command: str, *argv: Path | str) -> tuple[list[str], dict]:
+    """The command line and environment running a zllm command on the selected host."""
     if args.host in HOSTS[1:]:
         mapped = [win(a) if isinstance(a, Path) else a for a in argv]
         cmd = [str(ROOT / "scripts" / "d3d12.sh"), command, *mapped]
@@ -86,7 +92,7 @@ def zllm_on_host(args, paths, command: str, *argv: Path | str) -> subprocess.Com
     else:
         cmd = [args.zllm, command, *map(str, argv)]
         env = {**os.environ, "ZLLM_DAWN": str(paths.root / "dawn" / "libwebgpu_dawn.so")}
-    return subprocess.run(cmd, env=env, capture_output=True, text=True)
+    return cmd, env
 
 
 class GpuRuns:
@@ -125,11 +131,23 @@ class GpuRuns:
         host_path = win if self.windows else str
         runs_file = self.tmp / f"runs-{self.model.stem}.txt"
         runs_file.write_text("".join(" ".join([host_path(t), host_path(o), *opts]) + "\n" for t, o, opts in self.runs))
-        proc = zllm_on_host(self.args, self.paths, "gpu-forward", self.model, "--runs", runs_file)
-        if proc.returncode != 0:
-            sys.stderr.write(proc.stdout + proc.stderr)
+        print(f"[{self.model.name}: {len(self.runs)} gpu-forward runs, one model load]", flush=True)
+        cmd, env = host_command(self.args, self.paths, "gpu-forward", self.model, "--runs", runs_file)
+        # stderr streams, so a long run on a slow host shows progress.
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        timing, errors = [], []
+        assert proc.stderr is not None and proc.stdout is not None
+        for line in proc.stderr:
+            line = line.replace("\r", "").rstrip("\n")
+            errors.append(line)
+            if line.startswith("gpu-forward:"):
+                print(f"  {line}", flush=True)
+                if "loaded in" not in line:
+                    timing.append(line)
+        out = proc.stdout.read()
+        if proc.wait() != 0:
+            sys.stderr.write(out + "\n".join(errors) + "\n")
             raise SystemExit(f"gpu-forward failed ({self.args.host})")
-        timing = [line for line in proc.stderr.replace("\r", "").splitlines() if line.startswith("gpu-forward:") and "loaded in" not in line]
         return {o: t for (_, o, _), t in zip(self.runs, timing, strict=True)}
 
 
@@ -202,6 +220,7 @@ def main() -> int:
             tok = tmp / f"{name}.i32"
             tok.write_bytes(np.asarray(ids, dtype="<i4").tobytes())
             ref_path = tmp / f"{name}-ref.bin"
+            print(f"[{name}: CPU reference (cached in .fixtures/cache)]", flush=True)
             cached_reference(paths, "zllm-forward --mtp", paths.gguf, tok, ref_path, [args.zllm, "forward", str(paths.gguf), str(tok), str(ref_path), "--mtp"])
             mtp = ("--mtp",) if "mtp_logits" in read_records(ref_path) else ()
             part = tmp / f"{name}-part.i32"
