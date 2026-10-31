@@ -115,6 +115,18 @@ pub const Recorder = struct {
         r.words.clearRetainingCapacity();
     }
 
+    /// How many objects of `kind` the recorder has created: ids below it
+    /// are taken, so a span of ids marks what a stretch of recording made.
+    pub fn created(r: *const Recorder, kind: Kind) u32 {
+        return r.next[@backingInt(kind)];
+    }
+
+    /// Records the destruction of every object of `kind` with an id in
+    /// [from, created(kind)).
+    pub fn destroySince(r: *Recorder, gpa: Allocator, kind: Kind, from: u32) Allocator.Error!void {
+        for (from..r.created(kind)) |id| try r.destroy(gpa, kind, @intCast(id));
+    }
+
     fn alloc(r: *Recorder, kind: Kind) u32 {
         const id = r.next[@backingInt(kind)];
         r.next[@backingInt(kind)] += 1;

@@ -47,6 +47,9 @@ const usage =
     \\                                       fails on a device error or a submission past 250 ms
     \\  engine-check <model.gguf>           check that reusing a resident prefix or checkpoint gives
     \\                                       the logits of a fresh run
+    \\  gpu-forward <model.gguf> --runs <runs.txt>
+    \\                                       one run per line, `<tokens.i32> <out.bin> [options]`
+    \\                                       as below, the model loaded once for all of them
     \\  gpu-forward <model.gguf> <tokens.i32> <out.bin> [--chunk N] [--kv f32|f16|fp8]
     \\              [--path prefill|decode] [--mtp] [--tune] [--no-fuse]
     \\                                       as `forward`, on the GPU through Dawn, in
@@ -193,8 +196,12 @@ pub fn main(init: std.process.Init) !void {
         if (args.len != 2) return fail(usage);
         try gpuCheck(gpa, init.environ_map, out);
     } else if (std.mem.eql(u8, cmd, "gpu-forward")) {
-        if (args.len < 5) return fail(usage);
-        try gpuForward(gpa, io, init.environ_map, args[2], args[3], args[4], try ForwardOptions.parse(args[5..]));
+        if (args.len == 5 and std.mem.eql(u8, args[3], "--runs")) {
+            try gpuForward(gpa, io, init.environ_map, args[2], try readRuns(arena, io, args[4]));
+        } else {
+            if (args.len < 5) return fail(usage);
+            try gpuForward(gpa, io, init.environ_map, args[2], &.{.{ .tokens_path = args[3], .out_path = args[4], .opts = try ForwardOptions.parse(args[5..]) }});
+        }
     } else {
         return fail(usage);
     }
@@ -520,40 +527,125 @@ const ForwardOptions = struct {
     }
 };
 
-/// gpu-forward for Qwen4Exp: the decode kernels in steps of up to
+/// One gpu-forward run: token ids in, activation records out.
+const ForwardRun = struct {
+    tokens_path: []const u8,
+    out_path: []const u8,
+    opts: ForwardOptions,
+};
+
+/// The runs of `gpu-forward <model> --runs <file>`: one per non-empty line,
+/// `<tokens.i32> <out.bin> [options]`.
+fn readRuns(arena: std.mem.Allocator, io: Io, path: []const u8) ![]ForwardRun {
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
+    var runs: std.ArrayList(ForwardRun) = .empty;
+    var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+    while (lines.next()) |line| {
+        var words: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        while (it.next()) |w| try words.append(arena, w);
+        if (words.items.len < 2) return fail(usage);
+        try runs.append(arena, .{ .tokens_path = words.items[0], .out_path = words.items[1], .opts = try ForwardOptions.parse(words.items[2..]) });
+    }
+    return runs.items;
+}
+
+/// The GPU forward pass, with the same activation records as `forward`,
+/// for each run: the model loads once, then each run builds its own step
+/// program, runs its tokens as steps of `chunk` against the KV cache and
+/// the recurrent state, writes its records, and frees what it created.
+/// Load and forward timings go to stderr.
+fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, model_path: []const u8, runs: []const ForwardRun) !void {
+    const t_start = Io.Timestamp.now(io, .awake);
+    var mapped = try FileBytes.open(io, model_path);
+    defer mapped.close(io);
+    var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
+    defer file.deinit(gpa);
+
+    const d = try openGpu(gpa, env);
+    defer d.deinit(gpa);
+    var host = try zllm.gpu.Host.init(gpa, d);
+    defer host.deinit();
+    const dl = d.limits();
+    const limits: zllm.plan.common.Limits = .{ .max_binding = dl.max_binding, .offset_align = dl.offset_align };
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var g: Gpu = .{ .gpa = gpa, .io = io, .d = d, .host = &host };
+    defer g.rec.deinit(gpa);
+    defer g.completions.deinit(gpa);
+
+    var set = try zllm.kernels.Set.create(gpa, arena, &g.rec, d.backend());
+    try set.requireAll();
+    try host.setFile(gpa, mapped.bytes, model_path);
+    const arch = file.get("general.architecture") orelse return error.MissingMetadata;
+    const gyro = arch == .string and std.mem.eql(u8, arch.string, zllm.graph.qwen4exp.arch);
+    const Loaded = union(enum) { qwen4exp: zllm.plan.qwen4exp.Model, qwen35: zllm.plan.qwen35.Model };
+    const model: Loaded = if (gyro)
+        .{ .qwen4exp = try zllm.plan.qwen4exp.Model.upload(arena, gpa, &g.rec, &set, file, limits) }
+    else
+        .{ .qwen35 = try zllm.plan.qwen35.Model.uploadAny(arena, gpa, &g.rec, &set, file, limits) };
+    // The upload runs before any program is built, which may read what it
+    // read back (RoPE frequency factors).
+    try g.run(0);
+    std.debug.print("gpu-forward: model loaded in {d} ms\n", .{t_start.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds()});
+
+    for (runs) |r| {
+        var run_arena: std.heap.ArenaAllocator = .init(gpa);
+        defer run_arena.deinit();
+        const buffers = g.rec.created(.buffer);
+        const groups = g.rec.created(.bind_group);
+        const tokens = try readTokens(gpa, io, r.tokens_path);
+        defer gpa.free(tokens);
+        switch (model) {
+            .qwen4exp => |*x| try gpuRunQwen4exp(&g, run_arena.allocator(), &set, x, limits, tokens, r.out_path, r.opts),
+            .qwen35 => |*x| try gpuRunQwen35(&g, run_arena.allocator(), &set, x, limits, tokens, r.out_path, r.opts),
+        }
+        // What the run made goes before the next one's: its bind groups,
+        // then the buffers they bound.
+        try g.rec.destroySince(gpa, .bind_group, groups);
+        try g.rec.destroySince(gpa, .buffer, buffers);
+        try g.run(0);
+    }
+}
+
+/// gpu-forward's device, host and command stream.
+const Gpu = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    d: zllm.gpu.Device,
+    host: *zllm.gpu.Host,
+    rec: zllm.gpu.cmd.Recorder = .{},
+    completions: std.ArrayList(zllm.gpu.cmd.Completion) = .empty,
+
+    /// Submits what is recorded (as `token`) and runs it.
+    fn run(g: *Gpu, token: u32) !void {
+        try g.rec.submit(g.gpa, token);
+        try runBatch(g.d, g.host, &g.rec, &g.completions);
+    }
+};
+
+/// A Qwen4Exp run: the decode kernels in steps of up to
 /// min(chunk, decode_max_rows) tokens, the PLE rows read from the mapped
-/// file. Writes the records the reference names alike:
-/// each layer's streams (`l_last-<layer>`) and chosen experts
-/// (`ffn_moe_topk-<layer>`), and every position's logits.
-fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, d: zllm.gpu.Device, host: *zllm.gpu.Host, file: zllm.gguf.File, bytes: []const u8, path: []const u8, tokens: []const u32, out_path: []const u8, opts: ForwardOptions) !void {
+/// file. Writes the records the reference names alike: each layer's
+/// streams (`l_last-<layer>`) and chosen experts (`ffn_moe_topk-<layer>`),
+/// and every position's logits.
+fn gpuRunQwen4exp(g: *Gpu, arena: std.mem.Allocator, set: *zllm.kernels.Set, model: *const zllm.plan.qwen4exp.Model, limits: zllm.plan.common.Limits, tokens: []const u32, out_path: []const u8, opts: ForwardOptions) !void {
     const plan = zllm.plan.qwen4exp;
     if (opts.path == .prefill or opts.mtp or opts.tune) {
         std.log.err("gpu-forward runs Qwen4Exp with the decode kernels only, without --mtp or --tune", .{});
         return error.InvalidUsage;
     }
-    const t_start = Io.Timestamp.now(io, .awake);
-    const dl = d.limits();
-    const limits: zllm.plan.common.Limits = .{ .max_binding = dl.max_binding, .offset_align = dl.offset_align };
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var rec: zllm.gpu.cmd.Recorder = .{};
-    defer rec.deinit(gpa);
-    var completions: std.ArrayList(zllm.gpu.cmd.Completion) = .empty;
-    defer completions.deinit(gpa);
-
+    const gpa = g.gpa;
+    const t_start = Io.Timestamp.now(g.io, .awake);
     const n: u32 = @intCast(tokens.len);
     if (n > plan.max_context) return error.ContextTooLong;
     const chunk: u32 = @min(opts.chunk, zllm.kernels.decode_max_rows, n);
-    var set = try zllm.kernels.Set.create(gpa, arena, &rec, d.backend());
-    try set.requireAll();
-    try host.setFile(gpa, bytes, path);
-    const model = try plan.Model.upload(arena, gpa, &rec, &set, file, limits);
-    var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{ .context = @max(n, 1), .kv = opts.kv, .fuse = !opts.no_fuse }, limits);
-    try program.recordReset(gpa, &rec);
-    try rec.submit(gpa, 0);
-    try runBatch(d, host, &rec, &completions);
-    const t_loaded = Io.Timestamp.now(io, .awake);
+    var program = try plan.Program.build(arena, gpa, &g.rec, set, model, .{ .context = @max(n, 1), .kv = opts.kv, .fuse = !opts.no_fuse }, limits);
+    try program.recordReset(gpa, &g.rec);
+    try g.run(0);
+    const t_loaded = Io.Timestamp.now(g.io, .awake);
 
     const vocab: usize = model.hp.vocab;
     const logits = try arena.alloc(f32, @as(usize, n) * vocab);
@@ -578,26 +670,25 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, d: zllm.gpu.Device, host: 
             sx.* = x[pos0 * used ..][0 .. m * used];
         }
         const readback: plan.Program.Readback = .{ .streams = step_streams, .experts = step_experts };
-        try program.recordStep(gpa, &rec, .{
+        try program.recordStep(gpa, &g.rec, .{
             .pos0 = pos0,
             .tokens = tokens[pos0..][0..m],
             .logit_rows = m,
             .logits = logits[pos0 * vocab ..][0 .. m * vocab],
             .readback = &readback,
         });
-        try rec.submit(gpa, steps + 1);
-        try runBatch(d, host, &rec, &completions);
+        try g.run(steps + 1);
         pos0 += m;
     }
-    const t_done = Io.Timestamp.now(io, .awake);
-    std.debug.print("gpu-forward: {d} tokens in {d} steps of up to {d} ({t} KV); load {d} ms, forward {d} ms\n", .{
+    const t_done = Io.Timestamp.now(g.io, .awake);
+    std.debug.print("gpu-forward: {d} tokens in {d} steps of up to {d} ({t} KV); program {d} ms, forward {d} ms\n", .{
         n, steps, chunk, opts.kv, t_start.durationTo(t_loaded).toMilliseconds(), t_loaded.durationTo(t_done).toMilliseconds(),
     });
 
-    const out_file = try Io.Dir.cwd().createFile(io, out_path, .{});
-    defer out_file.close(io);
+    const out_file = try Io.Dir.cwd().createFile(g.io, out_path, .{});
+    defer out_file.close(g.io);
     var buf: [1 << 16]u8 = undefined;
-    var fw: Io.File.Writer = .init(out_file, io, &buf);
+    var fw: Io.File.Writer = .init(out_file, g.io, &buf);
     var rw: RecordWriter = .{ .w = &fw.interface };
     var name_buf: [32]u8 = undefined;
     const ids_f = try arena.alloc(f32, n * used);
@@ -610,60 +701,25 @@ fn gpuForwardQwen4exp(gpa: std.mem.Allocator, io: Io, d: zllm.gpu.Device, host: 
     try fw.interface.flush();
 }
 
-/// The GPU forward pass, with the same arguments and activation records as
-/// `forward`, run as steps of `chunk` tokens against the KV cache and the
-/// recurrent state. Load and forward timings go to stderr.
-fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, model_path: []const u8, tokens_path: []const u8, out_path: []const u8, opts: ForwardOptions) !void {
+/// A Qwen 3.5 (or dense) run: steps of `chunk` tokens, through the path
+/// `opts` forces or the step's own.
+fn gpuRunQwen35(g: *Gpu, arena: std.mem.Allocator, set: *zllm.kernels.Set, model: *const zllm.plan.qwen35.Model, limits: zllm.plan.common.Limits, tokens: []const u32, out_path: []const u8, opts: ForwardOptions) !void {
     const plan = zllm.plan.qwen35;
-    const plan_common = zllm.plan.common;
-    const t_start = Io.Timestamp.now(io, .awake);
-    var mapped = try FileBytes.open(io, model_path);
-    defer mapped.close(io);
-    var file = try zllm.gguf.parse(gpa, mapped.bytes, true);
-    defer file.deinit(gpa);
-    const tokens = try readTokens(gpa, io, tokens_path);
-    defer gpa.free(tokens);
-
-    const d = try openGpu(gpa, env);
-    defer d.deinit(gpa);
-    var host = try zllm.gpu.Host.init(gpa, d);
-    defer host.deinit();
-    const arch = file.get("general.architecture") orelse return error.MissingMetadata;
-    if (arch == .string and std.mem.eql(u8, arch.string, zllm.graph.qwen4exp.arch)) {
-        return gpuForwardQwen4exp(gpa, io, d, &host, file, mapped.bytes, model_path, tokens, out_path, opts);
-    }
-    const dl = d.limits();
-    const limits: plan_common.Limits = .{ .max_binding = dl.max_binding, .offset_align = dl.offset_align };
-
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var rec: zllm.gpu.cmd.Recorder = .{};
-    defer rec.deinit(gpa);
-    var completions: std.ArrayList(zllm.gpu.cmd.Completion) = .empty;
-    defer completions.deinit(gpa);
-
+    const gpa = g.gpa;
+    const t_start = Io.Timestamp.now(g.io, .awake);
     const n: u32 = @intCast(tokens.len);
     const chunk = @min(opts.chunk, n);
-    var set = try zllm.kernels.Set.create(gpa, arena, &rec, d.backend());
-    try set.requireAll();
-    try host.setFile(gpa, mapped.bytes, model_path);
-    const model = try plan.Model.uploadAny(arena, gpa, &rec, &set, file, limits);
-    // The upload runs before the program is built, which may read what it
-    // read back (RoPE frequency factors).
-    try rec.submit(gpa, 0);
-    try runBatch(d, &host, &rec, &completions);
-    var tuning: plan_common.Tuning = .{};
+    var tuning: zllm.plan.common.Tuning = .{};
     if (opts.tune) {
-        var sweep = try zllm.tune.Sweep.init(gpa, arena, &rec, &set, &model, .{}, @min(chunk, 2));
+        var sweep = try zllm.tune.Sweep.init(gpa, arena, &g.rec, set, model, .{}, @min(chunk, 2));
         while (try sweep.next()) |_| {
-            const t0 = Io.Timestamp.now(io, .awake);
-            try runBatch(d, &host, &rec, &completions);
-            try sweep.done(@intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds()));
+            const t0 = Io.Timestamp.now(g.io, .awake);
+            try runBatch(g.d, g.host, &g.rec, &g.completions);
+            try sweep.done(@intCast(t0.durationTo(Io.Timestamp.now(g.io, .awake)).toNanoseconds()));
         }
         tuning = sweep.tuning();
     }
-    var program = try plan.Program.build(arena, gpa, &rec, &set, &model, .{
+    var program = try plan.Program.build(arena, gpa, &g.rec, set, model, .{
         .max_tokens = chunk,
         .context = n,
         // An MTP program needs two rows (its verify step).
@@ -673,10 +729,9 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
         .mtp = opts.mtp,
         .tuning = tuning,
     }, limits);
-    try program.recordReset(gpa, &rec);
-    try rec.submit(gpa, 0);
-    try runBatch(d, &host, &rec, &completions);
-    const t_loaded = Io.Timestamp.now(io, .awake);
+    try program.recordReset(gpa, &g.rec);
+    try g.run(0);
+    const t_loaded = Io.Timestamp.now(g.io, .awake);
 
     const hp = model.hp;
     const e: usize = hp.n_embd;
@@ -692,7 +747,7 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
     while (pos0 < n) : (steps += 1) {
         const m = @min(chunk, n - pos0);
         for (step_layers, layer_out) |*s, o| s.* = o[pos0 * e ..][0 .. m * e];
-        try program.recordStep(gpa, &rec, .{
+        try program.recordStep(gpa, &g.rec, .{
             .pos0 = pos0,
             .tokens = tokens[pos0..][0..m],
             .logit_rows = m,
@@ -705,31 +760,25 @@ fn gpuForward(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Ma
         });
         // The rows with a next token, over this step's final hidden states.
         const rows = @min(m, n - 1 - pos0);
-        if (opts.mtp and rows > 0) try program.recordMtp(gpa, &rec, .{
+        if (opts.mtp and rows > 0) try program.recordMtp(gpa, &g.rec, .{
             .pos0 = pos0,
             .tokens = tokens[pos0 + 1 ..][0..rows],
             .logit_rows = rows,
             .path = opts.path,
             .logits = mtp_logits[@as(usize, pos0) * hp.vocab ..][0 .. @as(usize, rows) * hp.vocab],
         });
-        try rec.submit(gpa, steps + 1);
-        try runBatch(d, &host, &rec, &completions);
+        try g.run(steps + 1);
         pos0 += m;
     }
-    const t_done = Io.Timestamp.now(io, .awake);
-    std.debug.print("gpu-forward: {d} tokens in {d} steps of up to {d} ({t} KV); load {d} ms, forward {d} ms\n", .{
-        n,
-        steps,
-        chunk,
-        opts.kv,
-        t_start.durationTo(t_loaded).toMilliseconds(),
-        t_loaded.durationTo(t_done).toMilliseconds(),
+    const t_done = Io.Timestamp.now(g.io, .awake);
+    std.debug.print("gpu-forward: {d} tokens in {d} steps of up to {d} ({t} KV); program {d} ms, forward {d} ms\n", .{
+        n, steps, chunk, opts.kv, t_start.durationTo(t_loaded).toMilliseconds(), t_loaded.durationTo(t_done).toMilliseconds(),
     });
 
-    const out_file = try Io.Dir.cwd().createFile(io, out_path, .{});
-    defer out_file.close(io);
+    const out_file = try Io.Dir.cwd().createFile(g.io, out_path, .{});
+    defer out_file.close(g.io);
     var buf: [1 << 16]u8 = undefined;
-    var fw: Io.File.Writer = .init(out_file, io, &buf);
+    var fw: Io.File.Writer = .init(out_file, g.io, &buf);
     var rw: RecordWriter = .{ .w = &fw.interface };
     var name_buf: [32]u8 = undefined;
     for (layer_out, 0..) |o, il| {
