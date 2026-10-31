@@ -118,12 +118,12 @@ fetch_header() {
 vocab() {
 	fetch_header "https://huggingface.co/$gguf_repo/resolve/$gguf_rev/$gguf_file" \
 		"$dir/models/$header_file" "$header_bytes" "$header_sha256"
-	local entry name sha repo rev file file_sha bytes bytes_sha hf hf_rev tok_sha
+	local entry name sha repo rev file file_sha bytes bytes_sha hf tok_rev tok_sha
 	for entry in "${dense_models[@]}"; do
-		read -r name repo rev file file_sha bytes bytes_sha hf hf_rev tok_sha <<<"$entry"
+		read -r name repo rev file file_sha bytes bytes_sha hf tok_rev tok_sha <<<"$entry"
 		fetch_header "https://huggingface.co/$repo/resolve/$rev/$file" \
 			"$dir/models/${file%.gguf}.header.gguf" "$bytes" "$bytes_sha"
-		fetch "https://huggingface.co/$hf/resolve/$hf_rev/tokenizer.json" \
+		fetch "https://huggingface.co/$hf/resolve/$tok_rev/tokenizer.json" \
 			"$dir/hf/$name/tokenizer.json" "$tok_sha"
 	done
 	for entry in "${hf_files[@]}"; do
