@@ -301,6 +301,17 @@ Agility and Dawn D3D12. GPU checks now include 69 expert output rows and
 Gyro routing has zero flips, logits median/max rel L2 remain
 2.02e-5/1.63e-4, and split/unfused prefill results remain bitwise identical.
 
+A separate double-buffered expert experiment used four compute waves and
+four producer waves, retaining the same 32 KiB shared allocation and
+original 128-K high/residual accumulation by consuming two 64-K slices.
+It passed standalone `gpu-check`, but was rejected: with the padded dense
+kernel below, 1,024-token prefill fell from 178.04 to 163.93 tok/s and
+expert GPU time rose from 140.337 to 153.030 ms per 64-token step.
+Dense GPU time was 46.753 ms in that experiment, so its regression was
+localized to the expert implementation. Decode was 62.18 tok/s.
+The four-wave, single-buffered expert remains the production kernel;
+the producer-wave experiment is not retained.
+
 ## Bank-aware dense LinAlg staging
 
 The retained dense optimization keeps TT16/TN64/KT64 rather than reducing
