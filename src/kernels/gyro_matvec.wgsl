@@ -7,11 +7,12 @@
 // A TQ2_T block is 128 weights: a binary16 scale and 32 stream bytes. Step
 // s (0..31) has the 16-bit state (byte s − 1 mod 32) << 8 | byte s; its low
 // 15 bits, times 0x9e3779b1, give two indices into the 2,048-pair codebook:
-// weights 4s..4s+3. A lane group of 32 lanes takes one row, a lane per step,
-// over the row's blocks; the lanes' sums then reduce in a fixed tree. x is
-// staged in workgroup memory once for the workgroup's 8 rows.
+// weights 4s..4s+3. A lane group of 32 lanes takes RPG rows in turn, a lane
+// per step, over each row's blocks; the lanes' sums then reduce in a fixed
+// tree. x is staged in workgroup memory once for the workgroup's 32 rows
+// (kernels.gyro_rows).
 //
-// Grid: x = row groups of 8, y = slots (token × n_used + k), z = projections.
+// Grid: x = row groups of 32, y = slots (token × n_used + k), z = projections.
 
 struct Params {
     // Output features per expert, and inputs (a multiple of 128).
@@ -38,7 +39,8 @@ struct Params {
 
 const WG: u32 = 256u;
 const LANES: u32 = 32u;
-const ROWS: u32 = WG / LANES;
+// Rows per lane group: 8 lane groups × RPG = 32 rows a workgroup.
+const RPG: u32 = 4u;
 const MAX_COLS: u32 = 2560u;
 const BLOCK_BYTES: u32 = 34u;
 
@@ -64,7 +66,6 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
     let slot = wg.y;
     let z = wg.z;
     let lane = li % LANES;
-    let j = wg.x * ROWS + li / LANES;
 
     var xrow = slot;
     if (p.x_per_slot == 0u) {
@@ -75,32 +76,36 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
     }
     workgroupBarrier();
 
-    var acc = 0.0;
-    if (j < p.rows) {
-        let blocks = p.cols / 128u;
-        let row_bytes = blocks * BLOCK_BYTES;
-        let row0 = (ids[slot] * p.rows + j) * row_bytes;
-        let prev_lane = (lane + 31u) & 31u;
-        for (var b = 0u; b < blocks; b++) {
-            let bo = row0 + b * BLOCK_BYTES;
-            let state = (wbyte(z, bo + 2u + prev_lane) << 8u) | wbyte(z, bo + 2u + lane);
-            let h = (state & 0x7fffu) * 0x9e3779b1u;
-            let pa = unpack2x16float(book[h >> 21u]);
-            let pb = unpack2x16float(book[(h >> 10u) & 2047u]);
-            let xi = b * 128u + lane * 4u;
-            let part = pa.x * xs[xi] + pa.y * xs[xi + 1u] + pb.x * xs[xi + 2u] + pb.y * xs[xi + 3u];
-            acc += whalf(z, bo) * part;
+    let blocks = p.cols / 128u;
+    let row_bytes = blocks * BLOCK_BYTES;
+    let prev_lane = (lane + 31u) & 31u;
+    for (var r = 0u; r < RPG; r++) {
+        let j = (wg.x * (WG / LANES) + li / LANES) * RPG + r;
+        var acc = 0.0;
+        if (j < p.rows) {
+            let row0 = (ids[slot] * p.rows + j) * row_bytes;
+            for (var b = 0u; b < blocks; b++) {
+                let bo = row0 + b * BLOCK_BYTES;
+                let state = (wbyte(z, bo + 2u + prev_lane) << 8u) | wbyte(z, bo + 2u + lane);
+                let h = (state & 0x7fffu) * 0x9e3779b1u;
+                let pa = unpack2x16float(book[h >> 21u]);
+                let pb = unpack2x16float(book[(h >> 10u) & 2047u]);
+                let xi = b * 128u + lane * 4u;
+                let part = pa.x * xs[xi] + pa.y * xs[xi + 1u] + pb.x * xs[xi + 2u] + pb.y * xs[xi + 3u];
+                acc += whalf(z, bo) * part;
+            }
         }
-    }
-    partial[li] = acc;
-    workgroupBarrier();
-    for (var s = LANES / 2u; s > 0u; s /= 2u) {
-        if (lane < s) {
-            partial[li] += partial[li + s];
+        partial[li] = acc;
+        workgroupBarrier();
+        for (var s = LANES / 2u; s > 0u; s /= 2u) {
+            if (lane < s) {
+                partial[li] += partial[li + s];
+            }
+            workgroupBarrier();
+        }
+        if (lane == 0u && j < p.rows) {
+            out[slot * p.out_stride + z * p.out_z + j] = partial[li];
         }
         workgroupBarrier();
-    }
-    if (lane == 0u && j < p.rows) {
-        out[slot * p.out_stride + z * p.out_z + j] = partial[li];
     }
 }

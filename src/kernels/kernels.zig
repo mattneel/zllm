@@ -239,6 +239,9 @@ fn composed(comptime name: []const u8) []const u8 {
     return @embedFile(name ++ ".wgsl");
 }
 
+/// Rows per gyro_matvec workgroup.
+pub const gyro_rows = 32;
+
 /// Matrix multiply tile sizes (matmul_half.wgsl: TN outputs × TT tokens).
 pub const matmul_tile_n = 64;
 pub const matmul_tile_t = 16;

@@ -1781,7 +1781,7 @@ fn checkGyroMatvec(c: *Ctx) !Result {
             .x_stride = cols,
             .out_stride = 2 * rows,
             .out_z = rows,
-        }, &.{ try c.upload(w[0]), try c.upload(w[1]), try c.upload(x), out, try c.upload(&ids), book }, .{ std.math.divCeil(u32, rows, 8) catch unreachable, tokens * used, projections });
+        }, &.{ try c.upload(w[0]), try c.upload(w[1]), try c.upload(x), out, try c.upload(&ids), book }, .{ std.math.divCeil(u32, rows, kernels.gyro_rows) catch unreachable, tokens * used, projections });
         const got = try c.read(out);
         const want = try c.arena.alloc(f64, got.len);
         @memset(want, 0);

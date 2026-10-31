@@ -662,7 +662,7 @@ pub const Program = struct {
                 .x_stride = hp.n_embd,
                 .out_stride = 2 * hp.n_ff_exp,
                 .out_z = hp.n_ff_exp,
-            }, &.{ layer.gate_exps, layer.up_exps, xh, gu, ids, m.codebook }, .{ .tiles_y = .{ .x = std.math.divCeil(u32, hp.n_ff_exp, 8) catch unreachable, .tile = 1, .z = 2 } }), .mul = hp.n_expert_used });
+            }, &.{ layer.gate_exps, layer.up_exps, xh, gu, ids, m.codebook }, .{ .tiles_y = .{ .x = std.math.divCeil(u32, hp.n_ff_exp, kernels.gyro_rows) catch unreachable, .tile = 1, .z = 2 } }), .mul = hp.n_expert_used });
             try body.append(arena, .{ .launch = try b.add(.rotate128, P.Rotate128{ .width = hp.n_ff_exp, .x_stride = 2 * hp.n_ff_exp, .y_stride = hp.n_ff_exp, .silu_pair = 1 }, &.{ gu, m.signs_ff, act }, .{ .rows_y = hp.n_ff_exp / 128 }), .mul = hp.n_expert_used });
             try body.append(arena, .{ .launch = try b.add(.gyro_matvec, P.GyroMatvec{
                 .rows = hp.n_embd,
@@ -672,7 +672,7 @@ pub const Program = struct {
                 .x_stride = hp.n_ff_exp,
                 .out_stride = hp.n_embd,
                 .out_z = 0,
-            }, &.{ layer.down_exps, layer.down_exps, act, down, ids, m.codebook }, .{ .tiles_y = .{ .x = std.math.divCeil(u32, hp.n_embd, 8) catch unreachable, .tile = 1, .z = 1 } }), .mul = hp.n_expert_used });
+            }, &.{ layer.down_exps, layer.down_exps, act, down, ids, m.codebook }, .{ .tiles_y = .{ .x = std.math.divCeil(u32, hp.n_embd, kernels.gyro_rows) catch unreachable, .tile = 1, .z = 1 } }), .mul = hp.n_expert_used });
             try add(&body, arena, try mm.vector(sh_act, cur, &layer.sh_gu, .{ .silu_pair = hp.n_ff_shexp }));
             try add(&body, arena, try mm.vector(sh_out, sh_act, &layer.sh_down, .{}));
             try body.append(arena, .{ .launch = try b.add(.moe_combine, P.MoeCombine{ .n_used = hp.n_expert_used, .dim = hp.n_embd }, &.{ down, weights, sh_out, shared_logit, block }, .{ .rows_y = col_groups }) });
