@@ -133,6 +133,12 @@ async function chat(text: string): Promise<void> {
   }
 }
 
+// The model list fills in the URL, which stays editable for any other GGUF.
+el<HTMLSelectElement>("model-pick").addEventListener("change", (e) => {
+  if (e.target instanceof HTMLSelectElement) {
+    el<HTMLInputElement>("model-url").value = e.target.value;
+  }
+});
 el<HTMLButtonElement>("load-url").addEventListener("click", () => {
   const url = el<HTMLInputElement>("model-url").value;
   void start(url, url.split("/").pop() ?? url);

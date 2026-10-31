@@ -63,12 +63,20 @@
   <body>
     <h1>zllm</h1>
     <fieldset id="load-form">
+      <select id="model-pick" aria-label="Model">
+        <option value="https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/807dfd9a6fadbf703207aac3bfb0b2b3040d077c/Qwen3.5-0.8B-BF16.gguf">Qwen3.5 0.8B BF16 (1.6 GB)</option>
+        <option value="https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-BF16.gguf">Qwen3 0.6B BF16 (1.2 GB)</option>
+        <option value="https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/resolve/b69aef112e9f895e6f98d7ae0949f72ff09aa401/Llama-3.2-1B-Instruct-BF16.gguf">Llama 3.2 1B Instruct BF16 (2.5 GB)</option>
+        <option value="https://huggingface.co/ibm-granite/granite-4.2-3b-GGUF/resolve/c40945d71cd90f249a56985e8155551a9188dc30/granite-4.2-3b-bf16.gguf">Granite 4.2 3B BF16 (6.8 GB)</option>
+        <option value="https://huggingface.co/ibm-granite/granite-4.2-30b-GGUF/resolve/27b350a791e81d9a4d1ddca1c49282e9ec533768/granite-4.2-30b-Q4_K_M.gguf">Granite 4.2 30B Q4_K_M (17.7 GB)</option>
+        <option value="https://huggingface.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF/resolve/ab8d7bd81d03117501e4da60cccdff4c80f0eea0/RVN-Q3_K_M-mtp.gguf">Qwen3.8 27B Q3_K_M with MTP (13.8 GB)</option>
+      </select>
       <input id="model-url" value="https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/807dfd9a6fadbf703207aac3bfb0b2b3040d077c/Qwen3.5-0.8B-BF16.gguf" aria-label="Model URL" />
       <button id="load-url">Load URL</button>
       <input id="model-file" type="file" accept=".gguf" aria-label="Model file" />
       <button id="clear-cache" type="button">Clear cache</button>
     </fieldset>
-    <p id="status">WebGPU, GGUF in, tokens out. Load a Qwen 3.5 GGUF (BF16).</p>
+    <p id="status">WebGPU, GGUF in, tokens out. Pick a model, paste a GGUF URL, or open a file.</p>
     <progress id="progress" value="0" max="1" hidden></progress>
     <div id="log"></div>
     <form id="chat" hidden>
